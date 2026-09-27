@@ -26,7 +26,6 @@ import os
 import discord
 from aiohttp import web
 from discord import app_commands
-from discord.ext import commands
 
 # python-dotenv lets us load a local .env file for local development.
 # On Render, environment variables are provided directly by the platform,
@@ -68,6 +67,12 @@ MINECRAFT_ROLE_MENTION = "<@&1536962762952146944>"
 # Prefix used to identify our "Interested" button clicks inside custom_id.
 JOIN_BUTTON_PREFIX = "join_interested:"
 
+# Custom status shown under the bot's name in the member list (right sidebar).
+# Discord calls this a "custom status" activity; there's no separate way for
+# a bot to set an "About Me" bio via the API, so this is the closest
+# equivalent and it's visible right where you want it.
+BOT_CUSTOM_STATUS = "I am in Da Game GNG server! AAPoke made me!!"
+
 # ---------------------------------------------------------------------------
 # Auto-response architecture (kept for future extensibility)
 # Add new automatic text responses here without touching the rest of the bot.
@@ -107,8 +112,15 @@ intents.guilds = True
 intents.message_content = False
 
 
-class DaBot(commands.Bot):
-    """Bot subclass so we can sync the slash command tree once at startup."""
+class DaBot(discord.Client):
+    """A plain Client (not commands.Bot) since we only use slash commands --
+    this avoids discord.py's "Message Content intent is missing" warning,
+    which is specific to the prefix-command-oriented commands.Bot class and
+    doesn't apply to us."""
+
+    def __init__(self) -> None:
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
         if ALLOWED_GUILD_ID:
@@ -127,7 +139,7 @@ class DaBot(commands.Bot):
             )
 
 
-bot = DaBot(command_prefix="?", intents=intents, help_command=None)
+bot = DaBot()
 
 
 class JoinView(discord.ui.View):
@@ -357,6 +369,18 @@ async def on_ready():
         logger.info("Restricted to guild ID: %s", ALLOWED_GUILD_ID)
     else:
         logger.info("ALLOWED_GUILD_ID not set -- bot will respond in any guild it's in.")
+
+    # Set an online status with a custom status message, so the bot shows
+    # up as online with a bio-like line under its name in the member list.
+    # Safe to call again on every reconnect (idempotent).
+    try:
+        await bot.change_presence(
+            status=discord.Status.online,
+            activity=discord.CustomActivity(name=BOT_CUSTOM_STATUS),
+        )
+    except Exception:
+        logger.exception("Failed to set bot presence/status")
+
     logger.info("Da Bot is ready.")
 
 
