@@ -2,8 +2,8 @@
 Da Bot - a simple, single-server Discord bot.
 
 Features:
-- Prefix commands (?creator, ?join, ?help) using discord.py 2.x
-- A persistent "Interested" button on ?join messages that survives bot restarts
+- Slash commands (/creator, /join, /help) using discord.py 2.x
+- A persistent "Interested" button on /join messages that survives bot restarts
   WITHOUT a database (the author's user ID is encoded in the button's custom_id)
 - A tiny built-in HTTP server (aiohttp) so this can run as a Render Free Web Service
 - No database, no local persistent files -- everything is derived from
@@ -14,7 +14,7 @@ Run locally:
 
 Required environment variables (see .env.example):
     DISCORD_TOKEN       - your bot's token (KEEP SECRET)
-    CREATOR_USER_ID      - your Discord user ID, used for the ?creator link
+    CREATOR_USER_ID      - your Discord user ID, used for the /creator link
     ALLOWED_GUILD_ID     - (optional) restrict the bot to a single server
     PORT                 - (optional) HTTP port, Render sets this automatically
 """
@@ -22,10 +22,10 @@ Required environment variables (see .env.example):
 import asyncio
 import logging
 import os
-import re
 
 import discord
 from aiohttp import web
+from discord import app_commands
 from discord.ext import commands
 
 # python-dotenv lets us load a local .env file for local development.
@@ -68,17 +68,13 @@ MINECRAFT_ROLE_MENTION = "<@&1536962762952146944>"
 # Prefix used to identify our "Interested" button clicks inside custom_id.
 JOIN_BUTTON_PREFIX = "join_interested:"
 
-JOIN_USAGE = (
-    "**Usage:** `?join game:<vbl|minecraft> message:<optional message>`\n"
-    "**Example:** `?join game:vbl message:Need 2 more players`\n"
-    "Supported games: **VBL** and **Minecraft**."
-)
-
 # ---------------------------------------------------------------------------
-# Auto-response architecture (section 12)
+# Auto-response architecture (kept for future extensibility)
 # Add new automatic text responses here without touching the rest of the bot.
-# Keys are matched against the lowercased, stripped message content.
-# Left empty by default -- only add entries the user actually wants.
+# NOTE: this requires the privileged "Message Content" intent to be enabled
+# both in code (intents.message_content = True below) and in the Discord
+# Developer Portal. It is left OFF by default since slash commands don't
+# need it and nothing currently uses this dict.
 # ---------------------------------------------------------------------------
 AUTO_RESPONSES: dict[str, str] = {
     # "hello": "Hello!",
@@ -102,14 +98,40 @@ def is_allowed_guild(guild_id: int | None) -> bool:
 # Discord bot setup
 # ---------------------------------------------------------------------------
 intents = discord.Intents.default()
-intents.message_content = True  # Required (privileged) to read "?..." prefix commands
 intents.guilds = True
+# Message Content is a privileged intent that is NOT needed for slash
+# commands or button interactions -- only for reading plain "?" style
+# text commands. Leave this False unless you actually populate
+# AUTO_RESPONSES above, in which case set it to True here AND enable
+# "Message Content Intent" in the Developer Portal's Bot tab.
+intents.message_content = False
 
-bot = commands.Bot(command_prefix="?", intents=intents, help_command=None)
+
+class DaBot(commands.Bot):
+    """Bot subclass so we can sync the slash command tree once at startup."""
+
+    async def setup_hook(self) -> None:
+        if ALLOWED_GUILD_ID:
+            guild_obj = discord.Object(id=ALLOWED_GUILD_ID)
+            # Copies globally-defined commands into this guild and syncs
+            # them there specifically, which makes them show up almost
+            # instantly (a global sync can take up to an hour to propagate).
+            self.tree.copy_global_to(guild=guild_obj)
+            await self.tree.sync(guild=guild_obj)
+            logger.info("Synced slash commands to guild %s", ALLOWED_GUILD_ID)
+        else:
+            await self.tree.sync()
+            logger.info(
+                "Synced slash commands globally (can take up to an hour to "
+                "appear everywhere; set ALLOWED_GUILD_ID for instant sync)."
+            )
+
+
+bot = DaBot(command_prefix="?", intents=intents, help_command=None)
 
 
 class JoinView(discord.ui.View):
-    """View shown under a ?join message.
+    """View shown under a /join message.
 
     The button has NO callback of its own -- all handling happens in the
     global on_interaction listener below. That is what lets this keep working
@@ -130,58 +152,60 @@ class JoinView(discord.ui.View):
 
 
 # ---------------------------------------------------------------------------
-# Commands
+# Slash commands
 # ---------------------------------------------------------------------------
-@bot.command(name="creator")
-async def creator_command(ctx: commands.Context):
-    """Shows who made Da Bot, with a clickable link to their Discord profile."""
+@bot.tree.command(name="creator", description="Shows who made Da Bot.")
+async def creator_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
     if not CREATOR_USER_ID:
-        await ctx.send("aapoke made me (creator profile link is not configured)")
+        await interaction.response.send_message(
+            "aapoke made me (creator profile link is not configured)"
+        )
         return
 
     profile_url = f"https://discord.com/users/{CREATOR_USER_ID}"
     # NOTE: Discord only renders [text](url) markdown links as clickable
     # inside embeds, not in plain message content, so we use an embed here.
     embed = discord.Embed(description=f"[aapoke]({profile_url}) made me")
-    await ctx.send(embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
-@bot.command(name="join")
-async def join_command(ctx: commands.Context, *, args: str = None):
-    """Looks for players. Usage: ?join game:<vbl|minecraft> message:<optional>"""
-    if not is_allowed_guild(ctx.guild.id if ctx.guild else None):
-        return  # This server isn't the configured one -- ignore quietly.
-
-    if not args:
-        await ctx.send(JOIN_USAGE)
-        return
-
-    game_match = re.search(r"game:\s*(\S+)", args, re.IGNORECASE)
-    if not game_match:
-        await ctx.send(JOIN_USAGE)
-        return
-
-    game = game_match.group(1).strip().lower()
-    if game not in ("vbl", "minecraft"):
-        await ctx.send(
-            "❌ Unsupported game. Supported games are: **VBL** and **Minecraft**.\n"
-            f"{JOIN_USAGE}"
+@bot.tree.command(name="join", description="Look for players for a game.")
+@app_commands.describe(
+    game="Which game are you looking for players for?",
+    message="Optional extra message to include (e.g. 'Need 2 more players')",
+)
+@app_commands.choices(
+    game=[
+        app_commands.Choice(name="VBL", value="vbl"),
+        app_commands.Choice(name="Minecraft", value="minecraft"),
+    ]
+)
+async def join_slash(
+    interaction: discord.Interaction,
+    game: app_commands.Choice[str],
+    message: str | None = None,
+):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
         )
         return
 
-    # Capture everything after "message:" to the end of the input, so
-    # multi-word custom messages are preserved as-is.
-    message_match = re.search(r"message:\s*(.*)", args, re.IGNORECASE | re.DOTALL)
-    custom_message = message_match.group(1).strip() if message_match else ""
-
+    custom_message = (message or "").strip()
     # Safety cap so a huge paste can't break the message (Discord's own limit
     # is 2000 chars per message; this keeps well under that).
     if len(custom_message) > 300:
         custom_message = custom_message[:300]
 
-    author_mention = ctx.author.mention
+    author_mention = interaction.user.mention
 
-    if game == "vbl":
+    if game.value == "vbl":
         content = (
             f"🏐 **{author_mention}** is looking for players!\n"
             f"{VBL_ROLE_MENTION}\n"
@@ -197,63 +221,84 @@ async def join_command(ctx: commands.Context, *, args: str = None):
     if custom_message:
         content += f"\n{custom_message}"
 
-    view = JoinView(ctx.author.id)
-    await ctx.send(content, view=view)
+    view = JoinView(interaction.user.id)
+    await interaction.response.send_message(content, view=view)
 
 
-@bot.command(name="help")
-async def help_command(ctx: commands.Context):
-    """Shows the list of available commands."""
+@bot.tree.command(name="help", description="Shows all Da Bot commands.")
+async def help_slash(interaction: discord.Interaction):
     embed = discord.Embed(title="Da Bot Commands", color=discord.Color.blurple())
-    embed.add_field(name="?creator", value="Shows who made Da Bot.", inline=False)
-    embed.add_field(name="?join game:vbl", value="Looks for VBL players.", inline=False)
+    embed.add_field(name="/creator", value="Shows who made Da Bot.", inline=False)
     embed.add_field(
-        name="?join game:minecraft", value="Looks for Minecraft players.", inline=False
+        name="/join game:VBL",
+        value="Looks for VBL players.",
+        inline=False,
     )
     embed.add_field(
-        name="?join game:vbl message:your message",
+        name="/join game:Minecraft",
+        value="Looks for Minecraft players.",
+        inline=False,
+    )
+    embed.add_field(
+        name="/join game:<game> message:<text>",
         value="Looks for players and includes an optional custom message.",
         inline=False,
     )
-    embed.add_field(name="?help", value="Shows this command list.", inline=False)
-    await ctx.send(embed=embed)
+    embed.add_field(name="/help", value="Shows this command list.", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
-# Auto-responses + command dispatch
+# Slash command error handling
+# ---------------------------------------------------------------------------
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+):
+    logger.error("Slash command error in '%s': %s", interaction.command, error)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                "⚠️ Something went wrong running that command.", ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                "⚠️ Something went wrong running that command.", ephemeral=True
+            )
+    except Exception:
+        # Never let error reporting itself crash the bot.
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Auto-responses (only fires if you enable Message Content intent above and
+# populate AUTO_RESPONSES; harmless no-op otherwise)
 # ---------------------------------------------------------------------------
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot:
+    if message.author.bot or not AUTO_RESPONSES:
         return
 
     if message.guild is not None and not is_allowed_guild(message.guild.id):
-        return  # Wrong server -- ignore everything, including auto-responses.
+        return
 
     content_lower = message.content.strip().lower()
     if content_lower in AUTO_RESPONSES:
         await message.channel.send(AUTO_RESPONSES[content_lower])
 
-    # Always let discord.py process prefix commands too.
-    await bot.process_commands(message)
-
 
 # ---------------------------------------------------------------------------
 # Persistent button handling (no database)
 #
-# We deliberately do NOT rely on the View's own callback dispatch for
-# cross-restart persistence, because that requires re-registering a View
-# with matching custom_ids at startup -- which we can't do without knowing
-# every past join-author ID (i.e. without a database). Instead, this raw
-# on_interaction listener fires for every interaction the bot receives,
-# regardless of whether a matching View object exists in memory, so it
-# keeps working after restarts as long as the message + button still exist.
+# This raw on_interaction listener fires for every interaction the bot
+# receives, regardless of whether a matching View object exists in memory,
+# so it keeps working after restarts as long as the message + button exist.
 # ---------------------------------------------------------------------------
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
     try:
         if interaction.type != discord.InteractionType.component:
-            return
+            return  # Slash commands are handled by the tree, not here.
 
         data = interaction.data or {}
         custom_id = data.get("custom_id", "")
@@ -299,29 +344,6 @@ async def on_interaction(interaction: discord.Interaction):
             # If we can't even send the error message, just swallow it --
             # we must never let a button click crash the bot.
             pass
-
-
-# ---------------------------------------------------------------------------
-# Error handling
-# ---------------------------------------------------------------------------
-@bot.event
-async def on_command_error(ctx: commands.Context, error: Exception):
-    # Unknown commands and wrong-server check failures are ignored quietly.
-    if isinstance(error, commands.CommandNotFound):
-        return
-    if isinstance(error, commands.CheckFailure):
-        return
-
-    if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"⚠️ Missing arguments.\n{JOIN_USAGE}")
-        return
-
-    if isinstance(error, commands.CommandInvokeError):
-        logger.error("Command '%s' raised an error: %s", ctx.command, error.original)
-    else:
-        logger.error("Command '%s' raised an error: %s", ctx.command, error)
-
-    await ctx.send("⚠️ Something went wrong running that command.")
 
 
 # ---------------------------------------------------------------------------
