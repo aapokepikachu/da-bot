@@ -1,4 +1,4 @@
-# Da Bot
+# Milo
 
 A simple, single-server Discord bot built with **Python 3.12+** and **discord.py 2.x**.
 
@@ -73,7 +73,7 @@ ALLOWED_GUILD_ID=your_server_id_here
 python bot.py
 ```
 
-You should see log lines like `Logged in as Da Bot#1234`, `Connected to 1 guild(s).`, and `HTTP health server listening on 0.0.0.0:10000`.
+You should see log lines like `Logged in as Milo#1234`, `Connected to 1 guild(s).`, and `HTTP health server listening on 0.0.0.0:10000`.
 
 ---
 
@@ -111,7 +111,7 @@ You should see log lines like `Logged in as Da Bot#1234`, `Connected to 1 guild(
    - `ALLOWED_GUILD_ID` (optional)
    - Render provides `PORT` automatically — you don't need to set it.
 8. Click **Deploy**.
-9. Watch the **Logs** tab for `Logged in as ...` and `Da Bot is ready.`
+9. Watch the **Logs** tab for `Logged in as ...` and `Milo is ready.`
 10. Check that the bot shows as **online** in your Discord server's member list.
 
 ### Free tier realities (please read)
@@ -126,45 +126,57 @@ You should see log lines like `Logged in as Da Bot#1234`, `Connected to 1 guild(
 
 ## 5. How the button persistence works (no database)
 
-When someone runs `/join`, the bot attaches an **✅ Interested** button whose `custom_id` is `join_interested:<AUTHOR_USER_ID>` (well under Discord's 100-character limit). A global `on_interaction` listener reads that ID back out whenever *anyone* clicks the button — including after the bot has restarted — and mentions both the clicker and the original author. No state is ever stored outside the message itself.
+When someone runs `/join`, the bot attaches an **✔️ Interested** button (green, Discord's "success" style) whose `custom_id` is `join_interested:<AUTHOR_USER_ID>` (well under Discord's 100-character limit). A global `on_interaction` listener reads that ID back out whenever *anyone* clicks the button — including after the bot has restarted — and mentions both the clicker and the original author. No state is ever stored outside the message itself.
+
+## 6. If the VBL/Minecraft role isn't notifying anyone
+
+The bot's code already sends the role mention with `allowed_mentions=discord.AllowedMentions(roles=True, ...)`, so it isn't being suppressed on the code side. If the role still shows up as a mention but doesn't actually ping/notify members, it's almost always one of these **server-side settings**, not a code problem:
+
+1. **The role isn't mentionable.** Go to **Server Settings → Roles → (the VBL or Minecraft role) → Display role members separately** section, and toggle **"Allow anyone @mention this role"** ON.
+2. **Or, give Milo's own role the permission to bypass that.** Go to **Server Settings → Roles → Milo's role**, and enable **"Mention @everyone, @here, and All Roles"**. This lets the bot ping any role even if it isn't mentionable by regular members.
+
+Either one fixes it — you don't need both. Option 2 is usually cleaner since it doesn't open the role up to being pinged by everyone else too.
 
 ---
 
-## 6. Command reference
+## 7. Command reference
 
 | Command | Description |
 |---|---|
-| `/creator` | Replies "aapoke made me" with `aapoke` as a clickable link to the creator's profile. |
-| `/join game:VBL` | Posts a VBL looking-for-players message with an Interested button. |
-| `/join game:Minecraft` | Posts a Minecraft looking-for-players message with an Interested button. |
+| `/creator` | Shows an intro for Milo (with the `:Milo:` emoji) and a clickable "AAPoke" link to the creator's profile. |
+| `/join game:VBL` | Posts a VBL looking-for-players message with an Interested button, and notifies the VBL role. |
+| `/join game:Minecraft` | Posts a Minecraft looking-for-players message with an Interested button, and notifies the Minecraft role. |
 | `/join game:<choice> message:your text` | Same as above, with an optional custom message appended. |
+| `/ping` | Replies with Milo's current Discord Gateway latency in milliseconds. |
 | `/help` | Shows the command list. |
 
 `game` is a dropdown with exactly two options (VBL, Minecraft) that Discord shows automatically — there's no way to type an invalid game. `message` is an optional free-text field.
 
 ---
 
-## 7. Testing checklist
+## 8. Testing checklist
 
-- [ ] `/creator` replies with a clickable "aapoke" link.
-- [ ] `/join game:VBL` posts the VBL message with the correct role mention and an Interested button.
+- [ ] `/creator` replies with an embed: "Hi, I'm Milo! 🐾", a group-management blurb, and a clickable "AAPoke" link.
+- [ ] `/join game:VBL` posts the VBL message with the correct role mention (and members of that role actually get notified) plus a green ✔️ Interested button.
 - [ ] `/join game:VBL message:Need 2 more players` appends the custom message on its own line.
-- [ ] `/join game:Minecraft` posts the Minecraft message with the correct role mention.
+- [ ] `/join game:Minecraft` posts the Minecraft message with the correct role mention and notification.
 - [ ] `/join game:Minecraft message:Starting at 8 PM` appends the custom message.
 - [ ] Typing `/join` shows Discord's built-in dropdown for `game` (only VBL/Minecraft) and an optional `message` field — no invalid game can be typed.
-- [ ] Clicking **✅ Interested** posts `<@clicker> is joining <@author>` using real mentions.
+- [ ] `/ping` replies with a latency in milliseconds.
+- [ ] Clicking **✔️ Interested** posts `<@clicker> is joining <@author>` using real mentions.
 - [ ] Restart the bot process, then click **Interested** on an *old* message — it still works correctly.
 - [ ] Clicking Interested on your own `/join` message gives a friendly "can't join your own request" reply.
 - [ ] `/help` shows all commands with no internal details, tokens, or env var names.
 - [ ] Running a command from a different server (if `ALLOWED_GUILD_ID` is set) is silently ignored.
-- [ ] Visiting `https://your-render-url.onrender.com/` shows `Da Bot is running.`
+- [ ] Visiting `https://your-render-url.onrender.com/` shows `Milo is running.`
 - [ ] Visiting `https://your-render-url.onrender.com/health` returns `OK` with HTTP 200.
 
 ---
 
-## 8. Limitations / assumptions
+## 9. Limitations / assumptions
 
-- Discord only renders `[text](url)` markdown as a clickable link **inside embeds**, not in plain message content, so `/creator` sends a small embed to make "aapoke" clickable as requested.
+- Discord only renders `[text](url)` markdown as a clickable link **inside embeds**, not in plain message content, so `/creator` sends a small embed to make "AAPoke" clickable as requested.
+- `MILO_EMOJI` defaults to a plain 🐾 emoji if you don't set it. To show your server's actual custom `:Milo:` emoji, set the env var to its raw code (see `.env.example` for how to grab it).
 - The wrong-server guard (`ALLOWED_GUILD_ID`) is configured to **silently ignore** commands from other servers; interaction (button) attempts from another server get a short ephemeral "not configured for this server" reply instead, since that only the clicking user sees it.
 - Clicking your own **Interested** button is blocked with a friendly ephemeral message — this wasn't explicitly requested but avoids a slightly odd `<@you> is joining <@you>` message; remove that check in `bot.py` if you'd rather allow it.
 - `AUTO_RESPONSES` in `bot.py` is an empty dictionary by design — it's there so you can add future automatic replies (e.g. `"hello": "Hello!"`) without restructuring the bot, but no extra responses were added since none were requested.

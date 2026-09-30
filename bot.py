@@ -1,8 +1,8 @@
 """
-Da Bot - a simple, single-server Discord bot.
+Milo - a simple, single-server Discord bot.
 
 Features:
-- Slash commands (/creator, /join, /help) using discord.py 2.x
+- Slash commands (/creator, /join, /ping, /help) using discord.py 2.x
 - A persistent "Interested" button on /join messages that survives bot restarts
   WITHOUT a database (the author's user ID is encoded in the button's custom_id)
 - A tiny built-in HTTP server (aiohttp) so this can run as a Render Free Web Service
@@ -16,6 +16,7 @@ Required environment variables (see .env.example):
     DISCORD_TOKEN       - your bot's token (KEEP SECRET)
     CREATOR_USER_ID      - your Discord user ID, used for the /creator link
     ALLOWED_GUILD_ID     - (optional) restrict the bot to a single server
+    MILO_EMOJI            - (optional) the server's custom :Milo: emoji, e.g. <:Milo:123456789012345678>
     PORT                 - (optional) HTTP port, Render sets this automatically
 """
 
@@ -41,13 +42,20 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("da_bot")
+logger = logging.getLogger("milo")
 
 # ---------------------------------------------------------------------------
 # Configuration (from environment variables only -- never hardcode secrets)
 # ---------------------------------------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CREATOR_USER_ID = os.getenv("CREATOR_USER_ID", "").strip()
+
+# Optional: the server's custom :Milo: emoji, e.g. "<:Milo:123456789012345678>"
+# (or "<a:Milo:123...>" if it's animated). To get this exact string, type
+# "\:Milo:" (a backslash then the emoji) in Discord and send it -- Discord
+# will show you the raw <:Milo:id> code to copy. Falls back to a plain emoji
+# if not set, so the bot still works without it.
+MILO_EMOJI = os.getenv("MILO_EMOJI", "🐾").strip()
 
 _raw_allowed_guild = os.getenv("ALLOWED_GUILD_ID", "").strip()
 ALLOWED_GUILD_ID = int(_raw_allowed_guild) if _raw_allowed_guild.isdigit() else None
@@ -112,7 +120,7 @@ intents.guilds = True
 intents.message_content = False
 
 
-class DaBot(discord.Client):
+class MiloClient(discord.Client):
     """A plain Client (not commands.Bot) since we only use slash commands --
     this avoids discord.py's "Message Content intent is missing" warning,
     which is specific to the prefix-command-oriented commands.Bot class and
@@ -139,7 +147,7 @@ class DaBot(discord.Client):
             )
 
 
-bot = DaBot()
+bot = MiloClient()
 
 
 class JoinView(discord.ui.View):
@@ -156,8 +164,8 @@ class JoinView(discord.ui.View):
         super().__init__(timeout=None)  # timeout=None -> button never expires
         button = discord.ui.Button(
             label="Interested",
-            emoji="✅",
-            style=discord.ButtonStyle.success,
+            emoji="✔️",  # A plain check mark reads cleaner than a boxed emoji
+            style=discord.ButtonStyle.success,  # success = Discord's green button style
             custom_id=f"{JOIN_BUTTON_PREFIX}{author_id}",
         )
         self.add_item(button)
@@ -166,7 +174,7 @@ class JoinView(discord.ui.View):
 # ---------------------------------------------------------------------------
 # Slash commands
 # ---------------------------------------------------------------------------
-@bot.tree.command(name="creator", description="Shows who made Da Bot.")
+@bot.tree.command(name="creator", description="Shows info about Milo and its creator.")
 async def creator_slash(interaction: discord.Interaction):
     if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
         await interaction.response.send_message(
@@ -174,16 +182,23 @@ async def creator_slash(interaction: discord.Interaction):
         )
         return
 
-    if not CREATOR_USER_ID:
-        await interaction.response.send_message(
-            "aapoke made me (creator profile link is not configured)"
-        )
-        return
+    intro = (
+        f"Hi, I'm Milo! {MILO_EMOJI}\n"
+        f"I'm here to help with group management — organizing game lobbies and more."
+    )
 
-    profile_url = f"https://discord.com/users/{CREATOR_USER_ID}"
-    # NOTE: Discord only renders [text](url) markdown links as clickable
-    # inside embeds, not in plain message content, so we use an embed here.
-    embed = discord.Embed(description=f"[aapoke]({profile_url}) made me")
+    if CREATOR_USER_ID:
+        profile_url = f"https://discord.com/users/{CREATOR_USER_ID}"
+        # NOTE: Discord only renders [text](url) markdown links as clickable
+        # inside embeds, not in plain message content, so we use an embed here.
+        creator_line = f"[AAPoke]({profile_url}) is my creator"
+    else:
+        creator_line = "AAPoke is my creator (profile link not configured)"
+
+    embed = discord.Embed(
+        description=f"{intro}\n\n{creator_line}",
+        color=discord.Color.green(),
+    )
     await interaction.response.send_message(embed=embed)
 
 
@@ -234,13 +249,35 @@ async def join_slash(
         content += f"\n{custom_message}"
 
     view = JoinView(interaction.user.id)
-    await interaction.response.send_message(content, view=view)
+    # Explicitly allow role mentions so the ping actually notifies members
+    # of that role (not just a highlighted, silent mention). If members
+    # still aren't notified after this, it's a server-side permission
+    # issue -- see the README's "Role isn't notifying anyone" section.
+    await interaction.response.send_message(
+        content,
+        view=view,
+        allowed_mentions=discord.AllowedMentions(roles=True, users=True, everyone=False),
+    )
 
 
-@bot.tree.command(name="help", description="Shows all Da Bot commands.")
+@bot.tree.command(name="ping", description="Check Milo's latency.")
+async def ping_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    latency_ms = round(bot.latency * 1000)
+    await interaction.response.send_message(f"🏓 Pong! Latency: **{latency_ms}ms**")
+
+
+@bot.tree.command(name="help", description="Shows all Milo commands.")
 async def help_slash(interaction: discord.Interaction):
-    embed = discord.Embed(title="Da Bot Commands", color=discord.Color.blurple())
-    embed.add_field(name="/creator", value="Shows who made Da Bot.", inline=False)
+    embed = discord.Embed(title="Milo Commands", color=discord.Color.blurple())
+    embed.add_field(
+        name="/creator", value="Shows info about Milo and its creator.", inline=False
+    )
     embed.add_field(
         name="/join game:VBL",
         value="Looks for VBL players.",
@@ -256,6 +293,7 @@ async def help_slash(interaction: discord.Interaction):
         value="Looks for players and includes an optional custom message.",
         inline=False,
     )
+    embed.add_field(name="/ping", value="Checks Milo's latency.", inline=False)
     embed.add_field(name="/help", value="Shows this command list.", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -381,7 +419,7 @@ async def on_ready():
     except Exception:
         logger.exception("Failed to set bot presence/status")
 
-    logger.info("Da Bot is ready.")
+    logger.info("Milo is ready.")
 
 
 @bot.event
@@ -399,7 +437,7 @@ async def on_resumed():
 # Runs concurrently with the Discord Gateway connection in the same process.
 # ---------------------------------------------------------------------------
 async def handle_root(request: web.Request) -> web.Response:
-    return web.Response(text="Da Bot is running.")
+    return web.Response(text="Milo is running.")
 
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -425,7 +463,7 @@ async def start_http_server() -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 async def main() -> None:
-    logger.info("Starting Da Bot...")
+    logger.info("Starting Milo...")
     await start_http_server()
 
     logger.info("Connecting to Discord...")
@@ -437,4 +475,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Shutting down Da Bot (KeyboardInterrupt).")
+        logger.info("Shutting down Milo (KeyboardInterrupt).")
