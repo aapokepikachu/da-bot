@@ -669,10 +669,19 @@ async def _handle_send_command(message: discord.Message) -> None:
     except (discord.Forbidden, discord.NotFound, discord.HTTPException):
         pass
 
-    await message.channel.send(
-        content_to_send,
-        allowed_mentions=discord.AllowedMentions(roles=True, users=True, everyone=False),
-    )
+    try:
+        await message.channel.send(
+            content_to_send,
+            allowed_mentions=discord.AllowedMentions(roles=True, users=True, everyone=False),
+        )
+    except discord.Forbidden:
+        logger.error(
+            "?send failed in #%s (guild %s): missing permission to send messages there.",
+            getattr(message.channel, "name", message.channel.id),
+            message.guild.id,
+        )
+    except discord.HTTPException:
+        logger.exception("?send failed to post the message")
 
 
 async def _handle_rolemenu_command(message: discord.Message) -> None:
@@ -708,7 +717,31 @@ async def _handle_rolemenu_command(message: discord.Message) -> None:
         color=discord.Color.green(),
     )
     view = SelfRoleView()
-    await message.channel.send(embed=embed, view=view)
+
+    try:
+        await message.channel.send(embed=embed, view=view)
+    except discord.Forbidden:
+        # Most likely missing "Embed Links" in this channel. Fall back to a
+        # plain-text version (no embed styling) so the buttons still work,
+        # rather than failing completely.
+        logger.warning(
+            "?rolemenu couldn't send an embed in #%s (guild %s) -- likely missing "
+            "the 'Embed Links' permission there. Falling back to plain text.",
+            getattr(message.channel, "name", message.channel.id),
+            message.guild.id,
+        )
+        plain_text = f"🎭 **Pick your roles!** {MILO_EMOJI}\n\n" + "\n".join(lines)
+        try:
+            await message.channel.send(plain_text, view=view)
+        except discord.Forbidden:
+            logger.error(
+                "?rolemenu failed completely in #%s (guild %s): missing "
+                "permission to send messages there at all.",
+                getattr(message.channel, "name", message.channel.id),
+                message.guild.id,
+            )
+    except discord.HTTPException:
+        logger.exception("?rolemenu failed to post the role menu")
 
 
 @bot.event
