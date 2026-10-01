@@ -3,7 +3,7 @@
 A simple, single-server, **cat-themed** Discord bot built with **Python 3.12+** and **discord.py 2.x**.
 
 Features:
-- Slash commands: `/creator`, `/join`, `/hi`, `/8ball`, `/poll`, `/coinflip`, `/roll`, `/serverinfo`, `/userinfo`, `/ping`, `/help`
+- Slash commands: `/aboutme`, `/join`, `/rolemenu`, `/hi`, `/8ball`, `/poll`, `/coinflip`, `/roll`, `/serverinfo`, `/userinfo`, `/ping`, `/help`
 - A persistent **✔️ Interested** button on `/join` messages — survives bot restarts, **no database required**
 - A cat-themed welcome message when new members join
 - A hidden, Manager-role-only `?send` text command for posting announcements as Milo — not a slash command, not in `/help`
@@ -79,7 +79,8 @@ You should see log lines like `Logged in as Milo#1234`, `Connected to 1 guild(s)
 4. Click **Reset Token** (or **Copy**) to get your bot token. Put it in `.env` / Render as `DISCORD_TOKEN`. **Never share this token or commit it to GitHub.**
 5. Go to **OAuth2 → URL Generator**:
    - Scopes: check **bot** and **applications.commands**.
-   - Bot Permissions: at minimum **Send Messages**, **Embed Links**, **Add Reactions** (for `/poll`), **Manage Messages** (so `?send` can delete the triggering message).
+   - Bot Permissions: at minimum **Send Messages**, **Embed Links**, **Add Reactions** (for `/poll`), **Manage Messages** (so `?send` can delete the triggering message), **Manage Roles** (for `/rolemenu` to grant/remove self-assign roles).
+   - If you invited Milo before adding **Manage Roles**, regenerate the URL with it checked and re-invite — re-inviting with added permissions doesn't remove the bot or reset anything, it just grants the new permission.
 6. Copy the generated URL, open it in your browser, and invite the bot to your one server.
 7. After the bot logs in for the first time, it registers its slash commands automatically. If `ALLOWED_GUILD_ID` is set, they appear in that server almost instantly; without it, a global sync can take up to an hour.
 
@@ -123,26 +124,32 @@ Either fixes it — you don't need both. Option 2 is usually cleaner since it do
 
 ---
 
-## 7. How reaction/self-assign roles *would* work (not built in yet)
+## 7. Self-assign roles with `/rolemenu`
 
-You asked how this pattern works, so here's the mechanism — same no-database trick as the Interested button, just applied to roles:
+This works exactly like the Interested button — no database. Each role button's `custom_id` encodes the role ID directly (e.g. `self_role:123456789012345678`), so clicking it keeps working forever, even after a restart, because the ID lives in the button itself rather than in memory.
 
-1. You'd add a `/rolemenu` command (or reuse an existing one) that posts an embed listing the available roles, with one button per role.
-2. Each button's `custom_id` encodes the target role, e.g. `role_toggle:<ROLE_ID>` — exactly like `join_interested:<USER_ID>` does today.
-3. A raw `on_interaction` listener (same pattern as the existing one) checks for that prefix, reads the role ID back out of the `custom_id`, and does:
-   ```python
-   member = interaction.user  # a discord.Member in guild context
-   role = interaction.guild.get_role(role_id)
-   if role in member.roles:
-       await member.remove_roles(role)
-   else:
-       await member.add_roles(role)
+### How to set it up
+
+1. **Decide which roles you want self-assignable**, and get each role's ID (Discord Settings → Advanced → turn on Developer Mode, then right-click a role in Server Settings → Roles → "Copy Role ID").
+2. **Set `SELF_ROLES`** in your `.env` / Render environment, using the format:
    ```
-4. **Where you'd "send" it:** wherever you want the picker to live — usually a `#roles` channel. You'd run `/rolemenu` once in that channel, and the message (with its buttons) just sits there permanently; the persistence works the same way the Interested button survives restarts.
+   SELF_ROLES=ROLE_ID|Label|Emoji,ROLE_ID|Label|Emoji,...
+   ```
+   Emoji is optional per entry. Example:
+   ```
+   SELF_ROLES=111111111111111111|Gamer|🎮,222222222222222222|Artist|🎨,333333333333333333|Night Owl|🦉
+   ```
+3. **Give Milo the Manage Roles permission**, and in **Server Settings → Roles**, drag Milo's own role **above** every role listed in `SELF_ROLES` — Discord won't let a bot grant or remove a role ranked higher than its own, no matter what permission it has.
+4. Restart the bot so it picks up the new `SELF_ROLES` value.
 
-Two permission requirements to know about: Milo's own role must sit **above** every role it's meant to grant/remove in the server's role list (Discord enforces this — a bot can't manage a role ranked higher than its own), and Milo needs the **Manage Roles** permission.
+### How to use it in Discord
 
-This isn't implemented in `bot.py` yet since no specific roles were given — happy to add it once you tell me which roles and which channel.
+1. Go to whichever channel you want the role-picker to live in (commonly `#roles`).
+2. A member with the **Manager role** (`MANAGER_ROLE_ID`) types `/rolemenu` and runs it. This posts an embed listing every configured role, each with its own button.
+3. Anyone in the server can now click a button to **add** that role to themselves, and click it again to **remove** it — it toggles, and only they can see the ephemeral "Gave you..." / "Removed..." confirmation.
+4. The message stays there permanently. You don't need to re-run `/rolemenu` after a bot restart — the buttons keep working as-is. Only re-run it if you want to post a *fresh* menu (e.g. after changing `SELF_ROLES`).
+
+Running `/rolemenu` itself is restricted to the Manager role (same `MANAGER_ROLE_ID` used for `?send`) — regular members can't post new menus, but anyone can click the buttons on one that's already posted.
 
 ---
 
@@ -151,7 +158,8 @@ This isn't implemented in `bot.py` yet since no specific roles were given — ha
 `?send <message>` posts `<message>` in the current channel, exactly as Milo, then deletes your original command message so the channel stays clean.
 
 - It's a **plain text command**, not a slash command — so it never appears in Discord's `/` picker, and it's deliberately left out of `/help`.
-- Only members with the role ID in `MANAGER_ROLE_ID` can use it. Anyone else typing `?send ...` gets silently ignored — no error, no hint it exists.
+- Only members with the role ID in `MANAGER_ROLE_ID` can use it — the **same role** that's allowed to run `/rolemenu`, so you only have to set that role up once for both "common stuff."
+- Anyone else typing `?send ...` gets silently ignored — no error, no hint it exists.
 - If `MANAGER_ROLE_ID` isn't set in your environment, `?send` is completely disabled.
 
 Example: a Manager types `?send Server maintenance tonight at 9 PM!` in `#announcements`, and Milo deletes their message and posts `Server maintenance tonight at 9 PM!` in its place.
@@ -162,7 +170,7 @@ Example: a Manager types `?send Server maintenance tonight at 9 PM!` in `#announ
 
 | Command | Description |
 |---|---|
-| `/creator` | Intro for Milo (with the `:Milo:` emoji) + a clickable "AAPoke" link to the creator's profile. |
+| `/aboutme` | Milo's intro: who it is, what it does, and a clickable "AAPoke" link to its creator. |
 | `/join game:VBL` | Posts a VBL looking-for-players message with an Interested button, and notifies the VBL role. |
 | `/join game:Minecraft` | Same, for Minecraft. |
 | `/join game:<choice> message:your text` | Same as above, with an optional custom message appended. Rate-limited to once per 30s per user. |
@@ -173,6 +181,7 @@ Example: a Manager types `?send Server maintenance tonight at 9 PM!` in `#announ
 | `/roll sides:<n> count:<n>` | Rolls dice (defaults: 1 die, 6 sides). |
 | `/serverinfo` | Shows info about the current server. |
 | `/userinfo user:<member>` | Shows info about a member (defaults to yourself). |
+| `/rolemenu` | Posts the self-assign roles menu in the current channel. **Manager role only.** |
 | `/ping` | Replies with Milo's current Discord Gateway latency. |
 | `/help` | Shows this command list (minus the hidden `?send`). |
 | `?send <message>` | **Hidden.** Manager-role-only. Posts `<message>` as Milo. Not in `/help`, not a slash command. |
@@ -184,11 +193,12 @@ Example: a Manager types `?send Server maintenance tonight at 9 PM!` in `#announ
 | Variable | Required? | Purpose |
 |---|---|---|
 | `DISCORD_TOKEN` | **Required** | Your bot's token. Never commit this. |
-| `CREATOR_USER_ID` | Recommended | Your Discord user ID, used to build the `/creator` link. |
+| `CREATOR_USER_ID` | Recommended | Your Discord user ID, used to build the `/aboutme` link. |
 | `ALLOWED_GUILD_ID` | Recommended | Restricts the bot to one server and makes slash commands sync instantly. |
 | `MILO_EMOJI` | Optional | The server's `:Milo:` emoji code. Defaults to `<:Milo:1554818642804482078>`. |
 | `WELCOME_CHANNEL_ID` | Optional | Channel where new-member welcome messages post. Welcome feature is skipped if blank. |
-| `MANAGER_ROLE_ID` | Optional | The one role allowed to use `?send`. Feature is disabled if blank. |
+| `MANAGER_ROLE_ID` | Optional | The one role allowed to use `?send` **and** `/rolemenu`. Both are disabled if blank. |
+| `SELF_ROLES` | Optional | Self-assignable roles for `/rolemenu`, as `ROLE_ID\|Label\|Emoji,...`. `/rolemenu` has nothing to post if blank. |
 | `PORT` | Managed by Render | HTTP port for the health server. Don't set this yourself on Render. |
 
 See `.env.example` for a ready-to-copy version of all of these with comments.
@@ -197,7 +207,7 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 
 ## 11. Testing checklist
 
-- [ ] `/creator` replies with an embed: "Hi, I'm Milo! (emoji)", a group-management blurb, and a clickable "AAPoke" link.
+- [ ] `/aboutme` replies with an embed: Milo's intro, a bullet list of what it does, and a clickable "AAPoke" link.
 - [ ] `/join game:VBL` posts the VBL message with the correct role mention (and members of that role actually get notified) plus a green ✔️ Interested button.
 - [ ] `/join game:VBL message:Need 2 more players` appends the custom message on its own line.
 - [ ] `/join game:Minecraft` posts the Minecraft message with the correct role mention and notification.
@@ -215,15 +225,20 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - [ ] `?send Hello everyone` from a non-Manager does nothing at all (no reply, no error).
 - [ ] `/help` lists every command **except** `?send`.
 - [ ] Typing `?send` doesn't show up anywhere in Discord's `/` command picker.
+- [ ] `/rolemenu` from a Manager posts the role-picker embed with one button per `SELF_ROLES` entry.
+- [ ] `/rolemenu` from a non-Manager gets an ephemeral "you don't have permission" reply.
+- [ ] Clicking a role button gives you that role and an ephemeral "Gave you..." confirmation; clicking it again removes the role.
+- [ ] Restart the bot, then click a role button on an *old* `/rolemenu` message — it still works.
 - [ ] Visiting `https://your-render-url.onrender.com/` shows `Milo is running.`
 
 ---
 
 ## 12. Limitations / assumptions
 
-- Discord only renders `[text](url)` markdown as a clickable link **inside embeds**, not in plain message content, so `/creator` sends a small embed to make "AAPoke" clickable.
+- Discord only renders `[text](url)` markdown as a clickable link **inside embeds**, not in plain message content, so `/aboutme` sends a small embed to make "AAPoke" clickable.
 - `/poll` supports up to 5 options because Discord slash commands need fixed, named parameters rather than an open-ended list — `option3`–`option5` are optional.
-- The reaction/self-assign-roles feature is explained in Section 7 but **not implemented**, since no specific roles/channel were given yet.
+- `/rolemenu` and `?send` share the same `MANAGER_ROLE_ID` gate — set it once, both features use it.
+- `/rolemenu` can offer at most 25 roles (Discord's hard limit on buttons in one message); if `SELF_ROLES` has more, the extras are dropped with a log warning.
 - `?send` requires both `MANAGER_ROLE_ID` to be set and the Message Content intent to be enabled — without either, it silently does nothing.
 - Clicking your own **Interested** button is blocked with a friendly ephemeral message — remove that check in `bot.py` if you'd rather allow it.
 - Custom `/join` messages are capped at 300 characters; Discord's own per-message limit is 2000.

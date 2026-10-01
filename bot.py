@@ -65,10 +65,37 @@ ALLOWED_GUILD_ID = int(_raw_allowed_guild) if _raw_allowed_guild.isdigit() else 
 _raw_welcome_channel = os.getenv("WELCOME_CHANNEL_ID", "").strip()
 WELCOME_CHANNEL_ID = int(_raw_welcome_channel) if _raw_welcome_channel.isdigit() else None
 
-# Optional: the one role allowed to use the hidden "?send" command.
-# If not set, "?send" is completely disabled.
+# Optional: the one role allowed to use the hidden "?send" command AND to
+# post the self-assign role menu via /rolemenu.
+# If not set, both of those features are disabled.
 _raw_manager_role = os.getenv("MANAGER_ROLE_ID", "").strip()
 MANAGER_ROLE_ID = int(_raw_manager_role) if _raw_manager_role.isdigit() else None
+
+# Optional: self-assignable roles shown by /rolemenu, as
+# "ROLE_ID|Label|Emoji,ROLE_ID|Label|Emoji,...". Emoji is optional per entry.
+# A pipe delimiter is used (not a colon) so custom emoji codes like
+# <:Gamer:123456789012345678>, which already contain colons, parse cleanly.
+_raw_self_roles = os.getenv("SELF_ROLES", "").strip()
+SELF_ROLES: list[tuple[int, str, str | None]] = []
+if _raw_self_roles:
+    for _entry in _raw_self_roles.split(","):
+        _entry = _entry.strip()
+        if not _entry:
+            continue
+        _parts = _entry.split("|")
+        if len(_parts) < 2 or not _parts[0].strip().isdigit():
+            logger.warning("Skipping malformed SELF_ROLES entry: %r", _entry)
+            continue
+        _role_id = int(_parts[0].strip())
+        _label = _parts[1].strip()
+        _emoji = _parts[2].strip() if len(_parts) > 2 and _parts[2].strip() else None
+        SELF_ROLES.append((_role_id, _label, _emoji))
+    if len(SELF_ROLES) > 25:
+        logger.warning(
+            "SELF_ROLES has %d entries; only the first 25 fit on one button menu.",
+            len(SELF_ROLES),
+        )
+        SELF_ROLES = SELF_ROLES[:25]
 
 PORT = int(os.getenv("PORT", "10000"))
 
@@ -84,6 +111,9 @@ MINECRAFT_ROLE_MENTION = "<@&1536962762952146944>"
 
 # Prefix used to identify our "Interested" button clicks inside custom_id.
 JOIN_BUTTON_PREFIX = "join_interested:"
+
+# Prefix used to identify self-assign role button clicks inside custom_id.
+SELF_ROLE_BUTTON_PREFIX = "self_role:"
 
 # Custom status shown under the bot's name in the member list (right sidebar).
 BOT_CUSTOM_STATUS = "I am in Da Game GNG server! AAPoke made me!!"
@@ -253,21 +283,34 @@ class JoinView(discord.ui.View):
         self.add_item(button)
 
 
+class SelfRoleView(discord.ui.View):
+    """Posted once by /rolemenu. Each button's custom_id encodes the role ID
+    directly (e.g. "self_role:123456789012345678"), so clicking it keeps
+    working forever -- even after a bot restart -- with no database, using
+    the exact same trick as the Interested button above."""
+
+    def __init__(self):
+        super().__init__(timeout=None)  # timeout=None -> buttons never expire
+        for role_id, label, emoji in SELF_ROLES:
+            button = discord.ui.Button(
+                label=label,
+                emoji=emoji,  # None is fine -- Discord just shows no emoji
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"{SELF_ROLE_BUTTON_PREFIX}{role_id}",
+            )
+            self.add_item(button)
+
+
 # ---------------------------------------------------------------------------
 # Slash commands
 # ---------------------------------------------------------------------------
-@bot.tree.command(name="creator", description="Shows info about Milo and its creator.")
-async def creator_slash(interaction: discord.Interaction):
+@bot.tree.command(name="aboutme", description="Learn about Milo.")
+async def aboutme_slash(interaction: discord.Interaction):
     if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
         await interaction.response.send_message(
             "This bot is not configured for this server.", ephemeral=True
         )
         return
-
-    intro = (
-        f"Hi, I'm Milo! {MILO_EMOJI}\n"
-        f"I'm here to help with group management — organizing game lobbies and more."
-    )
 
     if CREATOR_USER_ID:
         profile_url = f"https://discord.com/users/{CREATOR_USER_ID}"
@@ -277,10 +320,18 @@ async def creator_slash(interaction: discord.Interaction):
     else:
         creator_line = "AAPoke is my creator (profile link not configured)"
 
-    embed = discord.Embed(
-        description=f"{intro}\n\n{creator_line}",
-        color=discord.Color.green(),
+    description = (
+        f"Hi, I'm Milo! {MILO_EMOJI} A cat-themed group-management bot, through and through.\n\n"
+        f"Here's what I get up to around here:\n"
+        f"• 🏐 Rounding up players for game lobbies with `/join`\n"
+        f"• 🎭 Letting you pick your own roles with `/rolemenu`\n"
+        f"• 🐾 Saying hi, flipping coins, rolling dice, answering the magic 8-ball, and running polls\n"
+        f"• 👋 Welcoming new members the moment they join\n\n"
+        f"I run on pure vibes and whatever's happening right now — no database, no memory banks, "
+        f"just me, my whiskers, and the occasional nap.\n\n"
+        f"{creator_line}"
     )
+    embed = discord.Embed(description=description, color=discord.Color.green())
     await interaction.response.send_message(embed=embed)
 
 
@@ -527,6 +578,56 @@ async def userinfo_slash(
     await interaction.response.send_message(embed=embed)
 
 
+@bot.tree.command(
+    name="rolemenu",
+    description="Post the self-assign roles menu here (Manager role only).",
+)
+async def rolemenu_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    # Same manager-only check used for the hidden ?send command.
+    if not MANAGER_ROLE_ID:
+        await interaction.response.send_message(
+            "MANAGER_ROLE_ID isn't configured, so this command is disabled.",
+            ephemeral=True,
+        )
+        return
+
+    member_role_ids = {r.id for r in getattr(interaction.user, "roles", [])}
+    if MANAGER_ROLE_ID not in member_role_ids:
+        await interaction.response.send_message(
+            "You don't have permission to use this.", ephemeral=True
+        )
+        return
+
+    if not SELF_ROLES:
+        await interaction.response.send_message(
+            "No self-assignable roles are configured. Set SELF_ROLES and restart Milo.",
+            ephemeral=True,
+        )
+        return
+
+    lines = []
+    for _role_id, label, emoji in SELF_ROLES:
+        prefix = f"{emoji} " if emoji else "• "
+        lines.append(f"{prefix}**{label}**")
+
+    embed = discord.Embed(
+        title=f"🎭 Pick your roles! {MILO_EMOJI}",
+        description=(
+            "Click a button below to add a role. Click it again to remove it — "
+            "toggle on, toggle off, as many times as you like.\n\n" + "\n".join(lines)
+        ),
+        color=discord.Color.green(),
+    )
+    view = SelfRoleView()
+    await interaction.response.send_message(embed=embed, view=view)
+
+
 @bot.tree.command(name="help", description="Shows all Milo commands.")
 async def help_slash(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -535,7 +636,7 @@ async def help_slash(interaction: discord.Interaction):
         color=discord.Color.blurple(),
     )
     embed.add_field(
-        name="/creator", value="Shows info about Milo and its creator.", inline=False
+        name="/aboutme", value="Learn about Milo and who made it.", inline=False
     )
     embed.add_field(name="/join game:VBL", value="Looks for VBL players.", inline=False)
     embed.add_field(
@@ -557,6 +658,11 @@ async def help_slash(interaction: discord.Interaction):
     embed.add_field(name="/roll sides:<n> count:<n>", value="Rolls dice.", inline=False)
     embed.add_field(name="/serverinfo", value="Shows info about this server.", inline=False)
     embed.add_field(name="/userinfo user:<member>", value="Shows info about a member.", inline=False)
+    embed.add_field(
+        name="/rolemenu",
+        value="Posts the self-assign roles menu here. Manager role only.",
+        inline=False,
+    )
     embed.add_field(name="/ping", value="Checks Milo's latency.", inline=False)
     embed.add_field(name="/help", value="Shows this command list.", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -670,6 +776,82 @@ async def on_member_join(member: discord.Member):
 # receives, regardless of whether a matching View object exists in memory,
 # so it keeps working after restarts as long as the message + button exist.
 # ---------------------------------------------------------------------------
+async def _handle_join_interested_click(interaction: discord.Interaction, custom_id: str) -> None:
+    if not is_allowed_guild(interaction.guild_id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    raw_id = custom_id[len(JOIN_BUTTON_PREFIX):]
+    try:
+        author_id = int(raw_id)
+    except ValueError:
+        logger.error("Received malformed join button custom_id: %r", custom_id)
+        await interaction.response.send_message(
+            "Sorry, I couldn't read who posted this request.", ephemeral=True
+        )
+        return
+
+    clicker_id = interaction.user.id
+
+    if clicker_id == author_id:
+        await interaction.response.send_message(
+            "You can't join your own request!", ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(f"<@{clicker_id}> is joining <@{author_id}>")
+
+
+async def _handle_self_role_click(interaction: discord.Interaction, custom_id: str) -> None:
+    if not is_allowed_guild(interaction.guild_id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    raw_id = custom_id[len(SELF_ROLE_BUTTON_PREFIX):]
+    try:
+        role_id = int(raw_id)
+    except ValueError:
+        logger.error("Received malformed self-role button custom_id: %r", custom_id)
+        await interaction.response.send_message(
+            "Sorry, that role button looks broken.", ephemeral=True
+        )
+        return
+
+    guild = interaction.guild
+    member = interaction.user
+    if guild is None or not isinstance(member, discord.Member):
+        await interaction.response.send_message(
+            "This only works inside a server.", ephemeral=True
+        )
+        return
+
+    role = guild.get_role(role_id)
+    if role is None:
+        await interaction.response.send_message(
+            "That role doesn't exist anymore.", ephemeral=True
+        )
+        return
+
+    try:
+        if role in member.roles:
+            await member.remove_roles(role, reason="Self-assign role button (removed)")
+            await interaction.response.send_message(f"➖ Removed **{role.name}**.", ephemeral=True)
+        else:
+            await member.add_roles(role, reason="Self-assign role button (added)")
+            await interaction.response.send_message(f"➕ Gave you **{role.name}**! {MILO_EMOJI}", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I don't have permission to manage that role -- make sure Milo's role "
+            "is above it in Server Settings → Roles, and that Milo has the "
+            "Manage Roles permission.",
+            ephemeral=True,
+        )
+
+
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
     try:
@@ -678,36 +860,12 @@ async def on_interaction(interaction: discord.Interaction):
 
         data = interaction.data or {}
         custom_id = data.get("custom_id", "")
-        if not custom_id.startswith(JOIN_BUTTON_PREFIX):
-            return
 
-        if not is_allowed_guild(interaction.guild_id):
-            await interaction.response.send_message(
-                "This bot is not configured for this server.", ephemeral=True
-            )
-            return
-
-        raw_id = custom_id[len(JOIN_BUTTON_PREFIX):]
-        try:
-            author_id = int(raw_id)
-        except ValueError:
-            logger.error("Received malformed join button custom_id: %r", custom_id)
-            await interaction.response.send_message(
-                "Sorry, I couldn't read who posted this request.", ephemeral=True
-            )
-            return
-
-        clicker_id = interaction.user.id
-
-        if clicker_id == author_id:
-            await interaction.response.send_message(
-                "You can't join your own request!", ephemeral=True
-            )
-            return
-
-        await interaction.response.send_message(
-            f"<@{clicker_id}> is joining <@{author_id}>"
-        )
+        if custom_id.startswith(JOIN_BUTTON_PREFIX):
+            await _handle_join_interested_click(interaction, custom_id)
+        elif custom_id.startswith(SELF_ROLE_BUTTON_PREFIX):
+            await _handle_self_role_click(interaction, custom_id)
+        # else: not a button we recognize -- ignore silently.
 
     except Exception:
         logger.exception("Unexpected error handling a button interaction")
