@@ -70,12 +70,12 @@ _raw_welcome_channel = os.getenv("WELCOME_CHANNEL_ID", "").strip()
 WELCOME_CHANNEL_ID = int(_raw_welcome_channel) if _raw_welcome_channel.isdigit() else None
 
 # Optional: the one role allowed to use the hidden "?send" command AND to
-# post the self-assign role menu via /rolemenu.
+# post the self-assign role menu via ?rolemenu.
 # If not set, both of those features are disabled.
 _raw_manager_role = os.getenv("MANAGER_ROLE_ID", "").strip()
 MANAGER_ROLE_ID = int(_raw_manager_role) if _raw_manager_role.isdigit() else None
 
-# Optional: self-assignable roles shown by /rolemenu, as
+# Optional: self-assignable roles shown by ?rolemenu, as
 # "ROLE_ID|Label|Emoji,ROLE_ID|Label|Emoji,...". Emoji is optional per entry.
 # A pipe delimiter is used (not a colon) so custom emoji codes like
 # <:Gamer:123456789012345678>, which already contain colons, parse cleanly.
@@ -288,7 +288,7 @@ class JoinView(discord.ui.View):
 
 
 class SelfRoleView(discord.ui.View):
-    """Posted once by /rolemenu. Each button's custom_id encodes the role ID
+    """Posted once by ?rolemenu. Each button's custom_id encodes the role ID
     directly (e.g. "self_role:123456789012345678"), so clicking it keeps
     working forever -- even after a bot restart -- with no database, using
     the exact same trick as the Interested button above."""
@@ -328,7 +328,7 @@ async def aboutme_slash(interaction: discord.Interaction):
         f"Hi, I'm Milo! {MILO_EMOJI} A cat-themed group-management bot, through and through.\n\n"
         f"Here's what I get up to around here:\n"
         f"• 🏐 Rounding up players for game lobbies with `/join`\n"
-        f"• 🎭 Letting you pick your own roles with `/rolemenu`\n"
+        f"• 🎭 Letting you pick your own roles\n"
         f"• 🐾 Saying hi, flipping coins, rolling dice, answering the magic 8-ball, and running polls\n"
         f"• 👋 Welcoming new members the moment they join\n\n"
         f"I run on pure vibes and whatever's happening right now — no database, no memory banks, "
