@@ -2,15 +2,19 @@
 Milo - a simple, single-server, cat-themed Discord bot.
 
 Features:
-- Slash commands (/creator, /join, /ping, /hi, /8ball, /poll, /coinflip,
-  /roll, /serverinfo, /userinfo, /help) using discord.py 2.x
+- Slash commands (/aboutme, /join, /ping, /hi, /8ball, /poll, /coinflip,
+  /roll, /serverinfo, /userinfo, /help) using discord.py 2.x -- these all
+  show up in Discord's "/" command list
 - A persistent "Interested" button on /join messages that survives bot
   restarts WITHOUT a database (the author's user ID is encoded in the
   button's custom_id)
 - A cat-themed welcome message when new members join
-- A hidden, Manager-role-only "?send" text command for posting announcements
-  as Milo -- intentionally NOT a slash command, so it never shows up in
-  Discord's "/" command list and isn't listed in /help either
+- A self-assign roles system (button-based, no database) posted via the
+  hidden "?rolemenu" command
+- Two hidden, Manager-role-only text commands: "?send" (post an announcement
+  as Milo) and "?rolemenu" (post the self-assign roles menu) -- both are
+  intentionally plain text commands, not slash commands, so neither ever
+  shows up in Discord's "/" command list and neither is listed in /help
 - A tiny built-in HTTP server (aiohttp) so this can run as a Render Free Web Service
 - No database, no local persistent files -- everything is derived from
   environment variables and Discord interaction/event data.
@@ -578,56 +582,6 @@ async def userinfo_slash(
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(
-    name="rolemenu",
-    description="Post the self-assign roles menu here (Manager role only).",
-)
-async def rolemenu_slash(interaction: discord.Interaction):
-    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
-        await interaction.response.send_message(
-            "This bot is not configured for this server.", ephemeral=True
-        )
-        return
-
-    # Same manager-only check used for the hidden ?send command.
-    if not MANAGER_ROLE_ID:
-        await interaction.response.send_message(
-            "MANAGER_ROLE_ID isn't configured, so this command is disabled.",
-            ephemeral=True,
-        )
-        return
-
-    member_role_ids = {r.id for r in getattr(interaction.user, "roles", [])}
-    if MANAGER_ROLE_ID not in member_role_ids:
-        await interaction.response.send_message(
-            "You don't have permission to use this.", ephemeral=True
-        )
-        return
-
-    if not SELF_ROLES:
-        await interaction.response.send_message(
-            "No self-assignable roles are configured. Set SELF_ROLES and restart Milo.",
-            ephemeral=True,
-        )
-        return
-
-    lines = []
-    for _role_id, label, emoji in SELF_ROLES:
-        prefix = f"{emoji} " if emoji else "• "
-        lines.append(f"{prefix}**{label}**")
-
-    embed = discord.Embed(
-        title=f"🎭 Pick your roles! {MILO_EMOJI}",
-        description=(
-            "Click a button below to add a role. Click it again to remove it — "
-            "toggle on, toggle off, as many times as you like.\n\n" + "\n".join(lines)
-        ),
-        color=discord.Color.green(),
-    )
-    view = SelfRoleView()
-    await interaction.response.send_message(embed=embed, view=view)
-
-
 @bot.tree.command(name="help", description="Shows all Milo commands.")
 async def help_slash(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -658,11 +612,6 @@ async def help_slash(interaction: discord.Interaction):
     embed.add_field(name="/roll sides:<n> count:<n>", value="Rolls dice.", inline=False)
     embed.add_field(name="/serverinfo", value="Shows info about this server.", inline=False)
     embed.add_field(name="/userinfo user:<member>", value="Shows info about a member.", inline=False)
-    embed.add_field(
-        name="/rolemenu",
-        value="Posts the self-assign roles menu here. Manager role only.",
-        inline=False,
-    )
     embed.add_field(name="/ping", value="Checks Milo's latency.", inline=False)
     embed.add_field(name="/help", value="Shows this command list.", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -691,12 +640,12 @@ async def on_app_command_error(
 
 
 # ---------------------------------------------------------------------------
-# Hidden "?send" command + auto-responses
+# Hidden "?send" and "?rolemenu" commands + auto-responses
 #
-# "?send <message>" is deliberately a plain text command, not a slash
-# command, so it never appears in Discord's "/" picker and is never listed
-# in /help. Only members with MANAGER_ROLE_ID can use it. Anyone else typing
-# it is silently ignored -- the command's existence isn't revealed.
+# Both are deliberately plain text commands, not slash commands, so neither
+# ever appears in Discord's "/" picker and neither is listed in /help. Only
+# members with MANAGER_ROLE_ID can use either one. Anyone else typing them
+# is silently ignored -- their existence isn't revealed.
 # ---------------------------------------------------------------------------
 async def _handle_send_command(message: discord.Message) -> None:
     if not MANAGER_ROLE_ID:
@@ -726,6 +675,42 @@ async def _handle_send_command(message: discord.Message) -> None:
     )
 
 
+async def _handle_rolemenu_command(message: discord.Message) -> None:
+    if not MANAGER_ROLE_ID:
+        return  # Feature disabled -- no manager role configured.
+    if message.guild is None or not isinstance(message.author, discord.Member):
+        return  # Only works inside a server, where roles exist.
+
+    author_role_ids = {role.id for role in message.author.roles}
+    if MANAGER_ROLE_ID not in author_role_ids:
+        return  # Not authorized -- stay silent.
+
+    if not SELF_ROLES:
+        return  # Nothing configured to post -- stay silent.
+
+    # Clean up the trigger message, same as ?send does.
+    try:
+        await message.delete()
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        pass
+
+    lines = []
+    for _role_id, label, emoji in SELF_ROLES:
+        prefix = f"{emoji} " if emoji else "• "
+        lines.append(f"{prefix}**{label}**")
+
+    embed = discord.Embed(
+        title=f"🎭 Pick your roles! {MILO_EMOJI}",
+        description=(
+            "Click a button below to add a role. Click it again to remove it — "
+            "toggle on, toggle off, as many times as you like.\n\n" + "\n".join(lines)
+        ),
+        color=discord.Color.green(),
+    )
+    view = SelfRoleView()
+    await message.channel.send(embed=embed, view=view)
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -736,6 +721,10 @@ async def on_message(message: discord.Message):
 
     if message.content.startswith("?send "):
         await _handle_send_command(message)
+        return
+
+    if message.content.strip().lower() == "?rolemenu":
+        await _handle_rolemenu_command(message)
         return
 
     if not AUTO_RESPONSES:
