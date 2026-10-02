@@ -3,14 +3,15 @@
 A simple, single-server, **cat-themed** Discord bot built with **Python 3.12+** and **discord.py 2.x**.
 
 Features:
-- Slash commands (shown in Discord's `/` picker): `/aboutme`, `/join`, `/hi`, `/8ball`, `/poll`, `/coinflip`, `/roll`, `/serverinfo`, `/userinfo`, `/ping`, `/help`
+- 26 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, lookups, and utility — see Section 9 for the full list
 - A persistent **✔️ Interested** button on `/join` messages — survives bot restarts, **no database required**
 - A cat-themed welcome message when new members join
 - Self-assign roles (button-based, no database), posted via the hidden `?rolemenu` command
 - Two hidden, Manager-role-only text commands — `?send` and `?rolemenu` — the **only** `?`-prefixed commands in the whole bot. Neither shows up in Discord's `/` picker and neither is listed in `/help`; they're documented here in the README only.
+- Several commands call free, keyless public APIs (cat facts/photos, quotes, dictionary, weather, translation, reaction gifs) — every call has a graceful fallback message if the API is briefly down or slow
 - Runs as a **Render Free Web Service** (Discord Gateway + a tiny HTTP health server in one process)
 - Secrets stay in environment variables, never in code
-- No database — everything is either generated live or derived from Discord interaction/event data
+- No database — everything is either generated live, pulled from a free public API, or derived from Discord interaction/event data
 
 ---
 
@@ -80,7 +81,7 @@ You should see log lines like `Logged in as Milo#1234`, `Connected to 1 guild(s)
 4. Click **Reset Token** (or **Copy**) to get your bot token. Put it in `.env` / Render as `DISCORD_TOKEN`. **Never share this token or commit it to GitHub.**
 5. Go to **OAuth2 → URL Generator**:
    - Scopes: check **bot** and **applications.commands**.
-   - Bot Permissions: at minimum **Send Messages**, **Embed Links**, **Add Reactions** (for `/poll`), **Manage Messages** (so `?send` can delete the triggering message), **Manage Roles** (for `?rolemenu` to grant/remove self-assign roles).
+   - Bot Permissions: at minimum **Send Messages**, **Embed Links**, **Add Reactions** (for `/poll`), **Manage Messages** (so `?send` can delete the triggering message), **Manage Roles** (for `?rolemenu` to grant/remove self-assign roles), **Read Message History** (for `/firstmessage`).
    - If you invited Milo before adding **Manage Roles**, regenerate the URL with it checked and re-invite — re-inviting with added permissions doesn't remove the bot or reset anything, it just grants the new permission.
 6. Copy the generated URL, open it in your browser, and invite the bot to your one server.
 7. After the bot logs in for the first time, it registers its slash commands automatically. If `ALLOWED_GUILD_ID` is set, they appear in that server almost instantly; without it, a global sync can take up to an hour.
@@ -170,22 +171,65 @@ For both: if `MANAGER_ROLE_ID` isn't set, the command is completely disabled. If
 
 ## 9. Command reference
 
+### Group & server
+
 | Command | Description |
 |---|---|
-| `/aboutme` | Milo's intro: who it is, what it does, and a clickable "AAPoke" link to its creator. |
 | `/join game:VBL` | Posts a VBL looking-for-players message with an Interested button, and notifies the VBL role. |
 | `/join game:Minecraft` | Same, for Minecraft. |
 | `/join game:<choice> message:your text` | Same as above, with an optional custom message appended. Rate-limited to once per 30s per user. |
-| `/hi` | Milo replies with one of 25 random cat-themed greetings. |
+| `/serverinfo` | Shows info about the current server. |
+| `/userinfo user:<member>` | Shows info about a member (defaults to yourself). |
+| `/ping` | Replies with Milo's current Discord Gateway latency. |
+
+### Cat Corner
+
+| Command | Description |
+|---|---|
+| `/aboutme` | Milo's intro: who it is, what it does, and a clickable "AAPoke" link to its creator. |
+| `/hi` | One of 25 random cat-themed greetings. |
+| `/purr` | A random cat-ism (pun or ASCII cat). |
+| `/catfact` | A random cat fact, via [catfact.ninja](https://catfact.ninja). |
+| `/meow` | A random cat photo, via [cataas.com](https://cataas.com). |
+
+### Fun & games
+
+| Command | Description |
+|---|---|
 | `/8ball question:<text>` | Ask the magic 8-ball a question. |
 | `/poll question option1 option2 ...` | Posts a poll (2–5 options) with number-emoji reactions for voting. |
 | `/coinflip` | Flips a coin. |
 | `/roll sides:<n> count:<n>` | Rolls dice (defaults: 1 die, 6 sides). |
-| `/serverinfo` | Shows info about the current server. |
-| `/userinfo user:<member>` | Shows info about a member (defaults to yourself). |
-| `/ping` | Replies with Milo's current Discord Gateway latency. |
-| `/help` | Shows this command list (minus the hidden `?send`). |
+| `/rps choice:rock` | Rock-paper-scissors against Milo, instant result. |
+| `/trivia` | A random trivia question with answer buttons (60s to answer, nothing persisted). |
+| `/hug user:<member>` | Hug someone, with a reaction gif via [otakugifs.xyz](https://otakugifs.xyz). |
+| `/slap user:<member>` | Same, but a (playful) slap. |
+| `/pat user:<member>` | Same, but a headpat. |
+
+### Lookups (free public APIs)
+
+| Command | Description |
+|---|---|
+| `/quote` | A random inspirational quote, via [zenquotes.io](https://zenquotes.io). |
+| `/define word:<text>` | Dictionary lookup, via [dictionaryapi.dev](https://dictionaryapi.dev). |
+| `/weather location:<place>` | Current temperature & wind speed, via [Open-Meteo](https://open-meteo.com) (no API key needed). |
+| `/translate text:<text> to:<lang>` | Translates text using a language code (`es`, `fr`, `hi`, ...), via [MyMemory](https://mymemory.translated.net). |
+
+### Utility
+
+| Command | Description |
+|---|---|
+| `/avatar user:<member>` | Shows a member's full-size avatar (defaults to yourself). |
+| `/firstmessage channel:<#channel>` | Jump-link to the first message ever posted in a channel (defaults to the current one). |
+| `/color hex_code:<code>` | Shows a swatch and the Discord embed-color value for a hex code. |
+
+### Everything else
+
+| Command | Description |
+|---|---|
+| `/help` | Shows the full command list (minus the hidden `?send` and `?rolemenu`). |
 | `?send <message>` | **Hidden.** Manager-role-only. Posts `<message>` as Milo. Not in `/help`, not a slash command. |
+| `?rolemenu` | **Hidden.** Manager-role-only. Posts the self-assign roles menu. Not in `/help`, not a slash command. |
 
 ---
 
@@ -231,6 +275,15 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - [ ] Typing `?rolemenu` or `?send` doesn't show up anywhere in Discord's `/` command picker, and neither appears in `/help`.
 - [ ] Clicking a role button gives you that role and an ephemeral "Gave you..." confirmation; clicking it again removes the role.
 - [ ] Restart the bot, then click a role button on an *old* `?rolemenu` message — it still works.
+- [ ] `/catfact` and `/meow` return a fact and a cat photo respectively.
+- [ ] `/purr` gives a random cat-themed one-liner.
+- [ ] `/avatar` shows your own avatar; `/avatar user:<someone>` shows theirs.
+- [ ] `/rps choice:rock` gives an instant win/lose/tie result.
+- [ ] `/trivia` posts a question with 4 answer buttons; clicking one gives an ephemeral correct/incorrect reply.
+- [ ] `/hug`, `/slap`, `/pat` each post a reaction gif (or fall back to text-only if the gif API is briefly down).
+- [ ] `/quote`, `/define word:cat`, `/weather location:London`, and `/translate text:Hello to:es` each return live results.
+- [ ] `/firstmessage` jump-links to the oldest message in the current channel.
+- [ ] `/color hex_code:ff6600` shows a swatch; an invalid code like `/color hex_code:zzz` gives a friendly error instead of crashing.
 - [ ] Visiting `https://your-render-url.onrender.com/` shows `Milo is running.`
 
 ---
@@ -244,5 +297,8 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - `?send` requires both `MANAGER_ROLE_ID` to be set and the Message Content intent to be enabled — without either, it silently does nothing.
 - Clicking your own **Interested** button is blocked with a friendly ephemeral message — remove that check in `bot.py` if you'd rather allow it.
 - Custom `/join` messages are capped at 300 characters; Discord's own per-message limit is 2000.
+- `/catfact`, `/meow`, `/quote`, `/define`, `/weather`, `/translate`, and `/hug`/`/slap`/`/pat` all call free, keyless public APIs (catfact.ninja, cataas.com, zenquotes.io, dictionaryapi.dev, Open-Meteo, MyMemory, otakugifs.xyz). None of them need an API key or env var, but they're third-party services outside your control — if one is briefly down, slow, or rate-limits you, the command replies with a friendly fallback message instead of crashing (and `/hug`/`/slap`/`/pat` still post as plain text without the gif).
+- `/trivia`'s question bank is a fixed local list in `bot.py` — add more by editing the `TRIVIA_QUESTIONS` list.
+- `/firstmessage` needs the **Read Message History** permission; without it, it replies with a clear "I don't have permission" message rather than failing silently.
 - The `/join` cooldown (30s per user) and `?send`'s message-delete step both need no persistence — they're either in-memory or one-shot actions.
 - On Render's Free plan, expect spin-down after ~15 minutes of inactivity and a slower "cold start" reconnect afterward — a Render platform limitation, not a bug in the bot.

@@ -31,6 +31,7 @@ import os
 import random
 import time
 
+import aiohttp
 import discord
 from aiohttp import web
 from discord import app_commands
@@ -240,8 +241,17 @@ class MiloClient(discord.Client):
     def __init__(self) -> None:
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
+        # Shared HTTP client session for the free public APIs behind
+        # /catfact, /meow, /quote, /define, /weather, /translate, and the
+        # /hug /slap /pat reaction gifs. Created in setup_hook (needs a
+        # running event loop) and closed in close() on shutdown.
+        self.session: aiohttp.ClientSession | None = None
 
     async def setup_hook(self) -> None:
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=8)
+        )
+
         if ALLOWED_GUILD_ID:
             guild_obj = discord.Object(id=ALLOWED_GUILD_ID)
             # Copies globally-defined commands into this guild and syncs
@@ -262,8 +272,28 @@ class MiloClient(discord.Client):
         if not MANAGER_ROLE_ID:
             logger.info("MANAGER_ROLE_ID not set -- the hidden ?send command is disabled.")
 
+    async def close(self) -> None:
+        if self.session is not None:
+            await self.session.close()
+        await super().close()
+
 
 bot = MiloClient()
+
+
+async def _fetch_json(url: str, **kwargs):
+    """GET a URL and return parsed JSON, or None on any failure. Used by all
+    the free-API-backed commands below so each one can fail gracefully
+    instead of crashing if an external API is slow, down, or rate-limited."""
+    try:
+        async with bot.session.get(url, **kwargs) as resp:
+            if resp.status != 200:
+                logger.warning("GET %s returned status %s", url, resp.status)
+                return None
+            return await resp.json(content_type=None)
+    except Exception:
+        logger.exception("Failed to fetch %s", url)
+        return None
 
 
 class JoinView(discord.ui.View):
@@ -582,6 +612,471 @@ async def userinfo_slash(
     await interaction.response.send_message(embed=embed)
 
 
+# ---------------------------------------------------------------------------
+# Cat Corner: /catfact, /meow, /purr
+# ---------------------------------------------------------------------------
+PURR_RESPONSES = [
+    "{emoji} Purrrrrr~",
+    "{emoji} /ᐠ. .ᐟ\\ゝ Meow.",
+    "{emoji} I knead you to know this moment was purr-fectly timed.",
+    "{emoji} =^..^= *stretches*",
+    "{emoji} Feline fine, thanks for asking!",
+    "{emoji} /ᐠ˵ •⩊• ˵マ I regret nothing.",
+    "{emoji} That's paws-itively the best thing I've heard all day.",
+    "{emoji} 乁( •_• )ㄏ *stares into your soul, then naps*",
+    "{emoji} This is fur real my favorite conversation.",
+    "{emoji} /ᐠ - ˕ -マ Purr purr.",
+    "{emoji} No thoughts, just vibes and a sunbeam.",
+    "{emoji} I'm feline a little mischievous right meow.",
+    "{emoji} ⩊• *chases a dust particle, loses interest immediately*",
+    "{emoji} Claw-some. Absolutely claw-some.",
+    "{emoji} /ᐠ.ᆺ.ᐟ\\ noot noot, said the cat, incorrectly.",
+]
+
+
+@bot.tree.command(name="catfact", description="Get a random cat fact.")
+async def catfact_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    data = await _fetch_json("https://catfact.ninja/fact")
+    fact = data.get("fact") if data else None
+    if not fact:
+        await interaction.followup.send(
+            f"{MILO_EMOJI} Hmm, my whiskers couldn't catch a fact this time. Try again?"
+        )
+        return
+    await interaction.followup.send(f"🐱 {fact}")
+
+
+@bot.tree.command(name="meow", description="Get a random cat photo.")
+async def meow_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    data = await _fetch_json("https://cataas.com/cat?json=true")
+    image_path = data.get("url") if data else None
+    if not image_path:
+        await interaction.followup.send(
+            f"{MILO_EMOJI} Couldn't fetch a cat photo right now — try again in a bit!"
+        )
+        return
+    image_url = f"https://cataas.com{image_path}" if image_path.startswith("/") else image_path
+    embed = discord.Embed(color=discord.Color.green())
+    embed.set_image(url=image_url)
+    embed.set_footer(text="via cataas.com")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="purr", description="A random cat-ism from Milo.")
+async def purr_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(random.choice(PURR_RESPONSES).format(emoji=MILO_EMOJI))
+
+
+# ---------------------------------------------------------------------------
+# Games: /rps, /trivia
+# ---------------------------------------------------------------------------
+RPS_EMOJI = {"rock": "🪨", "paper": "📄", "scissors": "✂️"}
+RPS_BEATS = {"rock": "scissors", "paper": "rock", "scissors": "paper"}
+
+
+@bot.tree.command(name="rps", description="Play rock-paper-scissors against Milo.")
+@app_commands.choices(
+    choice=[
+        app_commands.Choice(name="Rock", value="rock"),
+        app_commands.Choice(name="Paper", value="paper"),
+        app_commands.Choice(name="Scissors", value="scissors"),
+    ]
+)
+async def rps_slash(interaction: discord.Interaction, choice: app_commands.Choice[str]):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    player_pick = choice.value
+    milo_pick = random.choice(["rock", "paper", "scissors"])
+
+    if player_pick == milo_pick:
+        result = "It's a tie!"
+    elif RPS_BEATS[player_pick] == milo_pick:
+        result = "You win! 🎉"
+    else:
+        result = f"Milo wins! {MILO_EMOJI}"
+
+    await interaction.response.send_message(
+        f"{RPS_EMOJI[player_pick]} vs {RPS_EMOJI[milo_pick]} — **{result}**"
+    )
+
+
+TRIVIA_QUESTIONS = [
+    {
+        "question": "What is a group of cats called?",
+        "options": ["A clowder", "A pack", "A herd", "A gaggle"],
+        "answer": 0,
+    },
+    {
+        "question": "What is the largest planet in our solar system?",
+        "options": ["Saturn", "Neptune", "Jupiter", "Uranus"],
+        "answer": 2,
+    },
+    {
+        "question": "How many hearts does an octopus have?",
+        "options": ["1", "2", "3", "9"],
+        "answer": 2,
+    },
+    {
+        "question": "What language has the most native speakers worldwide?",
+        "options": ["English", "Spanish", "Hindi", "Mandarin Chinese"],
+        "answer": 3,
+    },
+    {
+        "question": "Cats can't taste which flavor?",
+        "options": ["Sour", "Bitter", "Sweet", "Salty"],
+        "answer": 2,
+    },
+    {
+        "question": "What's the smallest country in the world?",
+        "options": ["Monaco", "Vatican City", "San Marino", "Liechtenstein"],
+        "answer": 1,
+    },
+    {
+        "question": "How many bones are in the human body?",
+        "options": ["186", "206", "226", "246"],
+        "answer": 1,
+    },
+    {
+        "question": "What do you call a baby cat?",
+        "options": ["Cub", "Pup", "Kit", "Kitten"],
+        "answer": 3,
+    },
+    {
+        "question": "Which planet is known as the Red Planet?",
+        "options": ["Venus", "Mars", "Jupiter", "Mercury"],
+        "answer": 1,
+    },
+    {
+        "question": "What's the fastest land animal?",
+        "options": ["Lion", "Cheetah", "Pronghorn", "Greyhound"],
+        "answer": 1,
+    },
+]
+
+
+class TriviaButton(discord.ui.Button):
+    def __init__(self, label: str, index: int, correct_index: int):
+        super().__init__(label=label, style=discord.ButtonStyle.primary)
+        self.index = index
+        self.correct_index = correct_index
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if self.index == self.correct_index:
+            await interaction.response.send_message(
+                f"✅ Correct, {interaction.user.mention}! {MILO_EMOJI}", ephemeral=True
+            )
+        else:
+            correct_letter = "ABCD"[self.correct_index]
+            await interaction.response.send_message(
+                f"❌ Not quite, {interaction.user.mention} — the answer was **{correct_letter}**.",
+                ephemeral=True,
+            )
+
+
+class TriviaView(discord.ui.View):
+    def __init__(self, correct_index: int):
+        super().__init__(timeout=60)  # Short-lived -- no need to persist across restarts.
+        for i, letter in enumerate("ABCD"):
+            self.add_item(TriviaButton(letter, i, correct_index))
+
+
+@bot.tree.command(name="trivia", description="Answer a random trivia question.")
+async def trivia_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    q = random.choice(TRIVIA_QUESTIONS)
+    options_text = "\n".join(
+        f"**{letter}.** {opt}" for letter, opt in zip("ABCD", q["options"])
+    )
+    embed = discord.Embed(
+        title="🧠 Trivia Time!",
+        description=f"{q['question']}\n\n{options_text}",
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text="You have 60 seconds. Answers are shown only to you.")
+    view = TriviaView(q["answer"])
+    await interaction.response.send_message(embed=embed, view=view)
+
+
+# ---------------------------------------------------------------------------
+# Reaction commands: /hug, /slap, /pat
+# ---------------------------------------------------------------------------
+async def _send_reaction_gif(
+    interaction: discord.Interaction, reaction: str, target: discord.Member, verb: str
+) -> None:
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    data = await _fetch_json(f"https://api.otakugifs.xyz/gif?reaction={reaction}")
+    gif_url = data.get("url") if data else None
+    text = f"{interaction.user.mention} {verb} {target.mention}! {MILO_EMOJI}"
+
+    if gif_url:
+        embed = discord.Embed(description=text, color=discord.Color.green())
+        embed.set_image(url=gif_url)
+        await interaction.followup.send(embed=embed)
+    else:
+        await interaction.followup.send(text)
+
+
+@bot.tree.command(name="hug", description="Give someone a hug.")
+@app_commands.describe(user="Who to hug")
+async def hug_slash(interaction: discord.Interaction, user: discord.Member):
+    await _send_reaction_gif(interaction, "hug", user, "hugs")
+
+
+@bot.tree.command(name="slap", description="Slap someone (playfully!).")
+@app_commands.describe(user="Who to slap")
+async def slap_slash(interaction: discord.Interaction, user: discord.Member):
+    await _send_reaction_gif(interaction, "slap", user, "slaps")
+
+
+@bot.tree.command(name="pat", description="Give someone a headpat.")
+@app_commands.describe(user="Who to pat")
+async def pat_slash(interaction: discord.Interaction, user: discord.Member):
+    await _send_reaction_gif(interaction, "pat", user, "pats")
+
+
+# ---------------------------------------------------------------------------
+# Lookups: /quote, /define, /weather, /translate
+# ---------------------------------------------------------------------------
+@bot.tree.command(name="quote", description="Get a random inspirational quote.")
+async def quote_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    data = await _fetch_json("https://zenquotes.io/api/random")
+    quote_text = author = None
+    if isinstance(data, list) and data:
+        quote_text = data[0].get("q")
+        author = data[0].get("a")
+
+    if not quote_text:
+        await interaction.followup.send(
+            f"{MILO_EMOJI} Couldn't fetch a quote right now — try again soon."
+        )
+        return
+    await interaction.followup.send(f"💬 *\"{quote_text}\"*\n— {author or 'Unknown'}")
+
+
+@bot.tree.command(name="define", description="Look up a word's definition.")
+@app_commands.describe(word="The word to define")
+async def define_slash(interaction: discord.Interaction, word: str):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    clean_word = word.strip()
+    data = await _fetch_json(f"https://api.dictionaryapi.dev/api/v2/entries/en/{clean_word}")
+
+    if not data or not isinstance(data, list):
+        await interaction.followup.send(f"Couldn't find a definition for **{clean_word}**.")
+        return
+
+    entry = data[0]
+    meanings = entry.get("meanings", [])
+    if not meanings:
+        await interaction.followup.send(f"Couldn't find a definition for **{clean_word}**.")
+        return
+
+    embed = discord.Embed(title=f"📖 {entry.get('word', clean_word)}", color=discord.Color.blurple())
+    phonetic = entry.get("phonetic")
+    if phonetic:
+        embed.description = phonetic
+
+    for meaning in meanings[:3]:
+        part_of_speech = meaning.get("partOfSpeech", "meaning")
+        defs = meaning.get("definitions", [])
+        if defs:
+            embed.add_field(name=part_of_speech, value=defs[0].get("definition", "—"), inline=False)
+
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="weather", description="Get current weather for a location.")
+@app_commands.describe(location="City name, e.g. 'London' or 'Bengaluru'")
+async def weather_slash(interaction: discord.Interaction, location: str):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    geo = await _fetch_json(
+        f"https://geocoding-api.open-meteo.com/v1/search?name={location}&count=1"
+    )
+    results = geo.get("results") if geo else None
+    if not results:
+        await interaction.followup.send(f"Couldn't find a location called **{location}**.")
+        return
+
+    place = results[0]
+    lat, lon = place.get("latitude"), place.get("longitude")
+    place_name = place.get("name", location)
+    country = place.get("country", "")
+
+    forecast = await _fetch_json(
+        f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true"
+    )
+    current = forecast.get("current_weather") if forecast else None
+    if not current:
+        await interaction.followup.send(f"Couldn't fetch weather for **{place_name}**.")
+        return
+
+    embed = discord.Embed(
+        title=f"🌦️ Weather in {place_name}, {country}".strip(", "),
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="Temperature", value=f"{current.get('temperature')}°C")
+    embed.add_field(name="Wind Speed", value=f"{current.get('windspeed')} km/h")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="translate", description="Translate text to another language.")
+@app_commands.describe(text="Text to translate", to="Target language code, e.g. 'es', 'fr', 'hi'")
+async def translate_slash(interaction: discord.Interaction, text: str, to: str):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    params = {"q": text, "langpair": f"en|{to.strip()}"}
+    data = await _fetch_json("https://api.mymemory.translated.net/get", params=params)
+    translated = None
+    if data:
+        translated = data.get("responseData", {}).get("translatedText")
+
+    if not translated:
+        await interaction.followup.send(
+            "Couldn't translate that — try a different language code (e.g. `es`, `fr`, `hi`)."
+        )
+        return
+
+    embed = discord.Embed(color=discord.Color.blurple())
+    embed.add_field(name="Original", value=text, inline=False)
+    embed.add_field(name=f"Translated ({to})", value=translated, inline=False)
+    await interaction.followup.send(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# Utility: /avatar, /firstmessage, /color
+# ---------------------------------------------------------------------------
+@bot.tree.command(name="avatar", description="Show a member's full-size avatar.")
+@app_commands.describe(user="Whose avatar to show (defaults to you)")
+async def avatar_slash(interaction: discord.Interaction, user: discord.Member | None = None):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    member = user or interaction.user
+    embed = discord.Embed(title=f"{member.display_name}'s avatar", color=discord.Color.blurple())
+    embed.set_image(url=member.display_avatar.url)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="firstmessage", description="Jump to the first message in a channel.")
+@app_commands.describe(channel="Which channel (defaults to this one)")
+async def firstmessage_slash(
+    interaction: discord.Interaction, channel: discord.TextChannel | None = None
+):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    target_channel = channel or interaction.channel
+    if not isinstance(target_channel, discord.TextChannel):
+        await interaction.response.send_message("That's not a text channel.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    try:
+        first_message = [msg async for msg in target_channel.history(limit=1, oldest_first=True)]
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I don't have permission to read history in that channel."
+        )
+        return
+
+    if not first_message:
+        await interaction.followup.send(f"{target_channel.mention} has no messages yet.")
+        return
+
+    msg = first_message[0]
+    await interaction.followup.send(
+        f"📜 The first message in {target_channel.mention} was by **{msg.author}**: {msg.jump_url}"
+    )
+
+
+@bot.tree.command(name="color", description="Show a color swatch from a hex code.")
+@app_commands.describe(hex_code="Hex color code, e.g. 'ff6600' or '#00ff00'")
+async def color_slash(interaction: discord.Interaction, hex_code: str):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    clean_hex = hex_code.strip().lstrip("#").lower()
+    if len(clean_hex) == 3:
+        clean_hex = "".join(c * 2 for c in clean_hex)
+    if len(clean_hex) != 6 or any(c not in "0123456789abcdef" for c in clean_hex):
+        await interaction.response.send_message(
+            "That doesn't look like a valid hex code. Try something like `ff6600`.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(title=f"#{clean_hex.upper()}", color=int(clean_hex, 16))
+    embed.set_thumbnail(url=f"https://singlecolorimage.com/get/{clean_hex}/200x200")
+    await interaction.response.send_message(embed=embed)
+
+
 @bot.tree.command(name="help", description="Shows all Milo commands.")
 async def help_slash(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -590,29 +1085,58 @@ async def help_slash(interaction: discord.Interaction):
         color=discord.Color.blurple(),
     )
     embed.add_field(
-        name="/aboutme", value="Learn about Milo and who made it.", inline=False
-    )
-    embed.add_field(name="/join game:VBL", value="Looks for VBL players.", inline=False)
-    embed.add_field(
-        name="/join game:Minecraft", value="Looks for Minecraft players.", inline=False
-    )
-    embed.add_field(
-        name="/join game:<game> message:<text>",
-        value="Looks for players and includes an optional custom message.",
+        name="🎮 Group & Server",
+        value=(
+            "`/join game:VBL` / `game:Minecraft` — look for players "
+            "(add `message:<text>` for a custom note)\n"
+            "`/serverinfo` — info about this server\n"
+            "`/userinfo user:<member>` — info about a member\n"
+            "`/ping` — check Milo's latency"
+        ),
         inline=False,
     )
-    embed.add_field(name="/hi", value="Say hi to Milo and get a cat-themed reply.", inline=False)
-    embed.add_field(name="/8ball question:<text>", value="Ask the magic 8-ball a question.", inline=False)
     embed.add_field(
-        name="/poll question option1 option2 ...",
-        value="Posts a poll (up to 5 options) with number-reaction voting.",
+        name="🐱 Cat Corner",
+        value=(
+            "`/aboutme` — learn about Milo and who made it\n"
+            "`/hi` — say hi and get a cat-themed reply\n"
+            "`/purr` — a random cat-ism\n"
+            "`/catfact` — a random cat fact\n"
+            "`/meow` — a random cat photo"
+        ),
         inline=False,
     )
-    embed.add_field(name="/coinflip", value="Flips a coin.", inline=False)
-    embed.add_field(name="/roll sides:<n> count:<n>", value="Rolls dice.", inline=False)
-    embed.add_field(name="/serverinfo", value="Shows info about this server.", inline=False)
-    embed.add_field(name="/userinfo user:<member>", value="Shows info about a member.", inline=False)
-    embed.add_field(name="/ping", value="Checks Milo's latency.", inline=False)
+    embed.add_field(
+        name="🎉 Fun & Games",
+        value=(
+            "`/8ball question:<text>` — ask the magic 8-ball\n"
+            "`/poll question option1 option2 ...` — quick poll with reactions\n"
+            "`/coinflip` / `/roll sides:<n>` — flip a coin or roll dice\n"
+            "`/rps choice:rock` — rock-paper-scissors vs Milo\n"
+            "`/trivia` — answer a random trivia question\n"
+            "`/hug user` / `/slap user` / `/pat user` — react at someone"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🌍 Lookups",
+        value=(
+            "`/quote` — a random inspirational quote\n"
+            "`/define word:<text>` — dictionary lookup\n"
+            "`/weather location:<place>` — current weather\n"
+            "`/translate text:<text> to:<lang>` — translate text"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🛠️ Utility",
+        value=(
+            "`/avatar user:<member>` — full-size avatar\n"
+            "`/firstmessage channel:<#channel>` — jump to a channel's first message\n"
+            "`/color hex_code:<code>` — preview a hex color"
+        ),
+        inline=False,
+    )
     embed.add_field(name="/help", value="Shows this command list.", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
