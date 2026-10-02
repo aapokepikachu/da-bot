@@ -213,7 +213,7 @@ For both: if `MANAGER_ROLE_ID` isn't set, the command is completely disabled. If
 | `/wave user:<member>` | Wave at someone. |
 | `/fistbump user:<member>` | Fist bump someone (otakugifs category: `brofist`). |
 | `/nudge user:<member>` | Nudge someone (otakugifs category: `poke`). |
-| `/handshake user:<member>` | Shake hands with someone. **Unverified** — see limitations below. |
+| `/handshake user:<member>` | Shake hands with someone (otakugifs category: `handhold`, the closest real one — there's no literal "handshake" category). |
 
 ### Lookups (free public APIs)
 
@@ -290,7 +290,7 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - [ ] `/rps choice:rock` gives an instant win/lose/tie result.
 - [ ] `/trivia` posts a question with 4 answer buttons; clicking one gives an ephemeral correct/incorrect reply.
 - [ ] `/hug`, `/slap`, `/pat`, `/wave`, `/fistbump`, `/nudge` each post a reaction gif (or fall back to text-only if the gif API is briefly down).
-- [ ] `/handshake` — **check this one specifically**; if `handshake` isn't a real category on otakugifs.xyz, it'll post text-only every time instead of occasionally. See limitations below for how to fix it if so.
+- [ ] `/handshake` posts a gif (it's mapped to otakugifs' `handhold` category under the hood).
 - [ ] `/quote`, `/define word:cat`, `/weather location:London`, and `/translate text:Hello to:es` each return live results.
 - [ ] `/firstmessage` jump-links to the oldest message in the current channel.
 - [ ] `/color hex_code:ff6600` shows a swatch; an invalid code like `/color hex_code:zzz` gives a friendly error instead of crashing.
@@ -313,7 +313,7 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - Clicking your own **Interested** button is blocked with a friendly ephemeral message — remove that check in `bot.py` if you'd rather allow it.
 - Custom `/join` messages are capped at 300 characters; Discord's own per-message limit is 2000.
 - `/catfact`, `/meow`, `/catbreed`, `/quote`, `/define`, `/weather`, `/translate`, `/yesno`, and `/hug`/`/slap`/`/pat`/`/wave`/`/fistbump`/`/nudge`/`/handshake` all call free, keyless public APIs (catfact.ninja, cataas.com, TheCatAPI, zenquotes.io, dictionaryapi.dev, Open-Meteo, MyMemory, yesno.wtf, otakugifs.xyz). None of them need an API key or env var, but they're third-party services outside your control — if one is briefly down, slow, or rate-limits you, the command replies with a friendly fallback message instead of crashing (and the reaction commands still post as plain text without the gif).
-- `/handshake` is genuinely unverified — I couldn't confirm from here whether `handshake` is a real category on otakugifs.xyz (its full category list wasn't something I could check live). If `/handshake` only ever posts text with no gif, open `bot.py`, find `handshake_slash`, and swap `"handshake"` for a real category name (its API docs list all valid ones) — one-line fix, same pattern as how `fistbump` → `brofist` and `nudge` → `poke` were already mapped.
+- otakugifs.xyz has no literal "handshake" category, so `/handshake` is mapped to its closest real one, `handhold`, same as `/fistbump` → `brofist` and `/nudge` → `poke`.
 - `/riddle`'s question bank, like `/trivia`'s, is a fixed local list in `bot.py` (`RIDDLES`) — add more by editing it directly.
 - `/emojify` only converts letters a–z and digits 0–9; punctuation and other characters are left as-is. Long input is capped at 80 characters since very long emoji strings render poorly in Discord.
 - `/trivia`'s question bank is a fixed local list in `bot.py` — add more by editing the `TRIVIA_QUESTIONS` list.

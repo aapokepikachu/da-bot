@@ -892,10 +892,9 @@ async def nudge_slash(interaction: discord.Interaction, user: discord.Member):
 @bot.tree.command(name="handshake", description="Shake hands with someone.")
 @app_commands.describe(user="Who to shake hands with")
 async def handshake_slash(interaction: discord.Interaction, user: discord.Member):
-    # Unverified: "handshake" may not exist as a category on otakugifs.xyz.
-    # If it doesn't, _send_reaction_gif already falls back to text-only --
-    # nothing crashes either way.
-    await _send_reaction_gif(interaction, "handshake", user, "shakes hands with")
+    # otakugifs.xyz has no literal "handshake" category -- confirmed against
+    # its full reaction list. "handhold" is the closest real one.
+    await _send_reaction_gif(interaction, "handhold", user, "shakes hands with")
 
 
 # ---------------------------------------------------------------------------
