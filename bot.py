@@ -1077,6 +1077,211 @@ async def color_slash(interaction: discord.Interaction, hex_code: str):
     await interaction.response.send_message(embed=embed)
 
 
+# ---------------------------------------------------------------------------
+# More fun: /riddle, /slots, /emojify, /yesno, /catbreed
+# ---------------------------------------------------------------------------
+RIDDLES = [
+    {
+        "question": "I speak without a mouth and hear without ears. I have no body, but I come alive with wind. What am I?",
+        "answer": "An echo",
+    },
+    {
+        "question": "The more you take, the more you leave behind. What am I?",
+        "answer": "Footsteps",
+    },
+    {
+        "question": "What has keys but no locks, space but no room, and you can enter but not go inside?",
+        "answer": "A keyboard",
+    },
+    {
+        "question": "I'm tall when I'm young and short when I'm old. What am I?",
+        "answer": "A candle",
+    },
+    {
+        "question": "What has a head and a tail but no body?",
+        "answer": "A coin",
+    },
+    {
+        "question": "What can travel around the world while staying in a corner?",
+        "answer": "A stamp",
+    },
+    {
+        "question": "What has to be broken before you can use it?",
+        "answer": "An egg",
+    },
+    {
+        "question": "I have cities, but no houses. I have mountains, but no trees. I have water, but no fish. What am I?",
+        "answer": "A map",
+    },
+    {
+        "question": "What gets wetter the more it dries?",
+        "answer": "A towel",
+    },
+    {
+        "question": "What has one eye but can't see?",
+        "answer": "A needle",
+    },
+]
+
+
+class RiddleRevealButton(discord.ui.Button):
+    def __init__(self, answer: str):
+        super().__init__(label="Reveal Answer", style=discord.ButtonStyle.secondary, emoji="🔍")
+        self.answer = answer
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(
+            f"🔍 The answer is: **{self.answer}**", ephemeral=True
+        )
+
+
+class RiddleView(discord.ui.View):
+    def __init__(self, answer: str):
+        super().__init__(timeout=120)  # Short-lived -- no need to persist across restarts.
+        self.add_item(RiddleRevealButton(answer))
+
+
+@bot.tree.command(name="riddle", description="Get a random riddle. Answer is hidden behind a button.")
+async def riddle_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    riddle = random.choice(RIDDLES)
+    embed = discord.Embed(
+        title="🧩 Riddle me this...",
+        description=riddle["question"],
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text="Click below to reveal the answer (only you'll see it).")
+    view = RiddleView(riddle["answer"])
+    await interaction.response.send_message(embed=embed, view=view)
+
+
+SLOT_SYMBOLS = ["🍒", "🍋", "🍉", "🍇", "⭐", "7️⃣"]
+
+
+@bot.tree.command(name="slots", description="Spin the emoji slot machine.")
+async def slots_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    reels = [random.choice(SLOT_SYMBOLS) for _ in range(3)]
+    reels_text = " | ".join(reels)
+
+    if reels[0] == reels[1] == reels[2]:
+        result = f"🎉 JACKPOT! All three match! {MILO_EMOJI}"
+    elif reels[0] == reels[1] or reels[1] == reels[2] or reels[0] == reels[2]:
+        result = "✨ Almost! Two matched."
+    else:
+        result = "No match — try again!"
+
+    await interaction.response.send_message(f"🎰 [ {reels_text} ]\n{result}")
+
+
+def _emojify_text(text: str) -> str:
+    regional_offset = ord("🇦") - ord("a")
+    parts = []
+    for char in text.lower():
+        if char.isalpha() and "a" <= char <= "z":
+            parts.append(chr(ord(char) + regional_offset))
+        elif char.isdigit():
+            parts.append(f"{char}\ufe0f\u20e3")  # keycap digit emoji
+        elif char == " ":
+            parts.append("   ")  # a little extra gap reads better between emoji
+        else:
+            parts.append(char)  # leave punctuation etc. as-is
+    return "".join(parts)
+
+
+@bot.tree.command(name="emojify", description="Turn text into regional-indicator emoji letters.")
+@app_commands.describe(text="The text to emojify (letters and numbers work best)")
+async def emojify_slash(interaction: discord.Interaction, text: str):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    clean_text = text.strip()
+    if not clean_text:
+        await interaction.response.send_message("Give me some text to emojify!", ephemeral=True)
+        return
+    if len(clean_text) > 80:
+        clean_text = clean_text[:80]  # Discord renders very long emoji strings poorly
+
+    await interaction.response.send_message(_emojify_text(clean_text))
+
+
+@bot.tree.command(name="yesno", description="Get a random yes or no answer.")
+async def yesno_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    data = await _fetch_json("https://yesno.wtf/api")
+    answer = data.get("answer") if data else None
+    image_url = data.get("image") if data else None
+
+    if not answer:
+        await interaction.followup.send(
+            f"{MILO_EMOJI} Couldn't get an answer right now — the universe is undecided."
+        )
+        return
+
+    embed = discord.Embed(title=answer.upper(), color=discord.Color.green())
+    if image_url:
+        embed.set_image(url=image_url)
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="catbreed", description="Learn about a random cat breed.")
+async def catbreed_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    data = await _fetch_json("https://api.thecatapi.com/v1/breeds")
+    if not data or not isinstance(data, list):
+        await interaction.followup.send(
+            f"{MILO_EMOJI} Couldn't fetch cat breeds right now — try again soon."
+        )
+        return
+
+    breed = random.choice(data)
+    name = breed.get("name", "Mystery Cat")
+    description = breed.get("description", "No description available.")
+    temperament = breed.get("temperament", "Unknown")
+    origin = breed.get("origin", "Unknown")
+    life_span = breed.get("life_span", "Unknown")
+
+    embed = discord.Embed(
+        title=f"🐾 {name}",
+        description=description,
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="Temperament", value=temperament, inline=True)
+    embed.add_field(name="Origin", value=origin, inline=True)
+    embed.add_field(name="Life Span", value=f"{life_span} years", inline=True)
+
+    reference_image_id = breed.get("reference_image_id")
+    if reference_image_id:
+        embed.set_image(url=f"https://cdn2.thecatapi.com/images/{reference_image_id}.jpg")
+
+    await interaction.followup.send(embed=embed)
+
+
 @bot.tree.command(name="help", description="Shows all Milo commands.")
 async def help_slash(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -1102,7 +1307,8 @@ async def help_slash(interaction: discord.Interaction):
             "`/hi` — say hi and get a cat-themed reply\n"
             "`/purr` — a random cat-ism\n"
             "`/catfact` — a random cat fact\n"
-            "`/meow` — a random cat photo"
+            "`/meow` — a random cat photo\n"
+            "`/catbreed` — learn about a random cat breed"
         ),
         inline=False,
     )
@@ -1114,6 +1320,10 @@ async def help_slash(interaction: discord.Interaction):
             "`/coinflip` / `/roll sides:<n>` — flip a coin or roll dice\n"
             "`/rps choice:rock` — rock-paper-scissors vs Milo\n"
             "`/trivia` — answer a random trivia question\n"
+            "`/riddle` — a riddle with the answer hidden behind a button\n"
+            "`/slots` — spin the emoji slot machine\n"
+            "`/yesno` — a random yes/no answer with a reaction gif\n"
+            "`/emojify text:<text>` — turn text into emoji letters\n"
             "`/hug user` / `/slap user` / `/pat user` — react at someone"
         ),
         inline=False,

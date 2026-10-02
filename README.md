@@ -3,7 +3,7 @@
 A simple, single-server, **cat-themed** Discord bot built with **Python 3.12+** and **discord.py 2.x**.
 
 Features:
-- 26 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, lookups, and utility — see Section 9 for the full list
+- 31 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, lookups, and utility — see Section 9 for the full list
 - A persistent **✔️ Interested** button on `/join` messages — survives bot restarts, **no database required**
 - A cat-themed welcome message when new members join
 - Self-assign roles (button-based, no database), posted via the hidden `?rolemenu` command
@@ -191,6 +191,7 @@ For both: if `MANAGER_ROLE_ID` isn't set, the command is completely disabled. If
 | `/purr` | A random cat-ism (pun or ASCII cat). |
 | `/catfact` | A random cat fact, via [catfact.ninja](https://catfact.ninja). |
 | `/meow` | A random cat photo, via [cataas.com](https://cataas.com). |
+| `/catbreed` | A random cat breed, its temperament, origin, and life span, via [TheCatAPI](https://thecatapi.com). |
 
 ### Fun & games
 
@@ -202,6 +203,10 @@ For both: if `MANAGER_ROLE_ID` isn't set, the command is completely disabled. If
 | `/roll sides:<n> count:<n>` | Rolls dice (defaults: 1 die, 6 sides). |
 | `/rps choice:rock` | Rock-paper-scissors against Milo, instant result. |
 | `/trivia` | A random trivia question with answer buttons (60s to answer, nothing persisted). |
+| `/riddle` | A random riddle; the answer is hidden behind a "Reveal Answer" button (ephemeral, only you see it). |
+| `/slots` | Spins a 3-reel emoji slot machine — jackpot on all 3 matching, a near-miss on 2. |
+| `/yesno` | A random yes/no answer with a reaction gif, via [yesno.wtf](https://yesno.wtf). |
+| `/emojify text:<text>` | Converts letters to 🇦🇧🇨-style regional-indicator emoji and digits to keycap emoji. |
 | `/hug user:<member>` | Hug someone, with a reaction gif via [otakugifs.xyz](https://otakugifs.xyz). |
 | `/slap user:<member>` | Same, but a (playful) slap. |
 | `/pat user:<member>` | Same, but a headpat. |
@@ -284,6 +289,11 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - [ ] `/quote`, `/define word:cat`, `/weather location:London`, and `/translate text:Hello to:es` each return live results.
 - [ ] `/firstmessage` jump-links to the oldest message in the current channel.
 - [ ] `/color hex_code:ff6600` shows a swatch; an invalid code like `/color hex_code:zzz` gives a friendly error instead of crashing.
+- [ ] `/riddle` posts a question; clicking "Reveal Answer" shows the answer only to you (ephemeral).
+- [ ] `/slots` spins and gives a jackpot, near-miss, or no-match result.
+- [ ] `/emojify text:hi 5` gives back `🇭🇮 5️⃣`.
+- [ ] `/yesno` returns a yes/no/maybe answer with an image.
+- [ ] `/catbreed` returns a random breed's name, temperament, origin, life span, and photo.
 - [ ] Visiting `https://your-render-url.onrender.com/` shows `Milo is running.`
 
 ---
@@ -297,7 +307,9 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - `?send` requires both `MANAGER_ROLE_ID` to be set and the Message Content intent to be enabled — without either, it silently does nothing.
 - Clicking your own **Interested** button is blocked with a friendly ephemeral message — remove that check in `bot.py` if you'd rather allow it.
 - Custom `/join` messages are capped at 300 characters; Discord's own per-message limit is 2000.
-- `/catfact`, `/meow`, `/quote`, `/define`, `/weather`, `/translate`, and `/hug`/`/slap`/`/pat` all call free, keyless public APIs (catfact.ninja, cataas.com, zenquotes.io, dictionaryapi.dev, Open-Meteo, MyMemory, otakugifs.xyz). None of them need an API key or env var, but they're third-party services outside your control — if one is briefly down, slow, or rate-limits you, the command replies with a friendly fallback message instead of crashing (and `/hug`/`/slap`/`/pat` still post as plain text without the gif).
+- `/catfact`, `/meow`, `/catbreed`, `/quote`, `/define`, `/weather`, `/translate`, `/yesno`, and `/hug`/`/slap`/`/pat` all call free, keyless public APIs (catfact.ninja, cataas.com, TheCatAPI, zenquotes.io, dictionaryapi.dev, Open-Meteo, MyMemory, yesno.wtf, otakugifs.xyz). None of them need an API key or env var, but they're third-party services outside your control — if one is briefly down, slow, or rate-limits you, the command replies with a friendly fallback message instead of crashing (and `/hug`/`/slap`/`/pat` still post as plain text without the gif).
+- `/riddle`'s question bank, like `/trivia`'s, is a fixed local list in `bot.py` (`RIDDLES`) — add more by editing it directly.
+- `/emojify` only converts letters a–z and digits 0–9; punctuation and other characters are left as-is. Long input is capped at 80 characters since very long emoji strings render poorly in Discord.
 - `/trivia`'s question bank is a fixed local list in `bot.py` — add more by editing the `TRIVIA_QUESTIONS` list.
 - `/firstmessage` needs the **Read Message History** permission; without it, it replies with a clear "I don't have permission" message rather than failing silently.
 - The `/join` cooldown (30s per user) and `?send`'s message-delete step both need no persistence — they're either in-memory or one-shot actions.
