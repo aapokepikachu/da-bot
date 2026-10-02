@@ -869,6 +869,35 @@ async def pat_slash(interaction: discord.Interaction, user: discord.Member):
     await _send_reaction_gif(interaction, "pat", user, "pats")
 
 
+@bot.tree.command(name="wave", description="Wave at someone.")
+@app_commands.describe(user="Who to wave at")
+async def wave_slash(interaction: discord.Interaction, user: discord.Member):
+    await _send_reaction_gif(interaction, "wave", user, "waves at")
+
+
+@bot.tree.command(name="fistbump", description="Fist bump someone.")
+@app_commands.describe(user="Who to fist bump")
+async def fistbump_slash(interaction: discord.Interaction, user: discord.Member):
+    # otakugifs.xyz's category for this is "brofist" rather than "fistbump".
+    await _send_reaction_gif(interaction, "brofist", user, "fist bumps")
+
+
+@bot.tree.command(name="nudge", description="Nudge someone.")
+@app_commands.describe(user="Who to nudge")
+async def nudge_slash(interaction: discord.Interaction, user: discord.Member):
+    # otakugifs.xyz's category for this is "poke" rather than "nudge".
+    await _send_reaction_gif(interaction, "poke", user, "nudges")
+
+
+@bot.tree.command(name="handshake", description="Shake hands with someone.")
+@app_commands.describe(user="Who to shake hands with")
+async def handshake_slash(interaction: discord.Interaction, user: discord.Member):
+    # Unverified: "handshake" may not exist as a category on otakugifs.xyz.
+    # If it doesn't, _send_reaction_gif already falls back to text-only --
+    # nothing crashes either way.
+    await _send_reaction_gif(interaction, "handshake", user, "shakes hands with")
+
+
 # ---------------------------------------------------------------------------
 # Lookups: /quote, /define, /weather, /translate
 # ---------------------------------------------------------------------------
@@ -1324,7 +1353,8 @@ async def help_slash(interaction: discord.Interaction):
             "`/slots` — spin the emoji slot machine\n"
             "`/yesno` — a random yes/no answer with a reaction gif\n"
             "`/emojify text:<text>` — turn text into emoji letters\n"
-            "`/hug user` / `/slap user` / `/pat user` — react at someone"
+            "`/hug user` / `/slap user` / `/pat user` — react at someone\n"
+            "`/wave user` / `/fistbump user` / `/nudge user` / `/handshake user` — more reactions"
         ),
         inline=False,
     )
