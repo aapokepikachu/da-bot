@@ -889,12 +889,68 @@ async def nudge_slash(interaction: discord.Interaction, user: discord.Member):
     await _send_reaction_gif(interaction, "poke", user, "nudges")
 
 
-@bot.tree.command(name="handshake", description="Shake hands with someone.")
-@app_commands.describe(user="Who to shake hands with")
-async def handshake_slash(interaction: discord.Interaction, user: discord.Member):
-    # otakugifs.xyz has no literal "handshake" category -- confirmed against
-    # its full reaction list. "handhold" is the closest real one.
-    await _send_reaction_gif(interaction, "handhold", user, "shakes hands with")
+@bot.tree.command(name="handhold", description="Hold hands with someone.")
+@app_commands.describe(user="Who to hold hands with")
+async def handhold_slash(interaction: discord.Interaction, user: discord.Member):
+    await _send_reaction_gif(interaction, "handhold", user, "holds hands with")
+
+
+# otakugifs.xyz's full set of reaction categories, confirmed against its own
+# API wrapper docs. The dedicated commands above (hug, slap, pat, wave,
+# fistbump, nudge, handhold) cover the most common ones; /react below covers
+# every category via type-to-search autocomplete, since Discord caps a fixed
+# dropdown at 25 choices and there are nearly 70 of these.
+ALL_REACTIONS = [
+    "airkiss", "angrystare", "bite", "bleh", "blush", "brofist", "celebrate",
+    "cheers", "clap", "confused", "cool", "cry", "cuddle", "dance", "drool",
+    "evillaugh", "facepalm", "handhold", "happy", "headbang", "hug", "huh",
+    "kiss", "laugh", "lick", "love", "mad", "nervous", "no", "nom",
+    "nosebleed", "nuzzle", "nyah", "pat", "peek", "pinch", "poke", "pout",
+    "punch", "roll", "run", "sad", "scared", "shout", "shrug", "shy", "sigh",
+    "sip", "slap", "sleep", "slowclap", "smack", "smile", "smug", "sneeze",
+    "sorry", "stare", "stop", "surprised", "sweat", "thumbsup", "tickle",
+    "tired", "wave", "wink", "woah", "yawn", "yay", "yes",
+]
+
+
+async def _reaction_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    current_lower = current.strip().lower()
+    matches = [r for r in ALL_REACTIONS if current_lower in r][:25]
+    return [app_commands.Choice(name=r, value=r) for r in matches]
+
+
+@bot.tree.command(name="react", description="Send any anime reaction gif at someone (start typing to search).")
+@app_commands.describe(reaction="Which reaction (start typing to search all 67)", user="Who to react at")
+@app_commands.autocomplete(reaction=_reaction_autocomplete)
+async def react_slash(interaction: discord.Interaction, reaction: str, user: discord.Member):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    reaction_clean = reaction.strip().lower()
+    if reaction_clean not in ALL_REACTIONS:
+        await interaction.response.send_message(
+            f"`{reaction}` isn't a reaction I know — start typing in the `reaction` "
+            "field and pick one of the suggestions.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer()
+    data = await _fetch_json(f"https://api.otakugifs.xyz/gif?reaction={reaction_clean}")
+    gif_url = data.get("url") if data else None
+    text = f"{interaction.user.mention} reacts with **{reaction_clean}** at {user.mention}! {MILO_EMOJI}"
+
+    if gif_url:
+        embed = discord.Embed(description=text, color=discord.Color.green())
+        embed.set_image(url=gif_url)
+        await interaction.followup.send(embed=embed)
+    else:
+        await interaction.followup.send(text)
 
 
 # ---------------------------------------------------------------------------
@@ -1353,7 +1409,8 @@ async def help_slash(interaction: discord.Interaction):
             "`/yesno` — a random yes/no answer with a reaction gif\n"
             "`/emojify text:<text>` — turn text into emoji letters\n"
             "`/hug user` / `/slap user` / `/pat user` — react at someone\n"
-            "`/wave user` / `/fistbump user` / `/nudge user` / `/handshake user` — more reactions"
+            "`/wave user` / `/fistbump user` / `/nudge user` / `/handhold user` — more reactions\n"
+            "`/react reaction:<search> user` — any reaction, type to search"
         ),
         inline=False,
     )

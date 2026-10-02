@@ -3,7 +3,7 @@
 A simple, single-server, **cat-themed** Discord bot built with **Python 3.12+** and **discord.py 2.x**.
 
 Features:
-- 35 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, lookups, and utility — see Section 9 for the full list
+- 36 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, lookups, and utility — see Section 9 for the full list
 - A persistent **✔️ Interested** button on `/join` messages — survives bot restarts, **no database required**
 - A cat-themed welcome message when new members join
 - Self-assign roles (button-based, no database), posted via the hidden `?rolemenu` command
@@ -213,7 +213,8 @@ For both: if `MANAGER_ROLE_ID` isn't set, the command is completely disabled. If
 | `/wave user:<member>` | Wave at someone. |
 | `/fistbump user:<member>` | Fist bump someone (otakugifs category: `brofist`). |
 | `/nudge user:<member>` | Nudge someone (otakugifs category: `poke`). |
-| `/handshake user:<member>` | Shake hands with someone (otakugifs category: `handhold`, the closest real one — there's no literal "handshake" category). |
+| `/handhold user:<member>` | Hold hands with someone. |
+| `/react reaction:<search> user:<member>` | Any of the ~70 otakugifs.xyz reaction categories (airkiss, bite, cry, dance, punch, wink, ...) — start typing in the `reaction` field to search and pick one. |
 
 ### Lookups (free public APIs)
 
@@ -290,7 +291,8 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - [ ] `/rps choice:rock` gives an instant win/lose/tie result.
 - [ ] `/trivia` posts a question with 4 answer buttons; clicking one gives an ephemeral correct/incorrect reply.
 - [ ] `/hug`, `/slap`, `/pat`, `/wave`, `/fistbump`, `/nudge` each post a reaction gif (or fall back to text-only if the gif API is briefly down).
-- [ ] `/handshake` posts a gif (it's mapped to otakugifs' `handhold` category under the hood).
+- [ ] `/handhold` posts a gif.
+- [ ] `/react` — typing a few letters in the `reaction` field (e.g. `cr`) shows matching suggestions (e.g. `cry`, `celebrate`); picking one and a user posts that reaction's gif.
 - [ ] `/quote`, `/define word:cat`, `/weather location:London`, and `/translate text:Hello to:es` each return live results.
 - [ ] `/firstmessage` jump-links to the oldest message in the current channel.
 - [ ] `/color hex_code:ff6600` shows a swatch; an invalid code like `/color hex_code:zzz` gives a friendly error instead of crashing.
@@ -312,8 +314,9 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - `?send` requires both `MANAGER_ROLE_ID` to be set and the Message Content intent to be enabled — without either, it silently does nothing.
 - Clicking your own **Interested** button is blocked with a friendly ephemeral message — remove that check in `bot.py` if you'd rather allow it.
 - Custom `/join` messages are capped at 300 characters; Discord's own per-message limit is 2000.
-- `/catfact`, `/meow`, `/catbreed`, `/quote`, `/define`, `/weather`, `/translate`, `/yesno`, and `/hug`/`/slap`/`/pat`/`/wave`/`/fistbump`/`/nudge`/`/handshake` all call free, keyless public APIs (catfact.ninja, cataas.com, TheCatAPI, zenquotes.io, dictionaryapi.dev, Open-Meteo, MyMemory, yesno.wtf, otakugifs.xyz). None of them need an API key or env var, but they're third-party services outside your control — if one is briefly down, slow, or rate-limits you, the command replies with a friendly fallback message instead of crashing (and the reaction commands still post as plain text without the gif).
-- otakugifs.xyz has no literal "handshake" category, so `/handshake` is mapped to its closest real one, `handhold`, same as `/fistbump` → `brofist` and `/nudge` → `poke`.
+- `/catfact`, `/meow`, `/catbreed`, `/quote`, `/define`, `/weather`, `/translate`, `/yesno`, and `/hug`/`/slap`/`/pat`/`/wave`/`/fistbump`/`/nudge`/`/handhold`/`/react` all call free, keyless public APIs (catfact.ninja, cataas.com, TheCatAPI, zenquotes.io, dictionaryapi.dev, Open-Meteo, MyMemory, yesno.wtf, otakugifs.xyz). None of them need an API key or env var, but they're third-party services outside your control — if one is briefly down, slow, or rate-limits you, the command replies with a friendly fallback message instead of crashing (and the reaction commands still post as plain text without the gif).
+- otakugifs.xyz has no literal "handshake" category, so that reaction is offered as `/handhold` (its real category name) instead.
+- `/react` covers every otakugifs.xyz category via autocomplete rather than one slash command each — Discord caps a fixed dropdown at 25 choices, and there are nearly 70 categories. The dedicated commands (`/hug`, `/slap`, `/pat`, `/wave`, `/fistbump`, `/nudge`, `/handhold`) exist for the most common ones; everything else goes through `/react`.
 - `/riddle`'s question bank, like `/trivia`'s, is a fixed local list in `bot.py` (`RIDDLES`) — add more by editing it directly.
 - `/emojify` only converts letters a–z and digits 0–9; punctuation and other characters are left as-is. Long input is capped at 80 characters since very long emoji strings render poorly in Discord.
 - `/trivia`'s question bank is a fixed local list in `bot.py` — add more by editing the `TRIVIA_QUESTIONS` list.
