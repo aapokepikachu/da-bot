@@ -3,7 +3,7 @@
 A simple, single-server, **cat-themed** Discord bot built with **Python 3.12+** and **discord.py 2.x**.
 
 Features:
-- 36 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, lookups, and utility — see Section 9 for the full list
+- 34 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, lookups, and utility — see Section 9 for the full list
 - A persistent **✔️ Interested** button on `/join` messages — survives bot restarts, **no database required**
 - A cat-themed welcome message when new members join
 - Self-assign roles (button-based, no database), posted via the hidden `?rolemenu` command
@@ -210,11 +210,9 @@ For both: if `MANAGER_ROLE_ID` isn't set, the command is completely disabled. If
 | `/hug user:<member>` | Hug someone, with a reaction gif via [otakugifs.xyz](https://otakugifs.xyz). |
 | `/slap user:<member>` | Same, but a (playful) slap. |
 | `/pat user:<member>` | Same, but a headpat. |
-| `/wave user:<member>` | Wave at someone. |
-| `/fistbump user:<member>` | Fist bump someone (otakugifs category: `brofist`). |
-| `/nudge user:<member>` | Nudge someone (otakugifs category: `poke`). |
-| `/handhold user:<member>` | Hold hands with someone. |
-| `/react reaction:<search> user:<member>` | Any of the ~70 otakugifs.xyz reaction categories (airkiss, bite, cry, dance, punch, wink, ...) — start typing in the `reaction` field to search and pick one. |
+| `/fistbump user:<member>` | Same, but a fist bump (otakugifs category: `brofist`). |
+| `/nudge user:<member>` | Same, but a nudge (otakugifs category: `poke`). |
+| `/react reaction:<search> user:<member>` | Any other otakugifs.xyz reaction (wave, handhold, cry, dance, punch, wink, and ~65 more) — start typing in the `reaction` field to search and pick one. |
 
 ### Lookups (free public APIs)
 
@@ -223,7 +221,7 @@ For both: if `MANAGER_ROLE_ID` isn't set, the command is completely disabled. If
 | `/quote` | A random inspirational quote, via [zenquotes.io](https://zenquotes.io). |
 | `/define word:<text>` | Dictionary lookup, via [dictionaryapi.dev](https://dictionaryapi.dev). |
 | `/weather location:<place>` | Current temperature & wind speed, via [Open-Meteo](https://open-meteo.com) (no API key needed). |
-| `/translate text:<text> to:<lang>` | Translates text using a language code (`es`, `fr`, `hi`, ...), via [MyMemory](https://mymemory.translated.net). |
+| `/translate text:<text> to:<lang>` | Translates text using a language code (`es`, `fr`, `hi`, ...), via Google Translate's free web endpoint. |
 
 ### Utility
 
@@ -290,15 +288,15 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - [ ] `/avatar` shows your own avatar; `/avatar user:<someone>` shows theirs.
 - [ ] `/rps choice:rock` gives an instant win/lose/tie result.
 - [ ] `/trivia` posts a question with 4 answer buttons; clicking one gives an ephemeral correct/incorrect reply.
-- [ ] `/hug`, `/slap`, `/pat`, `/wave`, `/fistbump`, `/nudge` each post a reaction gif (or fall back to text-only if the gif API is briefly down).
-- [ ] `/handhold` posts a gif.
+- [ ] `/hug`, `/slap`, `/pat`, `/fistbump`, `/nudge` each post a reaction gif (or fall back to text-only if the gif API is briefly down).
 - [ ] `/react` — typing a few letters in the `reaction` field (e.g. `cr`) shows matching suggestions (e.g. `cry`, `celebrate`); picking one and a user posts that reaction's gif.
 - [ ] `/quote`, `/define word:cat`, `/weather location:London`, and `/translate text:Hello to:es` each return live results.
 - [ ] `/firstmessage` jump-links to the oldest message in the current channel.
 - [ ] `/color hex_code:ff6600` shows a swatch; an invalid code like `/color hex_code:zzz` gives a friendly error instead of crashing.
 - [ ] `/riddle` posts a question; clicking "Reveal Answer" shows the answer only to you (ephemeral).
 - [ ] `/slots` spins and gives a jackpot, near-miss, or no-match result.
-- [ ] `/emojify text:hi 5` gives back `🇭🇮 5️⃣`.
+- [ ] `/emojify text:hi 5` shows individual boxed letters (🇭 🇮) followed by a keycap 5️⃣ — **not** a country flag. If you see an actual flag, the zero-width-space fix didn't make it into your deployed copy.
+- [ ] `/translate text:Hello to:fr` returns an actual French translation, not the "couldn't translate" fallback message.
 - [ ] `/yesno` returns a yes/no/maybe answer with an image.
 - [ ] `/catbreed` returns a random breed's name, temperament, origin, life span, and photo.
 - [ ] Visiting `https://your-render-url.onrender.com/` shows `Milo is running.`
@@ -314,11 +312,11 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - `?send` requires both `MANAGER_ROLE_ID` to be set and the Message Content intent to be enabled — without either, it silently does nothing.
 - Clicking your own **Interested** button is blocked with a friendly ephemeral message — remove that check in `bot.py` if you'd rather allow it.
 - Custom `/join` messages are capped at 300 characters; Discord's own per-message limit is 2000.
-- `/catfact`, `/meow`, `/catbreed`, `/quote`, `/define`, `/weather`, `/translate`, `/yesno`, and `/hug`/`/slap`/`/pat`/`/wave`/`/fistbump`/`/nudge`/`/handhold`/`/react` all call free, keyless public APIs (catfact.ninja, cataas.com, TheCatAPI, zenquotes.io, dictionaryapi.dev, Open-Meteo, MyMemory, yesno.wtf, otakugifs.xyz). None of them need an API key or env var, but they're third-party services outside your control — if one is briefly down, slow, or rate-limits you, the command replies with a friendly fallback message instead of crashing (and the reaction commands still post as plain text without the gif).
-- otakugifs.xyz has no literal "handshake" category, so that reaction is offered as `/handhold` (its real category name) instead.
-- `/react` covers every otakugifs.xyz category via autocomplete rather than one slash command each — Discord caps a fixed dropdown at 25 choices, and there are nearly 70 categories. The dedicated commands (`/hug`, `/slap`, `/pat`, `/wave`, `/fistbump`, `/nudge`, `/handhold`) exist for the most common ones; everything else goes through `/react`.
+- `/catfact`, `/meow`, `/catbreed`, `/quote`, `/define`, `/weather`, `/translate`, `/yesno`, and `/hug`/`/slap`/`/pat`/`/fistbump`/`/nudge`/`/react` all call free, keyless public APIs (catfact.ninja, cataas.com, TheCatAPI, zenquotes.io, dictionaryapi.dev, Open-Meteo, Google Translate's web endpoint, yesno.wtf, otakugifs.xyz). None of them need an API key or env var, but they're third-party services outside your control — if one is briefly down, slow, or rate-limits you, the command replies with a friendly fallback message instead of crashing (and the reaction commands still post as plain text without the gif).
+- `/react` covers every otakugifs.xyz category via autocomplete rather than one slash command each — Discord caps a fixed dropdown at 25 choices, and there are nearly 70 categories. `/hug`, `/slap`, `/pat`, `/fistbump`, and `/nudge` stay as dedicated commands since they're the most common; everything else (wave, handhold, and ~65 more) goes through `/react`.
 - `/riddle`'s question bank, like `/trivia`'s, is a fixed local list in `bot.py` (`RIDDLES`) — add more by editing it directly.
-- `/emojify` only converts letters a–z and digits 0–9; punctuation and other characters are left as-is. Long input is capped at 80 characters since very long emoji strings render poorly in Discord.
+- `/emojify` only converts letters a–z and digits 0–9; punctuation and other characters are left as-is. Long input is capped at 80 characters since very long emoji strings render poorly in Discord. Each letter emoji is followed by an invisible zero-width space — without it, two adjacent regional-indicator letters (e.g. "H" + "I") get auto-merged into a country flag by Discord's renderer instead of showing as two separate boxed letters.
+- `/translate` uses Google Translate's free web endpoint (`translate.googleapis.com`) rather than a documented, officially supported API — it's unofficial and could change or break without notice someday, but in practice it's far more reliable than MyMemory's free tier, whose anonymous quota is shared across everyone using it and gets exhausted fast from shared hosting IPs like Render's.
 - `/trivia`'s question bank is a fixed local list in `bot.py` — add more by editing the `TRIVIA_QUESTIONS` list.
 - `/firstmessage` needs the **Read Message History** permission; without it, it replies with a clear "I don't have permission" message rather than failing silently.
 - The `/join` cooldown (30s per user) and `?send`'s message-delete step both need no persistence — they're either in-memory or one-shot actions.

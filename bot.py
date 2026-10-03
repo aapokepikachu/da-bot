@@ -869,12 +869,6 @@ async def pat_slash(interaction: discord.Interaction, user: discord.Member):
     await _send_reaction_gif(interaction, "pat", user, "pats")
 
 
-@bot.tree.command(name="wave", description="Wave at someone.")
-@app_commands.describe(user="Who to wave at")
-async def wave_slash(interaction: discord.Interaction, user: discord.Member):
-    await _send_reaction_gif(interaction, "wave", user, "waves at")
-
-
 @bot.tree.command(name="fistbump", description="Fist bump someone.")
 @app_commands.describe(user="Who to fist bump")
 async def fistbump_slash(interaction: discord.Interaction, user: discord.Member):
@@ -889,17 +883,12 @@ async def nudge_slash(interaction: discord.Interaction, user: discord.Member):
     await _send_reaction_gif(interaction, "poke", user, "nudges")
 
 
-@bot.tree.command(name="handhold", description="Hold hands with someone.")
-@app_commands.describe(user="Who to hold hands with")
-async def handhold_slash(interaction: discord.Interaction, user: discord.Member):
-    await _send_reaction_gif(interaction, "handhold", user, "holds hands with")
-
-
 # otakugifs.xyz's full set of reaction categories, confirmed against its own
-# API wrapper docs. The dedicated commands above (hug, slap, pat, wave,
-# fistbump, nudge, handhold) cover the most common ones; /react below covers
-# every category via type-to-search autocomplete, since Discord caps a fixed
-# dropdown at 25 choices and there are nearly 70 of these.
+# API wrapper docs. /hug, /slap, /pat, /fistbump, and /nudge above are
+# dedicated commands; every other category (wave, handhold, and everything
+# else) goes through /react below via type-to-search autocomplete, since
+# Discord caps a fixed dropdown at 25 choices and there are nearly 70 of
+# these.
 ALL_REACTIONS = [
     "airkiss", "angrystare", "bite", "bleh", "blush", "brofist", "celebrate",
     "cheers", "clap", "confused", "cool", "cry", "cuddle", "dance", "drool",
@@ -1066,13 +1055,27 @@ async def translate_slash(interaction: discord.Interaction, text: str, to: str):
         return
 
     await interaction.response.defer()
-    params = {"q": text, "langpair": f"en|{to.strip()}"}
-    data = await _fetch_json("https://api.mymemory.translated.net/get", params=params)
+    target_lang = to.strip().lower()
+    # Uses Google Translate's free, keyless web endpoint (the same one many
+    # open-source translate bots use) rather than MyMemory -- MyMemory's
+    # anonymous free tier is shared and heavily rate-limited, which made it
+    # fail constantly when deployed (shared hosting IPs exhaust its daily
+    # quota fast). This endpoint has no official docs/SLA, so it could
+    # change someday, but it's far more reliable in practice.
+    params = {"client": "gtx", "sl": "auto", "tl": target_lang, "dt": "t", "q": text}
+    data = await _fetch_json("https://translate.googleapis.com/translate_a/single", params=params)
+
     translated = None
-    if data:
-        translated = data.get("responseData", {}).get("translatedText")
+    if data and isinstance(data, list) and data and data[0]:
+        try:
+            translated = "".join(segment[0] for segment in data[0] if segment and segment[0])
+        except (IndexError, TypeError):
+            translated = None
 
     if not translated:
+        logger.warning(
+            "Translate failed for text=%r to=%r -- raw response: %r", text, to, data
+        )
         await interaction.followup.send(
             "Couldn't translate that — try a different language code (e.g. `es`, `fr`, `hi`)."
         )
@@ -1080,7 +1083,7 @@ async def translate_slash(interaction: discord.Interaction, text: str, to: str):
 
     embed = discord.Embed(color=discord.Color.blurple())
     embed.add_field(name="Original", value=text, inline=False)
-    embed.add_field(name=f"Translated ({to})", value=translated, inline=False)
+    embed.add_field(name=f"Translated ({target_lang})", value=translated, inline=False)
     await interaction.followup.send(embed=embed)
 
 
@@ -1270,14 +1273,20 @@ async def slots_slash(interaction: discord.Interaction):
 
 def _emojify_text(text: str) -> str:
     regional_offset = ord("🇦") - ord("a")
+    # Two regional-indicator letters placed directly next to each other get
+    # auto-merged into a country flag by Discord's renderer (e.g. "H"+"I"
+    # becomes a flag instead of two boxed letters). A zero-width space
+    # between them is invisible but breaks that adjacency, so each letter
+    # renders on its own.
+    zwsp = "\u200b"
     parts = []
     for char in text.lower():
         if char.isalpha() and "a" <= char <= "z":
-            parts.append(chr(ord(char) + regional_offset))
+            parts.append(chr(ord(char) + regional_offset) + zwsp)
         elif char.isdigit():
             parts.append(f"{char}\ufe0f\u20e3")  # keycap digit emoji
         elif char == " ":
-            parts.append("   ")  # a little extra gap reads better between emoji
+            parts.append("  ")  # a little extra gap reads better between emoji
         else:
             parts.append(char)  # leave punctuation etc. as-is
     return "".join(parts)
@@ -1408,9 +1417,9 @@ async def help_slash(interaction: discord.Interaction):
             "`/slots` — spin the emoji slot machine\n"
             "`/yesno` — a random yes/no answer with a reaction gif\n"
             "`/emojify text:<text>` — turn text into emoji letters\n"
-            "`/hug user` / `/slap user` / `/pat user` — react at someone\n"
-            "`/wave user` / `/fistbump user` / `/nudge user` / `/handhold user` — more reactions\n"
-            "`/react reaction:<search> user` — any reaction, type to search"
+            "`/hug user` / `/slap user` / `/pat user` / `/fistbump user` / `/nudge user` — react at someone\n"
+            "`/react reaction:<search> user` — any other reaction (wave, handhold, cry, "
+            "dance, punch, and ~65 more), type to search"
         ),
         inline=False,
     )
