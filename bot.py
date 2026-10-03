@@ -30,6 +30,7 @@ import logging
 import os
 import random
 import time
+from urllib.parse import quote
 
 import aiohttp
 import discord
@@ -998,7 +999,12 @@ async def define_slash(interaction: discord.Interaction, word: str):
 
     await interaction.response.defer()
     clean_word = word.strip()
-    data = await _fetch_json(f"https://api.dictionaryapi.dev/api/v2/entries/en/{clean_word}")
+    # Percent-encode before building the URL -- an un-encoded comma, accented
+    # letter, etc. going straight into the path was causing the API's
+    # edge/CDN to hang instead of returning a clean 404, which made even the
+    # automatic retry in _fetch_json fail the same way twice.
+    encoded_word = quote(clean_word, safe="")
+    data = await _fetch_json(f"https://api.dictionaryapi.dev/api/v2/entries/en/{encoded_word}")
 
     if not data or not isinstance(data, list):
         await interaction.followup.send(f"Couldn't find a definition for **{clean_word}**.")
@@ -1034,8 +1040,12 @@ async def weather_slash(interaction: discord.Interaction, location: str):
         return
 
     await interaction.response.defer()
+    # Use aiohttp's params (not an f-string) so aiohttp handles encoding --
+    # a raw space, accented letter, or "&" in location would otherwise break
+    # the URL, same class of bug that was hanging /define.
     geo = await _fetch_json(
-        f"https://geocoding-api.open-meteo.com/v1/search?name={location}&count=1"
+        "https://geocoding-api.open-meteo.com/v1/search",
+        params={"name": location, "count": 1},
     )
     results = geo.get("results") if geo else None
     if not results:
