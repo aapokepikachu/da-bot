@@ -62,6 +62,12 @@ CREATOR_USER_ID = os.getenv("CREATOR_USER_ID", "").strip()
 # us, but stays overridable via env in case you ever move servers.
 MILO_EMOJI = os.getenv("MILO_EMOJI", "<:Milo:1554818642804482078>").strip()
 
+# Optional: TheCatAPI started requiring an API key on /v1/breeds around late
+# September 2026 (it used to work unauthenticated). Free to get at
+# thecatapi.com/signup. Without it, /catbreed is disabled with a clear
+# message rather than failing silently.
+CAT_API_KEY = os.getenv("CAT_API_KEY", "").strip()
+
 _raw_allowed_guild = os.getenv("ALLOWED_GUILD_ID", "").strip()
 ALLOWED_GUILD_ID = int(_raw_allowed_guild) if _raw_allowed_guild.isdigit() else None
 
@@ -249,7 +255,7 @@ class MiloClient(discord.Client):
 
     async def setup_hook(self) -> None:
         self.session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=8)
+            timeout=aiohttp.ClientTimeout(total=10)
         )
 
         if ALLOWED_GUILD_ID:
@@ -281,19 +287,32 @@ class MiloClient(discord.Client):
 bot = MiloClient()
 
 
-async def _fetch_json(url: str, **kwargs):
+async def _fetch_json(url: str, retries: int = 1, **kwargs):
     """GET a URL and return parsed JSON, or None on any failure. Used by all
     the free-API-backed commands below so each one can fail gracefully
-    instead of crashing if an external API is slow, down, or rate-limited."""
-    try:
-        async with bot.session.get(url, **kwargs) as resp:
-            if resp.status != 200:
-                logger.warning("GET %s returned status %s", url, resp.status)
-                return None
-            return await resp.json(content_type=None)
-    except Exception:
-        logger.exception("Failed to fetch %s", url)
-        return None
+    instead of crashing if an external API is slow, down, or rate-limited.
+
+    Free public APIs occasionally have a single slow/dropped request without
+    actually being down, so a timeout gets one automatic retry (default) --
+    everything else (404, 429, connection refused, etc.) fails immediately
+    without retrying, since retrying those wastes the deferred-response
+    window for no benefit."""
+    for attempt in range(retries + 1):
+        try:
+            async with bot.session.get(url, **kwargs) as resp:
+                if resp.status != 200:
+                    logger.warning("GET %s returned status %s", url, resp.status)
+                    return None
+                return await resp.json(content_type=None)
+        except asyncio.TimeoutError:
+            if attempt < retries:
+                logger.warning("Timed out fetching %s, retrying...", url)
+                continue
+            logger.warning("Timed out fetching %s after %d attempt(s)", url, retries + 1)
+            return None
+        except Exception:
+            logger.exception("Failed to fetch %s", url)
+            return None
 
 
 class JoinView(discord.ui.View):
@@ -1045,6 +1064,55 @@ async def weather_slash(interaction: discord.Interaction, location: str):
     await interaction.followup.send(embed=embed)
 
 
+# Free, keyless translate providers get overwhelmed fast on shared hosting
+# IPs like Render's -- many different apps hammer the same handful of free
+# endpoints, so any single one can rate-limit the whole IP range regardless
+# of how little *this* bot calls it. Trying several independent providers in
+# order means one being blocked doesn't take the command down entirely.
+async def _try_google_translate(text: str, target_lang: str) -> str | None:
+    params = {"client": "gtx", "sl": "auto", "tl": target_lang, "dt": "t", "q": text}
+    data = await _fetch_json("https://translate.googleapis.com/translate_a/single", params=params)
+    if data and isinstance(data, list) and data and data[0]:
+        try:
+            return "".join(seg[0] for seg in data[0] if seg and seg[0]) or None
+        except (IndexError, TypeError):
+            return None
+    return None
+
+
+async def _try_mymemory_translate(text: str, target_lang: str) -> str | None:
+    params = {"q": text, "langpair": f"en|{target_lang}"}
+    data = await _fetch_json("https://api.mymemory.translated.net/get", params=params)
+    if data:
+        translated = data.get("responseData", {}).get("translatedText")
+        # MyMemory sometimes returns a 200 with an error/quota message
+        # sitting in the translatedText field instead of a real translation.
+        if translated and "QUOTA" not in translated.upper() and "MYMEMORY WARNING" not in translated.upper():
+            return translated
+    return None
+
+
+async def _try_libretranslate(text: str, target_lang: str) -> str | None:
+    payload = {"q": text, "source": "auto", "target": target_lang, "format": "text"}
+    try:
+        async with bot.session.post("https://libretranslate.com/translate", json=payload) as resp:
+            if resp.status != 200:
+                logger.warning("LibreTranslate returned status %s", resp.status)
+                return None
+            data = await resp.json(content_type=None)
+    except Exception:
+        logger.exception("LibreTranslate request failed")
+        return None
+    return data.get("translatedText") if data else None
+
+
+TRANSLATE_PROVIDERS = [
+    ("Google Translate", _try_google_translate),
+    ("MyMemory", _try_mymemory_translate),
+    ("LibreTranslate", _try_libretranslate),
+]
+
+
 @bot.tree.command(name="translate", description="Translate text to another language.")
 @app_commands.describe(text="Text to translate", to="Target language code, e.g. 'es', 'fr', 'hi'")
 async def translate_slash(interaction: discord.Interaction, text: str, to: str):
@@ -1056,31 +1124,31 @@ async def translate_slash(interaction: discord.Interaction, text: str, to: str):
 
     await interaction.response.defer()
     target_lang = to.strip().lower()
-    # Uses Google Translate's free, keyless web endpoint (the same one many
-    # open-source translate bots use) rather than MyMemory -- MyMemory's
-    # anonymous free tier is shared and heavily rate-limited, which made it
-    # fail constantly when deployed (shared hosting IPs exhaust its daily
-    # quota fast). This endpoint has no official docs/SLA, so it could
-    # change someday, but it's far more reliable in practice.
-    params = {"client": "gtx", "sl": "auto", "tl": target_lang, "dt": "t", "q": text}
-    data = await _fetch_json("https://translate.googleapis.com/translate_a/single", params=params)
 
     translated = None
-    if data and isinstance(data, list) and data and data[0]:
+    used_provider = None
+    for provider_name, provider_fn in TRANSLATE_PROVIDERS:
         try:
-            translated = "".join(segment[0] for segment in data[0] if segment and segment[0])
-        except (IndexError, TypeError):
+            translated = await provider_fn(text, target_lang)
+        except Exception:
+            logger.exception("%s translate provider raised an exception", provider_name)
             translated = None
+        if translated:
+            used_provider = provider_name
+            break
 
     if not translated:
         logger.warning(
-            "Translate failed for text=%r to=%r -- raw response: %r", text, to, data
+            "All translate providers failed for text=%r to=%r", text, to
         )
         await interaction.followup.send(
-            "Couldn't translate that — try a different language code (e.g. `es`, `fr`, `hi`)."
+            "Couldn't translate that — all translation services seem to be rate-limited "
+            "or down right now. Try again in a bit, or try a different language code "
+            "(e.g. `es`, `fr`, `hi`)."
         )
         return
 
+    logger.info("Translated via %s", used_provider)
     embed = discord.Embed(color=discord.Color.blurple())
     embed.add_field(name="Original", value=text, inline=False)
     embed.add_field(name=f"Translated ({target_lang})", value=translated, inline=False)
@@ -1344,8 +1412,20 @@ async def catbreed_slash(interaction: discord.Interaction):
         )
         return
 
+    if not CAT_API_KEY:
+        await interaction.response.send_message(
+            f"{MILO_EMOJI} `/catbreed` needs a free TheCatAPI key to work -- ask "
+            "whoever runs this bot to grab one at thecatapi.com/signup and set "
+            "`CAT_API_KEY`.",
+            ephemeral=True,
+        )
+        return
+
     await interaction.response.defer()
-    data = await _fetch_json("https://api.thecatapi.com/v1/breeds")
+    data = await _fetch_json(
+        "https://api.thecatapi.com/v1/breeds",
+        headers={"x-api-key": CAT_API_KEY},
+    )
     if not data or not isinstance(data, list):
         await interaction.followup.send(
             f"{MILO_EMOJI} Couldn't fetch cat breeds right now — try again soon."

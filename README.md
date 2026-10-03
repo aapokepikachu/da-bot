@@ -191,7 +191,7 @@ For both: if `MANAGER_ROLE_ID` isn't set, the command is completely disabled. If
 | `/purr` | A random cat-ism (pun or ASCII cat). |
 | `/catfact` | A random cat fact, via [catfact.ninja](https://catfact.ninja). |
 | `/meow` | A random cat photo, via [cataas.com](https://cataas.com). |
-| `/catbreed` | A random cat breed, its temperament, origin, and life span, via [TheCatAPI](https://thecatapi.com). |
+| `/catbreed` | A random cat breed, its temperament, origin, and life span, via [TheCatAPI](https://thecatapi.com). **Requires `CAT_API_KEY`** (free signup) — see Section 10. |
 
 ### Fun & games
 
@@ -221,7 +221,7 @@ For both: if `MANAGER_ROLE_ID` isn't set, the command is completely disabled. If
 | `/quote` | A random inspirational quote, via [zenquotes.io](https://zenquotes.io). |
 | `/define word:<text>` | Dictionary lookup, via [dictionaryapi.dev](https://dictionaryapi.dev). |
 | `/weather location:<place>` | Current temperature & wind speed, via [Open-Meteo](https://open-meteo.com) (no API key needed). |
-| `/translate text:<text> to:<lang>` | Translates text using a language code (`es`, `fr`, `hi`, ...), via Google Translate's free web endpoint. |
+| `/translate text:<text> to:<lang>` | Translates text using a language code (`es`, `fr`, `hi`, ...). Tries Google Translate, then MyMemory, then LibreTranslate, in order, so one being rate-limited doesn't take the whole command down. |
 
 ### Utility
 
@@ -249,6 +249,7 @@ For both: if `MANAGER_ROLE_ID` isn't set, the command is completely disabled. If
 | `CREATOR_USER_ID` | Recommended | Your Discord user ID, used to build the `/aboutme` link. |
 | `ALLOWED_GUILD_ID` | Recommended | Restricts the bot to one server and makes slash commands sync instantly. |
 | `MILO_EMOJI` | Optional | The server's `:Milo:` emoji code. Defaults to `<:Milo:1554818642804482078>`. |
+| `CAT_API_KEY` | Optional | Free key from [thecatapi.com/signup](https://thecatapi.com/signup), needed for `/catbreed`. Command is disabled with a clear message if blank. |
 | `WELCOME_CHANNEL_ID` | Optional | Channel where new-member welcome messages post. Welcome feature is skipped if blank. |
 | `MANAGER_ROLE_ID` | Optional | The one role allowed to use `?send` **and** `?rolemenu`. Both are disabled if blank. |
 | `SELF_ROLES` | Optional | Self-assignable roles for `?rolemenu`, as `ROLE_ID\|Label\|Emoji,...`. `?rolemenu` has nothing to post if blank. |
@@ -296,9 +297,10 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - [ ] `/riddle` posts a question; clicking "Reveal Answer" shows the answer only to you (ephemeral).
 - [ ] `/slots` spins and gives a jackpot, near-miss, or no-match result.
 - [ ] `/emojify text:hi 5` shows individual boxed letters (🇭 🇮) followed by a keycap 5️⃣ — **not** a country flag. If you see an actual flag, the zero-width-space fix didn't make it into your deployed copy.
-- [ ] `/translate text:Hello to:fr` returns an actual French translation, not the "couldn't translate" fallback message.
+- [ ] `/translate text:Hello to:fr` returns an actual French translation, not the "couldn't translate" fallback message. Check Render's logs for an `Translated via <provider>` line to see which of the three actually succeeded.
 - [ ] `/yesno` returns a yes/no/maybe answer with an image.
-- [ ] `/catbreed` returns a random breed's name, temperament, origin, life span, and photo.
+- [ ] With `CAT_API_KEY` set, `/catbreed` returns a random breed's name, temperament, origin, life span, and photo. Without it set, `/catbreed` gives a clear "needs an API key" message instead of a generic failure.
+- [ ] `/define word:hello` returns a real definition even if it occasionally needs its one built-in retry (check Render's logs for a "retrying..." line if it's slow).
 - [ ] Visiting `https://your-render-url.onrender.com/` shows `Milo is running.`
 
 ---
@@ -312,11 +314,14 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - `?send` requires both `MANAGER_ROLE_ID` to be set and the Message Content intent to be enabled — without either, it silently does nothing.
 - Clicking your own **Interested** button is blocked with a friendly ephemeral message — remove that check in `bot.py` if you'd rather allow it.
 - Custom `/join` messages are capped at 300 characters; Discord's own per-message limit is 2000.
-- `/catfact`, `/meow`, `/catbreed`, `/quote`, `/define`, `/weather`, `/translate`, `/yesno`, and `/hug`/`/slap`/`/pat`/`/fistbump`/`/nudge`/`/react` all call free, keyless public APIs (catfact.ninja, cataas.com, TheCatAPI, zenquotes.io, dictionaryapi.dev, Open-Meteo, Google Translate's web endpoint, yesno.wtf, otakugifs.xyz). None of them need an API key or env var, but they're third-party services outside your control — if one is briefly down, slow, or rate-limits you, the command replies with a friendly fallback message instead of crashing (and the reaction commands still post as plain text without the gif).
+- `/catfact`, `/meow`, `/quote`, `/define`, `/weather`, `/translate`, `/yesno`, and `/hug`/`/slap`/`/pat`/`/fistbump`/`/nudge`/`/react` all call free, keyless public APIs (catfact.ninja, cataas.com, zenquotes.io, dictionaryapi.dev, Open-Meteo, Google Translate's web endpoint, yesno.wtf, otakugifs.xyz). None of them need an API key or env var, but they're third-party services outside your control — if one is briefly down, slow, or rate-limits you, the command replies with a friendly fallback message instead of crashing (and the reaction commands still post as plain text without the gif).
+- `/catbreed` is the one exception that **does** need a key: TheCatAPI started requiring `x-api-key` on its breeds endpoint in late September 2026 (previously it worked unauthenticated). A free account at thecatapi.com/signup gives you one. If TheCatAPI changes its policy again in the future, this is the place in `bot.py` to look (`CAT_API_KEY` and the `catbreed_slash` function).
+- Every `_fetch_json` call (used by every API-backed command) automatically retries once on a timeout before giving up, since free public APIs occasionally drop a single request without actually being down. Other failures (404, 429, connection refused) fail immediately without retrying.
 - `/react` covers every otakugifs.xyz category via autocomplete rather than one slash command each — Discord caps a fixed dropdown at 25 choices, and there are nearly 70 categories. `/hug`, `/slap`, `/pat`, `/fistbump`, and `/nudge` stay as dedicated commands since they're the most common; everything else (wave, handhold, and ~65 more) goes through `/react`.
 - `/riddle`'s question bank, like `/trivia`'s, is a fixed local list in `bot.py` (`RIDDLES`) — add more by editing it directly.
 - `/emojify` only converts letters a–z and digits 0–9; punctuation and other characters are left as-is. Long input is capped at 80 characters since very long emoji strings render poorly in Discord. Each letter emoji is followed by an invisible zero-width space — without it, two adjacent regional-indicator letters (e.g. "H" + "I") get auto-merged into a country flag by Discord's renderer instead of showing as two separate boxed letters.
-- `/translate` uses Google Translate's free web endpoint (`translate.googleapis.com`) rather than a documented, officially supported API — it's unofficial and could change or break without notice someday, but in practice it's far more reliable than MyMemory's free tier, whose anonymous quota is shared across everyone using it and gets exhausted fast from shared hosting IPs like Render's.
+- `/translate` tries three free, keyless providers in order — Google Translate's web endpoint, then MyMemory, then LibreTranslate — falling through to the next one if a provider is rate-limited, down, or errors. This matters specifically because of Render's shared hosting IPs: lots of different apps on Render (and other free platforms) hit the same handful of free translate APIs, so any one of them can end up rate-limiting the whole IP range regardless of how little *this* bot calls it. None of the three need an API key or env var. If all three ever fail at once, the command says so plainly rather than showing a generic error — check Render's logs (`logger.warning` lines mentioning "translate providers failed") to see which ones were tried.
+- None of the three translate providers are officially documented, supported APIs with an SLA — they're free community/unofficial endpoints that could change or disappear without notice. If translation stops working entirely someday, that's the most likely reason, and the fix is swapping in a real provider (e.g. DeepL's free tier, which gives each account its own quota instead of a shared one) in `bot.py`.
 - `/trivia`'s question bank is a fixed local list in `bot.py` — add more by editing the `TRIVIA_QUESTIONS` list.
 - `/firstmessage` needs the **Read Message History** permission; without it, it replies with a clear "I don't have permission" message rather than failing silently.
 - The `/join` cooldown (30s per user) and `?send`'s message-delete step both need no persistence — they're either in-memory or one-shot actions.
