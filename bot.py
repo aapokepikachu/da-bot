@@ -30,7 +30,6 @@ import logging
 import os
 import random
 import time
-from urllib.parse import quote
 
 import aiohttp
 import discord
@@ -847,68 +846,12 @@ async def trivia_slash(interaction: discord.Interaction):
 
 
 # ---------------------------------------------------------------------------
-# Reaction commands: /hug, /slap, /pat
+# Reactions: /react (every otakugifs.xyz category, via autocomplete)
 # ---------------------------------------------------------------------------
-async def _send_reaction_gif(
-    interaction: discord.Interaction, reaction: str, target: discord.Member, verb: str
-) -> None:
-    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
-        await interaction.response.send_message(
-            "This bot is not configured for this server.", ephemeral=True
-        )
-        return
-
-    await interaction.response.defer()
-    data = await _fetch_json(f"https://api.otakugifs.xyz/gif?reaction={reaction}")
-    gif_url = data.get("url") if data else None
-    text = f"{interaction.user.mention} {verb} {target.mention}! {MILO_EMOJI}"
-
-    if gif_url:
-        embed = discord.Embed(description=text, color=discord.Color.green())
-        embed.set_image(url=gif_url)
-        await interaction.followup.send(embed=embed)
-    else:
-        await interaction.followup.send(text)
-
-
-@bot.tree.command(name="hug", description="Give someone a hug.")
-@app_commands.describe(user="Who to hug")
-async def hug_slash(interaction: discord.Interaction, user: discord.Member):
-    await _send_reaction_gif(interaction, "hug", user, "hugs")
-
-
-@bot.tree.command(name="slap", description="Slap someone (playfully!).")
-@app_commands.describe(user="Who to slap")
-async def slap_slash(interaction: discord.Interaction, user: discord.Member):
-    await _send_reaction_gif(interaction, "slap", user, "slaps")
-
-
-@bot.tree.command(name="pat", description="Give someone a headpat.")
-@app_commands.describe(user="Who to pat")
-async def pat_slash(interaction: discord.Interaction, user: discord.Member):
-    await _send_reaction_gif(interaction, "pat", user, "pats")
-
-
-@bot.tree.command(name="fistbump", description="Fist bump someone.")
-@app_commands.describe(user="Who to fist bump")
-async def fistbump_slash(interaction: discord.Interaction, user: discord.Member):
-    # otakugifs.xyz's category for this is "brofist" rather than "fistbump".
-    await _send_reaction_gif(interaction, "brofist", user, "fist bumps")
-
-
-@bot.tree.command(name="nudge", description="Nudge someone.")
-@app_commands.describe(user="Who to nudge")
-async def nudge_slash(interaction: discord.Interaction, user: discord.Member):
-    # otakugifs.xyz's category for this is "poke" rather than "nudge".
-    await _send_reaction_gif(interaction, "poke", user, "nudges")
-
-
 # otakugifs.xyz's full set of reaction categories, confirmed against its own
-# API wrapper docs. /hug, /slap, /pat, /fistbump, and /nudge above are
-# dedicated commands; every other category (wave, handhold, and everything
-# else) goes through /react below via type-to-search autocomplete, since
-# Discord caps a fixed dropdown at 25 choices and there are nearly 70 of
-# these.
+# API wrapper docs. Every category goes through /react below via
+# type-to-search autocomplete, since Discord caps a fixed dropdown at 25
+# choices and there are nearly 70 of these.
 ALL_REACTIONS = [
     "airkiss", "angrystare", "bite", "bleh", "blush", "brofist", "celebrate",
     "cheers", "clap", "confused", "cool", "cry", "cuddle", "dance", "drool",
@@ -986,48 +929,6 @@ async def quote_slash(interaction: discord.Interaction):
         )
         return
     await interaction.followup.send(f"💬 *\"{quote_text}\"*\n— {author or 'Unknown'}")
-
-
-@bot.tree.command(name="define", description="Look up a word's definition.")
-@app_commands.describe(word="The word to define")
-async def define_slash(interaction: discord.Interaction, word: str):
-    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
-        await interaction.response.send_message(
-            "This bot is not configured for this server.", ephemeral=True
-        )
-        return
-
-    await interaction.response.defer()
-    clean_word = word.strip()
-    # Percent-encode before building the URL -- an un-encoded comma, accented
-    # letter, etc. going straight into the path was causing the API's
-    # edge/CDN to hang instead of returning a clean 404, which made even the
-    # automatic retry in _fetch_json fail the same way twice.
-    encoded_word = quote(clean_word, safe="")
-    data = await _fetch_json(f"https://api.dictionaryapi.dev/api/v2/entries/en/{encoded_word}")
-
-    if not data or not isinstance(data, list):
-        await interaction.followup.send(f"Couldn't find a definition for **{clean_word}**.")
-        return
-
-    entry = data[0]
-    meanings = entry.get("meanings", [])
-    if not meanings:
-        await interaction.followup.send(f"Couldn't find a definition for **{clean_word}**.")
-        return
-
-    embed = discord.Embed(title=f"📖 {entry.get('word', clean_word)}", color=discord.Color.blurple())
-    phonetic = entry.get("phonetic")
-    if phonetic:
-        embed.description = phonetic
-
-    for meaning in meanings[:3]:
-        part_of_speech = meaning.get("partOfSpeech", "meaning")
-        defs = meaning.get("definitions", [])
-        if defs:
-            embed.add_field(name=part_of_speech, value=defs[0].get("definition", "—"), inline=False)
-
-    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="weather", description="Get current weather for a location.")
@@ -1507,8 +1408,7 @@ async def help_slash(interaction: discord.Interaction):
             "`/slots` — spin the emoji slot machine\n"
             "`/yesno` — a random yes/no answer with a reaction gif\n"
             "`/emojify text:<text>` — turn text into emoji letters\n"
-            "`/hug user` / `/slap user` / `/pat user` / `/fistbump user` / `/nudge user` — react at someone\n"
-            "`/react reaction:<search> user` — any other reaction (wave, handhold, cry, "
+            "`/react reaction:<search> user` — react at someone (hug, slap, wave, cry, "
             "dance, punch, and ~65 more), type to search"
         ),
         inline=False,
@@ -1517,7 +1417,6 @@ async def help_slash(interaction: discord.Interaction):
         name="🌍 Lookups",
         value=(
             "`/quote` — a random inspirational quote\n"
-            "`/define word:<text>` — dictionary lookup\n"
             "`/weather location:<place>` — current weather\n"
             "`/translate text:<text> to:<lang>` — translate text"
         ),

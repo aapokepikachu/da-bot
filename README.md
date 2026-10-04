@@ -3,7 +3,7 @@
 A simple, single-server, **cat-themed** Discord bot built with **Python 3.12+** and **discord.py 2.x**.
 
 Features:
-- 34 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, lookups, and utility — see Section 9 for the full list
+- 28 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, lookups, and utility — see Section 9 for the full list
 - A persistent **✔️ Interested** button on `/join` messages — survives bot restarts, **no database required**
 - A cat-themed welcome message when new members join
 - Self-assign roles (button-based, no database), posted via the hidden `?rolemenu` command
@@ -207,19 +207,13 @@ For both: if `MANAGER_ROLE_ID` isn't set, the command is completely disabled. If
 | `/slots` | Spins a 3-reel emoji slot machine — jackpot on all 3 matching, a near-miss on 2. |
 | `/yesno` | A random yes/no answer with a reaction gif, via [yesno.wtf](https://yesno.wtf). |
 | `/emojify text:<text>` | Converts letters to 🇦🇧🇨-style regional-indicator emoji and digits to keycap emoji. |
-| `/hug user:<member>` | Hug someone, with a reaction gif via [otakugifs.xyz](https://otakugifs.xyz). |
-| `/slap user:<member>` | Same, but a (playful) slap. |
-| `/pat user:<member>` | Same, but a headpat. |
-| `/fistbump user:<member>` | Same, but a fist bump (otakugifs category: `brofist`). |
-| `/nudge user:<member>` | Same, but a nudge (otakugifs category: `poke`). |
-| `/react reaction:<search> user:<member>` | Any other otakugifs.xyz reaction (wave, handhold, cry, dance, punch, wink, and ~65 more) — start typing in the `reaction` field to search and pick one. |
+| `/react reaction:<search> user:<member>` | Any otakugifs.xyz reaction (hug, slap, pat, wave, handhold, cry, dance, punch, wink, and ~60 more) — start typing in the `reaction` field to search and pick one. |
 
 ### Lookups (free public APIs)
 
 | Command | Description |
 |---|---|
 | `/quote` | A random inspirational quote, via [zenquotes.io](https://zenquotes.io). |
-| `/define word:<text>` | Dictionary lookup, via [dictionaryapi.dev](https://dictionaryapi.dev). |
 | `/weather location:<place>` | Current temperature & wind speed, via [Open-Meteo](https://open-meteo.com) (no API key needed). |
 | `/translate text:<text> to:<lang>` | Translates text using a language code (`es`, `fr`, `hi`, ...). Tries Google Translate, then MyMemory, then LibreTranslate, in order, so one being rate-limited doesn't take the whole command down. |
 
@@ -289,9 +283,9 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - [ ] `/avatar` shows your own avatar; `/avatar user:<someone>` shows theirs.
 - [ ] `/rps choice:rock` gives an instant win/lose/tie result.
 - [ ] `/trivia` posts a question with 4 answer buttons; clicking one gives an ephemeral correct/incorrect reply.
-- [ ] `/hug`, `/slap`, `/pat`, `/fistbump`, `/nudge` each post a reaction gif (or fall back to text-only if the gif API is briefly down).
+- [ ] `/react reaction:hug user:<someone>` posts a reaction gif (or falls back to text-only if the gif API is briefly down).
 - [ ] `/react` — typing a few letters in the `reaction` field (e.g. `cr`) shows matching suggestions (e.g. `cry`, `celebrate`); picking one and a user posts that reaction's gif.
-- [ ] `/quote`, `/define word:cat`, `/weather location:London`, and `/translate text:Hello to:es` each return live results.
+- [ ] `/quote`, `/weather location:London`, and `/translate text:Hello to:es` each return live results.
 - [ ] `/firstmessage` jump-links to the oldest message in the current channel.
 - [ ] `/color hex_code:ff6600` shows a swatch; an invalid code like `/color hex_code:zzz` gives a friendly error instead of crashing.
 - [ ] `/riddle` posts a question; clicking "Reveal Answer" shows the answer only to you (ephemeral).
@@ -300,8 +294,6 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - [ ] `/translate text:Hello to:fr` returns an actual French translation, not the "couldn't translate" fallback message. Check Render's logs for an `Translated via <provider>` line to see which of the three actually succeeded.
 - [ ] `/yesno` returns a yes/no/maybe answer with an image.
 - [ ] With `CAT_API_KEY` set, `/catbreed` returns a random breed's name, temperament, origin, life span, and photo. Without it set, `/catbreed` gives a clear "needs an API key" message instead of a generic failure.
-- [ ] `/define word:hello` returns a real definition even if it occasionally needs its one built-in retry (check Render's logs for a "retrying..." line if it's slow).
-- [ ] `/define word:pokémon` and `/define word:café` (accented letters) resolve properly instead of timing out.
 - [ ] `/weather location:São Paulo` (a city with a space and an accent) resolves properly instead of timing out.
 - [ ] Visiting `https://your-render-url.onrender.com/` shows `Milo is running.`
 
@@ -316,11 +308,12 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - `?send` requires both `MANAGER_ROLE_ID` to be set and the Message Content intent to be enabled — without either, it silently does nothing.
 - Clicking your own **Interested** button is blocked with a friendly ephemeral message — remove that check in `bot.py` if you'd rather allow it.
 - Custom `/join` messages are capped at 300 characters; Discord's own per-message limit is 2000.
-- `/catfact`, `/meow`, `/quote`, `/define`, `/weather`, `/translate`, `/yesno`, and `/hug`/`/slap`/`/pat`/`/fistbump`/`/nudge`/`/react` all call free, keyless public APIs (catfact.ninja, cataas.com, zenquotes.io, dictionaryapi.dev, Open-Meteo, Google Translate's web endpoint, yesno.wtf, otakugifs.xyz). None of them need an API key or env var, but they're third-party services outside your control — if one is briefly down, slow, or rate-limits you, the command replies with a friendly fallback message instead of crashing (and the reaction commands still post as plain text without the gif).
+- `/catfact`, `/meow`, `/quote`, `/weather`, `/translate`, `/yesno`, and `/react` all call free, keyless public APIs (catfact.ninja, cataas.com, zenquotes.io, Open-Meteo, Google Translate's web endpoint, yesno.wtf, otakugifs.xyz). None of them need an API key or env var, but they're third-party services outside your control — if one is briefly down, slow, or rate-limits you, the command replies with a friendly fallback message instead of crashing (and the reaction commands still post as plain text without the gif).
 - `/catbreed` is the one exception that **does** need a key: TheCatAPI started requiring `x-api-key` on its breeds endpoint in late September 2026 (previously it worked unauthenticated). A free account at thecatapi.com/signup gives you one. If TheCatAPI changes its policy again in the future, this is the place in `bot.py` to look (`CAT_API_KEY` and the `catbreed_slash` function).
 - Every `_fetch_json` call (used by every API-backed command) automatically retries once on a timeout before giving up, since free public APIs occasionally drop a single request without actually being down. Other failures (404, 429, connection refused) fail immediately without retrying.
-- `/define` and `/weather` properly percent-encode their input (via `urllib.parse.quote` and aiohttp's `params`, respectively) before building the request URL. Earlier versions inserted raw user text directly into the URL string, so a word with a comma or accented letter (`Micro,`, `pokémon`) — or a city name with a space — could hang the request instead of cleanly failing, which looked like a flaky API but was actually a malformed request.
-- `/react` covers every otakugifs.xyz category via autocomplete rather than one slash command each — Discord caps a fixed dropdown at 25 choices, and there are nearly 70 categories. `/hug`, `/slap`, `/pat`, `/fistbump`, and `/nudge` stay as dedicated commands since they're the most common; everything else (wave, handhold, and ~65 more) goes through `/react`.
+- `/weather` properly percent-encodes its input (via aiohttp's `params`) before building the request URL. An earlier version inserted raw user text directly into the URL string, so a city name with a space or accented letter could hang the request instead of cleanly failing.
+- `/react` covers every otakugifs.xyz category via autocomplete in one command rather than a dedicated slash command per reaction — Discord caps a fixed dropdown at 25 choices, and there are nearly 70 categories, so this was simpler to maintain than keeping separate `/hug`, `/slap`, `/pat`, `/fistbump`, `/nudge` commands around too.
+- `/define` was removed entirely: it depended on dictionaryapi.dev, which had a confirmed, chronic multi-week outage pattern (independently verified via third-party uptime monitoring) rather than an occasional blip. No reliable free, keyless alternative was found — every "no signup" option that turned up was either the same broken service under a different URL, or an unverified hobby project. A paid-free-tier option like Wordnik (free account, no card) would fix this properly if you want dictionary lookups back someday.
 - `/riddle`'s question bank, like `/trivia`'s, is a fixed local list in `bot.py` (`RIDDLES`) — add more by editing it directly.
 - `/emojify` only converts letters a–z and digits 0–9; punctuation and other characters are left as-is. Long input is capped at 80 characters since very long emoji strings render poorly in Discord. Each letter emoji is followed by an invisible zero-width space — without it, two adjacent regional-indicator letters (e.g. "H" + "I") get auto-merged into a country flag by Discord's renderer instead of showing as two separate boxed letters.
 - `/translate` tries three free, keyless providers in order — Google Translate's web endpoint, then MyMemory, then LibreTranslate — falling through to the next one if a provider is rate-limited, down, or errors. This matters specifically because of Render's shared hosting IPs: lots of different apps on Render (and other free platforms) hit the same handful of free translate APIs, so any one of them can end up rate-limiting the whole IP range regardless of how little *this* bot calls it. None of the three need an API key or env var. If all three ever fail at once, the command says so plainly rather than showing a generic error — check Render's logs (`logger.warning` lines mentioning "translate providers failed") to see which ones were tried.
