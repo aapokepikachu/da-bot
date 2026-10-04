@@ -3,7 +3,7 @@
 A simple, single-server, **cat-themed** Discord bot built with **Python 3.12+** and **discord.py 2.x**.
 
 Features:
-- 28 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, lookups, and utility — see Section 9 for the full list
+- 39 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, party/social, lookups, and utility — see Section 9 for the full list
 - A persistent **✔️ Interested** button on `/join` messages — survives bot restarts, **no database required**
 - A cat-themed welcome message when new members join
 - Self-assign roles (button-based, no database), posted via the hidden `?rolemenu` command
@@ -206,8 +206,19 @@ For both: if `MANAGER_ROLE_ID` isn't set, the command is completely disabled. If
 | `/riddle` | A random riddle; the answer is hidden behind a "Reveal Answer" button (ephemeral, only you see it). |
 | `/slots` | Spins a 3-reel emoji slot machine — jackpot on all 3 matching, a near-miss on 2. |
 | `/yesno` | A random yes/no answer with a reaction gif, via [yesno.wtf](https://yesno.wtf). |
-| `/emojify text:<text>` | Converts letters to 🇦🇧🇨-style regional-indicator emoji and digits to keycap emoji. |
 | `/react reaction:<search> user:<member>` | Any otakugifs.xyz reaction (hug, slap, pat, wave, handhold, cry, dance, punch, wink, and ~60 more) — start typing in the `reaction` field to search and pick one. |
+
+### Party & social
+
+| Command | Description |
+|---|---|
+| `/emojify text:<text>` | Converts letters to 🇦🇧🇨-style regional-indicator emoji and digits to keycap emoji. Discord markup tokens (custom emoji, mentions, timestamps — anything in `<...>`) pass through untouched instead of getting shredded. |
+| `/mock text:<text>` | sPoNgEbOb CaSe converter. |
+| `/fortune` | A random fortune-cookie-style message. |
+| `/compliment user:<member>` | A random compliment, aimed at someone (defaults to yourself). |
+| `/icebreaker` | A random conversation-starter question. |
+| `/tableflip` | `(╯°□°)╯︵ ┻━┻` |
+| `/unflip` | `┬─┬ ノ( ゜-゜ノ)` |
 
 ### Lookups (free public APIs)
 
@@ -216,6 +227,11 @@ For both: if `MANAGER_ROLE_ID` isn't set, the command is completely disabled. If
 | `/quote` | A random inspirational quote, via [zenquotes.io](https://zenquotes.io). |
 | `/weather location:<place>` | Current temperature & wind speed, via [Open-Meteo](https://open-meteo.com) (no API key needed). |
 | `/translate text:<text> to:<lang>` | Translates text using a language code (`es`, `fr`, `hi`, ...). Tries Google Translate, then MyMemory, then LibreTranslate, in order, so one being rate-limited doesn't take the whole command down. |
+| `/joke` | A random dad joke, via [icanhazdadjoke.com](https://icanhazdadjoke.com). |
+| `/advice` | A random piece of life advice, via [api.adviceslip.com](https://api.adviceslip.com). |
+| `/numberfact number:<n>` | A fun fact about a number (or a random one if left blank), via [numbersapi.com](http://numbersapi.com). |
+| `/comic` | A random xkcd comic, via xkcd's own official API. |
+| `/meme` | A random meme pulled from Reddit, via [meme-api.com](https://meme-api.com). |
 
 ### Utility
 
@@ -291,10 +307,14 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - [ ] `/riddle` posts a question; clicking "Reveal Answer" shows the answer only to you (ephemeral).
 - [ ] `/slots` spins and gives a jackpot, near-miss, or no-match result.
 - [ ] `/emojify text:hi 5` shows individual boxed letters (🇭 🇮) followed by a keycap 5️⃣ — **not** a country flag. If you see an actual flag, the zero-width-space fix didn't make it into your deployed copy.
+- [ ] `/emojify text:hi <:Milo:1554818642804482078>` (or any custom emoji/mention your server has) leaves the `<...>` part completely untouched instead of shredding its letters and digits into more emoji.
 - [ ] `/translate text:Hello to:fr` returns an actual French translation, not the "couldn't translate" fallback message. Check Render's logs for an `Translated via <provider>` line to see which of the three actually succeeded.
 - [ ] `/yesno` returns a yes/no/maybe answer with an image.
 - [ ] With `CAT_API_KEY` set, `/catbreed` returns a random breed's name, temperament, origin, life span, and photo. Without it set, `/catbreed` gives a clear "needs an API key" message instead of a generic failure.
 - [ ] `/weather location:São Paulo` (a city with a space and an accent) resolves properly instead of timing out.
+- [ ] `/mock text:hello world` returns `HeLlO WoRlD`-style alternating case.
+- [ ] `/fortune`, `/compliment`, `/icebreaker`, `/tableflip`, `/unflip` each respond instantly (no network call, so no way for these to be slow or fail).
+- [ ] `/joke`, `/advice`, `/numberfact`, `/comic`, `/meme` each return live results.
 - [ ] Visiting `https://your-render-url.onrender.com/` shows `Milo is running.`
 
 ---
@@ -316,6 +336,9 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - `/define` was removed entirely: it depended on dictionaryapi.dev, which had a confirmed, chronic multi-week outage pattern (independently verified via third-party uptime monitoring) rather than an occasional blip. No reliable free, keyless alternative was found — every "no signup" option that turned up was either the same broken service under a different URL, or an unverified hobby project. A paid-free-tier option like Wordnik (free account, no card) would fix this properly if you want dictionary lookups back someday.
 - `/riddle`'s question bank, like `/trivia`'s, is a fixed local list in `bot.py` (`RIDDLES`) — add more by editing it directly.
 - `/emojify` only converts letters a–z and digits 0–9; punctuation and other characters are left as-is. Long input is capped at 80 characters since very long emoji strings render poorly in Discord. Each letter emoji is followed by an invisible zero-width space — without it, two adjacent regional-indicator letters (e.g. "H" + "I") get auto-merged into a country flag by Discord's renderer instead of showing as two separate boxed letters.
+- `/emojify` also leaves any Discord markup token (`<...>`) completely untouched — custom emoji (`<:name:id>`), user/role/channel mentions, and timestamps. An earlier version shredded these: a custom emoji's name and numeric ID would get converted into boxed letters and keycap digits like everything else, breaking the code so Discord could no longer recognize it.
+- `/joke`, `/advice`, `/numberfact`, `/comic`, and `/meme` were deliberately picked for having long, stable track records (icanhazdadjoke.com, adviceslip.com, numbersapi.com, xkcd's own official API, meme-api.com) rather than smaller/newer services, after `/define`'s removal over a chronically unreliable upstream. None of them need an API key.
+- `/fortune`, `/compliment`, `/icebreaker`, `/mock`, `/tableflip`, and `/unflip` are pure local logic with no network calls at all, so none of them can ever fail the way an external API can.
 - `/translate` tries three free, keyless providers in order — Google Translate's web endpoint, then MyMemory, then LibreTranslate — falling through to the next one if a provider is rate-limited, down, or errors. This matters specifically because of Render's shared hosting IPs: lots of different apps on Render (and other free platforms) hit the same handful of free translate APIs, so any one of them can end up rate-limiting the whole IP range regardless of how little *this* bot calls it. None of the three need an API key or env var. If all three ever fail at once, the command says so plainly rather than showing a generic error — check Render's logs (`logger.warning` lines mentioning "translate providers failed") to see which ones were tried.
 - None of the three translate providers are officially documented, supported APIs with an SLA — they're free community/unofficial endpoints that could change or disappear without notice. If translation stops working entirely someday, that's the most likely reason, and the fix is swapping in a real provider (e.g. DeepL's free tier, which gives each account its own quota instead of a shared one) in `bot.py`.
 - `/trivia`'s question bank is a fixed local list in `bot.py` — add more by editing the `TRIVIA_QUESTIONS` list.

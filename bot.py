@@ -29,6 +29,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import time
 
 import aiohttp
@@ -1250,6 +1251,14 @@ async def slots_slash(interaction: discord.Interaction):
     await interaction.response.send_message(f"🎰 [ {reels_text} ]\n{result}")
 
 
+# Matches any Discord markup token wrapped in angle brackets: custom emoji
+# (<:name:id> / <a:name:id>), user/role/channel mentions (<@id>, <@&id>,
+# <#id>), and timestamps (<t:...>). These need to pass through completely
+# untouched -- shredding their letters/digits into emoji breaks them so
+# Discord can no longer recognize them at all.
+_DISCORD_TOKEN_RE = re.compile(r"(<[^<>]+>)")
+
+
 def _emojify_text(text: str) -> str:
     regional_offset = ord("🇦") - ord("a")
     # Two regional-indicator letters placed directly next to each other get
@@ -1258,17 +1267,28 @@ def _emojify_text(text: str) -> str:
     # between them is invisible but breaks that adjacency, so each letter
     # renders on its own.
     zwsp = "\u200b"
-    parts = []
-    for char in text.lower():
-        if char.isalpha() and "a" <= char <= "z":
-            parts.append(chr(ord(char) + regional_offset) + zwsp)
-        elif char.isdigit():
-            parts.append(f"{char}\ufe0f\u20e3")  # keycap digit emoji
-        elif char == " ":
-            parts.append("  ")  # a little extra gap reads better between emoji
+
+    def emojify_plain(segment: str) -> str:
+        parts = []
+        for char in segment.lower():
+            if char.isalpha() and "a" <= char <= "z":
+                parts.append(chr(ord(char) + regional_offset) + zwsp)
+            elif char.isdigit():
+                parts.append(f"{char}\ufe0f\u20e3")  # keycap digit emoji
+            elif char == " ":
+                parts.append("  ")  # a little extra gap reads better between emoji
+            else:
+                parts.append(char)  # leave punctuation, unicode emoji, etc. as-is
+        return "".join(parts)
+
+    segments = _DISCORD_TOKEN_RE.split(text)
+    result = []
+    for segment in segments:
+        if _DISCORD_TOKEN_RE.fullmatch(segment):
+            result.append(segment)  # a Discord token -- leave completely untouched
         else:
-            parts.append(char)  # leave punctuation etc. as-is
-    return "".join(parts)
+            result.append(emojify_plain(segment))
+    return "".join(result)
 
 
 @bot.tree.command(name="emojify", description="Turn text into regional-indicator emoji letters.")
@@ -1366,6 +1386,270 @@ async def catbreed_slash(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed)
 
 
+# ---------------------------------------------------------------------------
+# Even more fun: /fortune, /compliment, /icebreaker, /mock, /tableflip, /unflip
+# All pure local logic -- no network calls, so nothing here can ever break
+# the way /define did.
+# ---------------------------------------------------------------------------
+FORTUNES = [
+    "A thrilling time is in your near future.",
+    "The best way to predict the future is to create it.",
+    "Your hard work is about to pay off in an unexpected way.",
+    "A pleasant surprise is waiting for you this week.",
+    "Good things come to those who wait... but better things come to those who work for it.",
+    "An old friend will bring good news your way.",
+    "Now is the time to try something new.",
+    "Your creativity will lead you to new horizons.",
+    "A small act of kindness today will come back to you tenfold.",
+    "The next chapter of your life is about to begin.",
+    "You will find success where you least expect it.",
+    "Trust the timing of your life.",
+    "A great change is coming -- embrace it.",
+    "Someone is thinking of you right now.",
+    "Your patience will soon be rewarded.",
+    f"{MILO_EMOJI} A cat's purr is a sign that good fortune is near.",
+]
+
+COMPLIMENTS = [
+    "has really solid taste.",
+    "makes this server better just by being in it.",
+    "is probably the funniest person in this chat.",
+    "gives great advice when it actually matters.",
+    "has main character energy.",
+    "is more talented than they realize.",
+    "always knows exactly what to say.",
+    "is the friend everyone wishes they had.",
+    "has impeccable vibes.",
+    "deserves more credit than they get.",
+    "brightens up every conversation they're in.",
+    "is quietly one of the most reliable people here.",
+]
+
+ICEBREAKERS = [
+    "What's a hobby you picked up recently?",
+    "What's the best game you've played this year?",
+    "If you could instantly master one skill, what would it be?",
+    "What's a small thing that always makes your day better?",
+    "What's your most-used emoji and why?",
+    "What's a movie or show you could rewatch forever?",
+    "If you had a free weekend with no obligations, what would you do?",
+    "What's something you're weirdly good at?",
+    "What's the last thing that made you laugh out loud?",
+    "What's a food you could never get tired of?",
+    "If this server had a mascot other than Milo, what would it be?",
+    "What's a game or hobby you want to get into but haven't started yet?",
+]
+
+
+@bot.tree.command(name="fortune", description="Get a fortune-cookie-style message.")
+async def fortune_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(f"🥠 {random.choice(FORTUNES)}")
+
+
+@bot.tree.command(name="compliment", description="Give someone a random compliment.")
+@app_commands.describe(user="Who to compliment (defaults to you)")
+async def compliment_slash(interaction: discord.Interaction, user: discord.Member | None = None):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    target = user or interaction.user
+    await interaction.response.send_message(
+        f"✨ {target.mention} {random.choice(COMPLIMENTS)}"
+    )
+
+
+@bot.tree.command(name="icebreaker", description="Get a random conversation-starter question.")
+async def icebreaker_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(f"💬 {random.choice(ICEBREAKERS)}")
+
+
+@bot.tree.command(name="mock", description="sPoNgEbOb CaSe your text.")
+@app_commands.describe(text="The text to mock")
+async def mock_slash(interaction: discord.Interaction, text: str):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    clean_text = text.strip()
+    if not clean_text:
+        await interaction.response.send_message("Give me some text to mock!", ephemeral=True)
+        return
+    if len(clean_text) > 300:
+        clean_text = clean_text[:300]
+
+    mocked = "".join(
+        char.upper() if i % 2 == 0 else char.lower()
+        for i, char in enumerate(clean_text)
+    )
+    await interaction.response.send_message(mocked)
+
+
+@bot.tree.command(name="tableflip", description="(╯°□°)╯︵ ┻━┻")
+async def tableflip_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message("(╯°□°)╯︵ ┻━┻")
+
+
+@bot.tree.command(name="unflip", description="┬─┬ ノ( ゜-゜ノ)")
+async def unflip_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message("┬─┬ ノ( ゜-゜ノ)")
+
+
+# ---------------------------------------------------------------------------
+# More free-API fun: /joke, /advice, /numberfact, /comic, /meme
+# Picked for having long, stable track records (unlike dictionaryapi.dev,
+# which turned out to have a chronic multi-week outage -- see /define's
+# removal in an earlier version of this file).
+# ---------------------------------------------------------------------------
+@bot.tree.command(name="joke", description="Get a random dad joke.")
+async def joke_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    data = await _fetch_json(
+        "https://icanhazdadjoke.com/", headers={"Accept": "application/json"}
+    )
+    joke = data.get("joke") if data else None
+    if not joke:
+        await interaction.followup.send(
+            f"{MILO_EMOJI} Couldn't fetch a joke right now — try again soon."
+        )
+        return
+    await interaction.followup.send(f"😹 {joke}")
+
+
+@bot.tree.command(name="advice", description="Get a random piece of life advice.")
+async def advice_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    data = await _fetch_json("https://api.adviceslip.com/advice")
+    advice = data.get("slip", {}).get("advice") if data else None
+    if not advice:
+        await interaction.followup.send(
+            f"{MILO_EMOJI} Couldn't fetch advice right now — try again soon."
+        )
+        return
+    await interaction.followup.send(f"💡 {advice}")
+
+
+@bot.tree.command(name="numberfact", description="Get a fun fact about a number.")
+@app_commands.describe(number="Which number (leave blank for a random one)")
+async def numberfact_slash(interaction: discord.Interaction, number: int | None = None):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    path = str(number) if number is not None else "random"
+    data = await _fetch_json(f"http://numbersapi.com/{path}?json")
+    fact = data.get("text") if data else None
+    if not fact:
+        await interaction.followup.send(
+            f"{MILO_EMOJI} Couldn't fetch a number fact right now — try again soon."
+        )
+        return
+    await interaction.followup.send(f"🔢 {fact}")
+
+
+@bot.tree.command(name="comic", description="Get a random xkcd comic.")
+async def comic_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    latest = await _fetch_json("https://xkcd.com/info.0.json")
+    max_num = latest.get("num") if latest else None
+    if not max_num:
+        await interaction.followup.send(
+            f"{MILO_EMOJI} Couldn't fetch a comic right now — try again soon."
+        )
+        return
+
+    comic_num = random.randint(1, max_num)
+    data = await _fetch_json(f"https://xkcd.com/{comic_num}/info.0.json")
+    if not data or not data.get("img"):
+        await interaction.followup.send(
+            f"{MILO_EMOJI} Couldn't fetch a comic right now — try again soon."
+        )
+        return
+
+    embed = discord.Embed(
+        title=f"xkcd #{data.get('num')}: {data.get('title', '')}",
+        color=discord.Color.blurple(),
+    )
+    embed.set_image(url=data["img"])
+    if data.get("alt"):
+        embed.set_footer(text=data["alt"][:2048])
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="meme", description="Get a random meme.")
+async def meme_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    data = await _fetch_json("https://meme-api.com/gimme")
+    image_url = data.get("url") if data else None
+    title = data.get("title") if data else None
+    if not image_url:
+        await interaction.followup.send(
+            f"{MILO_EMOJI} Couldn't fetch a meme right now — try again soon."
+        )
+        return
+
+    embed = discord.Embed(title=title or "Random meme", color=discord.Color.green())
+    embed.set_image(url=image_url)
+    if data.get("subreddit"):
+        embed.set_footer(text=f"r/{data['subreddit']}")
+    await interaction.followup.send(embed=embed)
+
+
 @bot.tree.command(name="help", description="Shows all Milo commands.")
 async def help_slash(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -1407,9 +1691,20 @@ async def help_slash(interaction: discord.Interaction):
             "`/riddle` — a riddle with the answer hidden behind a button\n"
             "`/slots` — spin the emoji slot machine\n"
             "`/yesno` — a random yes/no answer with a reaction gif\n"
-            "`/emojify text:<text>` — turn text into emoji letters\n"
             "`/react reaction:<search> user` — react at someone (hug, slap, wave, cry, "
             "dance, punch, and ~65 more), type to search"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="✨ Party & Social",
+        value=(
+            "`/emojify text:<text>` — turn text into emoji letters\n"
+            "`/mock text:<text>` — sPoNgEbOb CaSe your text\n"
+            "`/fortune` — a fortune-cookie message\n"
+            "`/compliment user` — give someone a compliment\n"
+            "`/icebreaker` — a random conversation-starter question\n"
+            "`/tableflip` / `/unflip` — (╯°□°)╯︵ ┻━┻ and back"
         ),
         inline=False,
     )
@@ -1418,7 +1713,12 @@ async def help_slash(interaction: discord.Interaction):
         value=(
             "`/quote` — a random inspirational quote\n"
             "`/weather location:<place>` — current weather\n"
-            "`/translate text:<text> to:<lang>` — translate text"
+            "`/translate text:<text> to:<lang>` — translate text\n"
+            "`/joke` — a random dad joke\n"
+            "`/advice` — random life advice\n"
+            "`/numberfact number:<n>` — trivia about a number\n"
+            "`/comic` — a random xkcd comic\n"
+            "`/meme` — a random meme"
         ),
         inline=False,
     )
