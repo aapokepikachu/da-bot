@@ -847,6 +847,178 @@ async def trivia_slash(interaction: discord.Interaction):
 
 
 # ---------------------------------------------------------------------------
+# /grouptrivia: a YAGPDB-style group round. Everyone can answer the same
+# question; what each person picked stays hidden, but their name is added to
+# a visible "answered so far" list the moment they lock one in. After 60
+# seconds the correct answer is revealed and everyone who got it right is
+# mentioned. No database -- all state lives in memory for the 60-second
+# window only, the same way /trivia and /riddle already work, just extended
+# to track multiple participants instead of answering once and vanishing.
+# ---------------------------------------------------------------------------
+GROUP_TRIVIA_WINDOW_SECONDS = 60
+# Leaves comfortable margin under Discord's hard 2000-char message cap when
+# chunking winner mentions across multiple messages.
+_MENTION_CHUNK_LIMIT = 1900
+
+
+class GroupTriviaButton(discord.ui.Button):
+    def __init__(self, label: str, index: int):
+        super().__init__(label=label, style=discord.ButtonStyle.primary)
+        self.index = index
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view: GroupTriviaView = self.view  # type: ignore[assignment]
+        if view is None:
+            return
+
+        if interaction.user.id in view.answers:
+            await interaction.response.send_message(
+                "You've already locked in an answer for this round!", ephemeral=True
+            )
+            return
+
+        view.answers[interaction.user.id] = self.index
+        view.participant_order.append(interaction.user.id)
+
+        await interaction.response.send_message(
+            "✅ Your answer is locked in! What you picked stays secret until time's up.",
+            ephemeral=True,
+        )
+
+        try:
+            await view.refresh_public_message()
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+
+class GroupTriviaView(discord.ui.View):
+    def __init__(self, question: dict):
+        super().__init__(timeout=GROUP_TRIVIA_WINDOW_SECONDS)
+        self.question = question
+        self.answers: dict[int, int] = {}  # user_id -> chosen index (kept secret)
+        self.participant_order: list[int] = []  # user_id, in the order they answered
+        self.message: discord.Message | None = None  # filled in right after sending
+        for i, letter in enumerate("ABCD"):
+            if i < len(question["options"]):
+                self.add_item(GroupTriviaButton(letter, i))
+
+    def build_embed(self, *, revealed: bool = False) -> discord.Embed:
+        options_text = "\n".join(
+            f"**{letter}.** {opt}" for letter, opt in zip("ABCD", self.question["options"])
+        )
+        if revealed:
+            correct_letter = "ABCD"[self.question["answer"]]
+            correct_text = self.question["options"][self.question["answer"]]
+            status = f"⏰ Time's up! The correct answer was **{correct_letter}. {correct_text}**."
+            color = discord.Color.green()
+        else:
+            status = (
+                f"You have {GROUP_TRIVIA_WINDOW_SECONDS} seconds. Pick an answer below -- "
+                "what you pick stays secret until time's up!"
+            )
+            color = discord.Color.blurple()
+
+        embed = discord.Embed(
+            title="🧠 Group Trivia!",
+            description=f"{self.question['question']}\n\n{options_text}\n\n{status}",
+            color=color,
+        )
+
+        count = len(self.participant_order)
+        if count:
+            if revealed:
+                embed.add_field(name="Participants", value=f"{count} people answered.", inline=False)
+            else:
+                mentions = " ".join(f"<@{uid}>" for uid in self.participant_order)
+                # Keep this field itself under Discord's 1024-char field
+                # limit -- if a huge group pushes past that, show a count
+                # instead of truncating mentions mid-tag.
+                if len(mentions) > 1000:
+                    mentions = f"{count} people have answered so far!"
+                embed.add_field(name=f"Answered so far ({count})", value=mentions, inline=False)
+
+        return embed
+
+    async def refresh_public_message(self) -> None:
+        if self.message is not None:
+            await self.message.edit(embed=self.build_embed(), view=self)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+        if self.message is not None:
+            try:
+                await self.message.edit(embed=self.build_embed(revealed=True), view=self)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+        if self.message is None:
+            return
+
+        correct_index = self.question["answer"]
+        correct_letter = "ABCD"[correct_index]
+        winner_ids = [uid for uid, choice in self.answers.items() if choice == correct_index]
+
+        if not winner_ids:
+            no_winner_text = (
+                "Nobody answered in time!" if not self.participant_order
+                else "Nobody got it right this time! Better luck next round."
+            )
+            try:
+                await self.message.reply(no_winner_text)
+            except (discord.NotFound, discord.HTTPException, discord.Forbidden):
+                pass
+            return
+
+        await _send_group_trivia_winners(self.message, winner_ids, correct_letter)
+
+
+async def _send_group_trivia_winners(
+    message: discord.Message, winner_ids: list[int], correct_letter: str
+) -> None:
+    """Announces winners, splitting across multiple messages if the mention
+    list would blow past Discord's 2000-char message limit (a big enough
+    group genuinely can)."""
+    header = f"🎉 Correct answer was **{correct_letter}**! Winners: "
+    continuation_header = "🎉 Winners (continued): "
+
+    chunks: list[str] = []
+    current = header
+    for uid in winner_ids:
+        mention = f"<@{uid}> "
+        if len(current) + len(mention) > _MENTION_CHUNK_LIMIT:
+            chunks.append(current.rstrip())
+            current = continuation_header
+        current += mention
+    chunks.append(current.rstrip())
+
+    try:
+        await message.reply(chunks[0])
+        for chunk in chunks[1:]:
+            await message.channel.send(chunk)
+    except (discord.NotFound, discord.HTTPException, discord.Forbidden):
+        pass
+
+
+@bot.tree.command(
+    name="grouptrivia",
+    description="Start a group trivia round -- everyone can answer, winners revealed after 60s.",
+)
+async def grouptrivia_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    question = random.choice(TRIVIA_QUESTIONS)
+    view = GroupTriviaView(question)
+    await interaction.response.send_message(embed=view.build_embed(), view=view)
+    view.message = await interaction.original_response()
+
+
+# ---------------------------------------------------------------------------
 # Reactions: /react (every otakugifs.xyz category, via autocomplete)
 # ---------------------------------------------------------------------------
 # otakugifs.xyz's full set of reaction categories, confirmed against its own
@@ -1408,6 +1580,20 @@ FORTUNES = [
     "Someone is thinking of you right now.",
     "Your patience will soon be rewarded.",
     f"{MILO_EMOJI} A cat's purr is a sign that good fortune is near.",
+    "Opportunity is knocking -- don't let it walk away.",
+    "What you focus on grows. Choose wisely.",
+    "A conversation today could change your week.",
+    "You are closer to your goal than you think.",
+    "Say yes to the thing that scares you a little.",
+    "The universe rewards those who show up consistently.",
+    "A fresh start is closer than it appears.",
+    "Someone you haven't met yet will become important to you.",
+    "Your next idea is better than you give it credit for.",
+    "Slow progress is still progress.",
+    "The risk you're avoiding might be the one worth taking.",
+    "Laughter today brings luck tomorrow.",
+    "A door you thought was closed is actually unlocked.",
+    "You're about to learn something that changes your perspective.",
 ]
 
 COMPLIMENTS = [
@@ -1423,6 +1609,19 @@ COMPLIMENTS = [
     "deserves more credit than they get.",
     "brightens up every conversation they're in.",
     "is quietly one of the most reliable people here.",
+    "has a way of making hard days easier.",
+    "notices the little things most people miss.",
+    "is someone people genuinely enjoy being around.",
+    "has great instincts.",
+    "always shows up when it counts.",
+    "has a talent for making people feel welcome.",
+    "brings a calm energy to the chaos.",
+    "is effortlessly cool.",
+    "has one of the best senses of humor around here.",
+    "makes everyone else's ideas better.",
+    "is criminally underrated.",
+    "has a gift for turning strangers into friends.",
+    "just has that main character energy, no notes.",
 ]
 
 ICEBREAKERS = [
@@ -1438,6 +1637,19 @@ ICEBREAKERS = [
     "What's a food you could never get tired of?",
     "If this server had a mascot other than Milo, what would it be?",
     "What's a game or hobby you want to get into but haven't started yet?",
+    "What's a skill you think everyone should learn?",
+    "What's the most useless talent you have?",
+    "What's a piece of advice you'd give your younger self?",
+    "What's your go-to comfort food?",
+    "What's a place you've always wanted to visit?",
+    "What's a book, show, or game that changed how you think?",
+    "What's your ideal way to spend a rainy day?",
+    "What's a trend you just don't get?",
+    "If you could have dinner with anyone, living or fictional, who would it be?",
+    "What's the best piece of advice you've ever received?",
+    "What's something you're really proud of?",
+    "What's a childhood memory that still makes you smile?",
+    "If you could instantly learn any language, which would you pick?",
 ]
 
 
@@ -1523,8 +1735,77 @@ async def unflip_slash(interaction: discord.Interaction):
     await interaction.response.send_message("┬─┬ ノ( ゜-゜ノ)")
 
 
+# /throw mirrors YAGPDB's own /fun throw command (same probability bands and
+# message format, confirmed from its public source code): 5% chance of a
+# triple throw, 10% chance of a double throw, otherwise a single throw.
+THROWABLE_ITEMS = [
+    "a remote-controlled car that only goes backwards",
+    "a Roomba that's given up on life",
+    "a Wi-Fi router with exactly one bar of signal",
+    "a Jenga tower mid-collapse",
+    "a fax machine from 1998",
+    "a Magic 8-Ball that only ever says 'ask again later'",
+    "a Bluetooth speaker stuck on 3% battery",
+    "a printer that's perpetually out of toner",
+    "a Tamagotchi that is deeply disappointed in you",
+    "a GPS that keeps recalculating",
+    "a microwave that beeps exactly once at 3am for no reason",
+    f"a disapproving cat stare {MILO_EMOJI}",
+    "a Roku remote with no batteries in it",
+    "a rubber chicken with a pulley in the middle",
+    "a Nokia 3310 (it survives the throw, obviously)",
+    "a Dyson vacuum that's purely for decoration",
+    "an aux cord that doesn't actually connect to anything",
+    "a fidget spinner, five years too late",
+    "a CAPTCHA that insists you're a robot",
+    "the sound of a 56k dial-up modem",
+    "a participation trophy",
+    "a to-do list with everything crossed off except the one important thing",
+    "a single AirPod -- the left one, it's always the left one",
+    "an email that just says 'per my last email'",
+    "a Zoom call with someone's cat walking across the keyboard",
+    "a slice of leftover pizza that's somehow still good",
+    "a Roomba that's stuck fighting a cat",
+    "a Discord notification at 3am",
+    "a printer jam of truly biblical proportions",
+    "a 'you have 1 new message' notification from 2014",
+    "a Monopoly board mid-argument",
+    "a Scooby-Doo villain mask",
+    "a cardboard cutout of a disappointed parent",
+    "a chair with one wheel that won't stop spinning",
+]
+
+
+@bot.tree.command(name="throw", description="Throw something at someone (or a random nearby person).")
+@app_commands.describe(user="Who to throw at (leave blank for a random nearby person)")
+async def throw_slash(interaction: discord.Interaction, user: discord.Member | None = None):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    target = user.mention if user else "a random person nearby"
+
+    roll = random.randint(0, 99)
+    if roll < 5:
+        items = random.sample(THROWABLE_ITEMS, 3)
+        text = (
+            f"🎯 TRIPLE THROW! Threw **{items[0]}**, **{items[1]}**, and "
+            f"**{items[2]}** at {target}!"
+        )
+    elif roll < 15:
+        items = random.sample(THROWABLE_ITEMS, 2)
+        text = f"🎯 DOUBLE THROW! Threw **{items[0]}** and **{items[1]}** at {target}!"
+    else:
+        item = random.choice(THROWABLE_ITEMS)
+        text = f"🎯 Threw **{item}** at {target}!"
+
+    await interaction.response.send_message(text)
+
+
 # ---------------------------------------------------------------------------
-# More free-API fun: /joke, /advice, /numberfact, /comic, /meme
+# More free-API fun: /joke, /advice, /comic, /meme
 # Picked for having long, stable track records (unlike dictionaryapi.dev,
 # which turned out to have a chronic multi-week outage -- see /define's
 # removal in an earlier version of this file).
@@ -1567,27 +1848,6 @@ async def advice_slash(interaction: discord.Interaction):
         )
         return
     await interaction.followup.send(f"💡 {advice}")
-
-
-@bot.tree.command(name="numberfact", description="Get a fun fact about a number.")
-@app_commands.describe(number="Which number (leave blank for a random one)")
-async def numberfact_slash(interaction: discord.Interaction, number: int | None = None):
-    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
-        await interaction.response.send_message(
-            "This bot is not configured for this server.", ephemeral=True
-        )
-        return
-
-    await interaction.response.defer()
-    path = str(number) if number is not None else "random"
-    data = await _fetch_json(f"http://numbersapi.com/{path}?json")
-    fact = data.get("text") if data else None
-    if not fact:
-        await interaction.followup.send(
-            f"{MILO_EMOJI} Couldn't fetch a number fact right now — try again soon."
-        )
-        return
-    await interaction.followup.send(f"🔢 {fact}")
 
 
 @bot.tree.command(name="comic", description="Get a random xkcd comic.")
@@ -1687,10 +1947,12 @@ async def help_slash(interaction: discord.Interaction):
             "`/poll question option1 option2 ...` — quick poll with reactions\n"
             "`/coinflip` / `/roll sides:<n>` — flip a coin or roll dice\n"
             "`/rps choice:rock` — rock-paper-scissors vs Milo\n"
-            "`/trivia` — answer a random trivia question\n"
+            "`/trivia` — answer a random trivia question (solo, private)\n"
+            "`/grouptrivia` — everyone can answer; winners revealed after 60s\n"
             "`/riddle` — a riddle with the answer hidden behind a button\n"
             "`/slots` — spin the emoji slot machine\n"
             "`/yesno` — a random yes/no answer with a reaction gif\n"
+            "`/throw user` — throw something at someone (or nearby, if left blank)\n"
             "`/react reaction:<search> user` — react at someone (hug, slap, wave, cry, "
             "dance, punch, and ~65 more), type to search"
         ),
@@ -1716,7 +1978,6 @@ async def help_slash(interaction: discord.Interaction):
             "`/translate text:<text> to:<lang>` — translate text\n"
             "`/joke` — a random dad joke\n"
             "`/advice` — random life advice\n"
-            "`/numberfact number:<n>` — trivia about a number\n"
             "`/comic` — a random xkcd comic\n"
             "`/meme` — a random meme"
         ),

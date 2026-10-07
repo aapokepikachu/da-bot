@@ -3,7 +3,7 @@
 A simple, single-server, **cat-themed** Discord bot built with **Python 3.12+** and **discord.py 2.x**.
 
 Features:
-- 39 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, party/social, lookups, and utility — see Section 9 for the full list
+- 40 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, party/social, lookups, and utility — see Section 9 for the full list
 - A persistent **✔️ Interested** button on `/join` messages — survives bot restarts, **no database required**
 - A cat-themed welcome message when new members join
 - Self-assign roles (button-based, no database), posted via the hidden `?rolemenu` command
@@ -207,6 +207,8 @@ For both: if `MANAGER_ROLE_ID` isn't set, the command is completely disabled. If
 | `/slots` | Spins a 3-reel emoji slot machine — jackpot on all 3 matching, a near-miss on 2. |
 | `/yesno` | A random yes/no answer with a reaction gif, via [yesno.wtf](https://yesno.wtf). |
 | `/react reaction:<search> user:<member>` | Any otakugifs.xyz reaction (hug, slap, pat, wave, handhold, cry, dance, punch, wink, and ~60 more) — start typing in the `reaction` field to search and pick one. |
+| `/throw user:<member>` | Throw a random absurdly-specific item at someone (or a random nearby person if left blank) — a Roomba fighting a cat, a Nokia 3310, a printer jam of biblical proportions, etc. Mirrors YAGPDB's own `/fun throw`: 5% chance of a triple throw, 10% chance of a double, otherwise a single. |
+| `/grouptrivia` | A live group round: everyone in the channel can answer the same question. What each person picked stays secret, but their name appears in a visibly growing "answered so far" list the moment they lock one in. After 60 seconds, the correct answer and everyone who got it right are revealed. No database — all state lives in memory for that 60-second window only. |
 
 ### Party & social
 
@@ -229,7 +231,6 @@ For both: if `MANAGER_ROLE_ID` isn't set, the command is completely disabled. If
 | `/translate text:<text> to:<lang>` | Translates text using a language code (`es`, `fr`, `hi`, ...). Tries Google Translate, then MyMemory, then LibreTranslate, in order, so one being rate-limited doesn't take the whole command down. |
 | `/joke` | A random dad joke, via [icanhazdadjoke.com](https://icanhazdadjoke.com). |
 | `/advice` | A random piece of life advice, via [api.adviceslip.com](https://api.adviceslip.com). |
-| `/numberfact number:<n>` | A fun fact about a number (or a random one if left blank), via [numbersapi.com](http://numbersapi.com). |
 | `/comic` | A random xkcd comic, via xkcd's own official API. |
 | `/meme` | A random meme pulled from Reddit, via [meme-api.com](https://meme-api.com). |
 
@@ -314,7 +315,9 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - [ ] `/weather location:São Paulo` (a city with a space and an accent) resolves properly instead of timing out.
 - [ ] `/mock text:hello world` returns `HeLlO WoRlD`-style alternating case.
 - [ ] `/fortune`, `/compliment`, `/icebreaker`, `/tableflip`, `/unflip` each respond instantly (no network call, so no way for these to be slow or fail).
-- [ ] `/joke`, `/advice`, `/numberfact`, `/comic`, `/meme` each return live results.
+- [ ] `/joke`, `/advice`, `/comic`, `/meme` each return live results.
+- [ ] `/throw` and `/throw user:<someone>` both work; roughly 1 in 20 throws should be a "TRIPLE THROW", 1 in 10 a "DOUBLE THROW".
+- [ ] `/grouptrivia`: have 2+ people click different answer buttons. Confirm everyone who answered shows up by name in the embed, but nobody can see what anyone else picked. After 60 seconds, confirm the correct answer reveals and only the people who picked right get mentioned as winners.
 - [ ] Visiting `https://your-render-url.onrender.com/` shows `Milo is running.`
 
 ---
@@ -337,7 +340,9 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - `/riddle`'s question bank, like `/trivia`'s, is a fixed local list in `bot.py` (`RIDDLES`) — add more by editing it directly.
 - `/emojify` only converts letters a–z and digits 0–9; punctuation and other characters are left as-is. Long input is capped at 80 characters since very long emoji strings render poorly in Discord. Each letter emoji is followed by an invisible zero-width space — without it, two adjacent regional-indicator letters (e.g. "H" + "I") get auto-merged into a country flag by Discord's renderer instead of showing as two separate boxed letters.
 - `/emojify` also leaves any Discord markup token (`<...>`) completely untouched — custom emoji (`<:name:id>`), user/role/channel mentions, and timestamps. An earlier version shredded these: a custom emoji's name and numeric ID would get converted into boxed letters and keycap digits like everything else, breaking the code so Discord could no longer recognize it.
-- `/joke`, `/advice`, `/numberfact`, `/comic`, and `/meme` were deliberately picked for having long, stable track records (icanhazdadjoke.com, adviceslip.com, numbersapi.com, xkcd's own official API, meme-api.com) rather than smaller/newer services, after `/define`'s removal over a chronically unreliable upstream. None of them need an API key.
+- `/joke`, `/advice`, `/comic`, and `/meme` were deliberately picked for having long, stable track records (icanhazdadjoke.com, adviceslip.com, xkcd's own official API, meme-api.com) rather than smaller/newer services, after `/define`'s removal over a chronically unreliable upstream. None of them need an API key.
+- `/numberfact` was removed for the same reason as `/define`: `numbersapi.com` is confirmed dead (TLS certificate mismatch on HTTPS, and independent automated link-checkers from unrelated projects confirming a hard 404 on the bare domain as recently as 13 days before this was written). Not fixable by changing the request format -- the root domain itself is down.
+- `/grouptrivia`'s per-round state (who answered, what they picked) lives only in memory for the duration of that one 60-second round, scoped to that specific message's View object. It is **not** shared between rounds and does not survive a bot restart mid-round -- if Milo restarts while a group trivia round is in progress, that round's buttons stop working and it never reveals a winner. This matches the same tradeoff `/trivia` and `/riddle` already make for their own short-lived views.
 - `/fortune`, `/compliment`, `/icebreaker`, `/mock`, `/tableflip`, and `/unflip` are pure local logic with no network calls at all, so none of them can ever fail the way an external API can.
 - `/translate` tries three free, keyless providers in order — Google Translate's web endpoint, then MyMemory, then LibreTranslate — falling through to the next one if a provider is rate-limited, down, or errors. This matters specifically because of Render's shared hosting IPs: lots of different apps on Render (and other free platforms) hit the same handful of free translate APIs, so any one of them can end up rate-limiting the whole IP range regardless of how little *this* bot calls it. None of the three need an API key or env var. If all three ever fail at once, the command says so plainly rather than showing a generic error — check Render's logs (`logger.warning` lines mentioning "translate providers failed") to see which ones were tried.
 - None of the three translate providers are officially documented, supported APIs with an SLA — they're free community/unofficial endpoints that could change or disappear without notice. If translation stops working entirely someday, that's the most likely reason, and the fix is swapping in a real provider (e.g. DeepL's free tier, which gives each account its own quota instead of a shared one) in `bot.py`.
