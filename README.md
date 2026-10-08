@@ -3,11 +3,11 @@
 A simple, single-server, **cat-themed** Discord bot built with **Python 3.12+** and **discord.py 2.x**.
 
 Features:
-- 40 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, party/social, lookups, and utility — see Section 9 for the full list
+- 41 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, party/social, AI, lookups, and utility — see Section 9 for the full list
 - A persistent **✔️ Interested** button on `/join` messages — survives bot restarts, **no database required**
 - A cat-themed welcome message when new members join
 - Self-assign roles (button-based, no database), posted via the hidden `?rolemenu` command
-- Two hidden, Manager-role-only text commands — `?send` and `?rolemenu` — the **only** `?`-prefixed commands in the whole bot. Neither shows up in Discord's `/` picker and neither is listed in `/help`; they're documented here in the README only.
+- Two hidden text commands — `?send` (Manager role **or** Milo role) and `?rolemenu` (Manager role only) — the **only** `?`-prefixed commands in the whole bot. Neither shows up in Discord's `/` picker and neither is listed in `/help`; they're documented here in the README only.
 - Several commands call free, keyless public APIs (cat facts/photos, quotes, dictionary, weather, translation, reaction gifs) — every call has a graceful fallback message if the API is briefly down or slow
 - Runs as a **Render Free Web Service** (Discord Gateway + a tiny HTTP health server in one process)
 - Secrets stay in environment variables, never in code
@@ -158,14 +158,20 @@ This works exactly like the Interested button — no database. Each role button'
 
 ## 8. The hidden `?send` and `?rolemenu` commands
 
-These are the **only two `?`-prefixed commands in the bot** — everything else is a slash command. Both are plain text commands (not slash commands), so neither ever appears in Discord's `/` picker, and neither is listed in `/help`. Both share the same `MANAGER_ROLE_ID` gate, so you only set that role up once.
+These are the **only two `?`-prefixed commands in the bot** — everything else is a slash command. Both are plain text commands (not slash commands), so neither ever appears in Discord's `/` picker, and neither is listed in `/help`. They have different access levels: `?send` works for the Manager role (`MANAGER_ROLE_ID`) **or** a second, more limited role (`MILO_ROLE_ID`, e.g. a role you name "Milo"), while `?rolemenu` is Manager-only.
 
 | Command | What it does |
 |---|---|
 | `?send <message>` | Posts `<message>` in the current channel, exactly as Milo, then deletes the original command message. Example: a Manager types `?send Server maintenance tonight at 9 PM!` in `#announcements`, and Milo deletes their message and posts it in its place. |
 | `?rolemenu` | Posts the self-assign roles embed + buttons in the current channel (see Section 7), then deletes the original command message. |
 
-For both: if `MANAGER_ROLE_ID` isn't set, the command is completely disabled. If a non-Manager tries either one, nothing happens at all.
+If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_ID` isn't set, `?rolemenu` is completely disabled. If someone without a permitted role tries either one, nothing happens at all — no reply, no error.
+
+| Role | `?send` | `?rolemenu` |
+|---|---|---|
+| Manager (`MANAGER_ROLE_ID`) | ✅ | ✅ |
+| Milo (`MILO_ROLE_ID`) | ✅ | ❌ |
+| Everyone else | ❌ | ❌ |
 
 ---
 
@@ -234,6 +240,12 @@ For both: if `MANAGER_ROLE_ID` isn't set, the command is completely disabled. If
 | `/comic` | A random xkcd comic, via xkcd's own official API. |
 | `/meme` | A random meme pulled from Reddit, via [meme-api.com](https://meme-api.com). |
 
+### AI
+
+| Command | Description |
+|---|---|
+| `/ask question:<text>` | Ask Milo a quick question (up to 300 characters), answered by `llama-3.1-8b-instant` via [Groq](https://console.groq.com). **Requires `GROQ_API_KEY`** (free signup, no credit card) — see Section 10. Built for quick, simple answers, not deep reasoning. |
+
 ### Utility
 
 | Command | Description |
@@ -247,7 +259,7 @@ For both: if `MANAGER_ROLE_ID` isn't set, the command is completely disabled. If
 | Command | Description |
 |---|---|
 | `/help` | Shows the full command list (minus the hidden `?send` and `?rolemenu`). |
-| `?send <message>` | **Hidden.** Manager-role-only. Posts `<message>` as Milo. Not in `/help`, not a slash command. |
+| `?send <message>` | **Hidden.** Manager role or Milo role. Posts `<message>` as Milo. Not in `/help`, not a slash command. |
 | `?rolemenu` | **Hidden.** Manager-role-only. Posts the self-assign roles menu. Not in `/help`, not a slash command. |
 
 ---
@@ -260,9 +272,11 @@ For both: if `MANAGER_ROLE_ID` isn't set, the command is completely disabled. If
 | `CREATOR_USER_ID` | Recommended | Your Discord user ID, used to build the `/aboutme` link. |
 | `ALLOWED_GUILD_ID` | Recommended | Restricts the bot to one server and makes slash commands sync instantly. |
 | `MILO_EMOJI` | Optional | The server's `:Milo:` emoji code. Defaults to `<:Milo:1554818642804482078>`. |
+| `GROQ_API_KEY` | Optional | Free key from [console.groq.com](https://console.groq.com), needed for `/ask`. Command is disabled with a clear message if blank. Groq is unrelated to xAI/Grok or SpaceX despite the similar-sounding name. |
 | `CAT_API_KEY` | Optional | Free key from [thecatapi.com/signup](https://thecatapi.com/signup), needed for `/catbreed`. Command is disabled with a clear message if blank. |
 | `WELCOME_CHANNEL_ID` | Optional | Channel where new-member welcome messages post. Welcome feature is skipped if blank. |
-| `MANAGER_ROLE_ID` | Optional | The one role allowed to use `?send` **and** `?rolemenu`. Both are disabled if blank. |
+| `MANAGER_ROLE_ID` | Optional | The Manager role. Can use `?send` **and** `?rolemenu`. `?rolemenu` is disabled if blank. |
+| `MILO_ROLE_ID` | Optional | A second, more limited role (e.g. one you name "Milo"). Can use `?send` **only** — not `?rolemenu`. Leave blank if only Managers should use `?send`. |
 | `SELF_ROLES` | Optional | Self-assignable roles for `?rolemenu`, as `ROLE_ID\|Label\|Emoji,...`. `?rolemenu` has nothing to post if blank. |
 | `PORT` | Managed by Render | HTTP port for the health server. Don't set this yourself on Render. |
 
@@ -287,6 +301,8 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - [ ] Restart the bot process, then click **Interested** on an *old* message — it still works correctly.
 - [ ] A new member joining posts a cat-themed welcome message in `WELCOME_CHANNEL_ID`.
 - [ ] `?send Hello everyone` from a Manager-role member deletes their message and posts "Hello everyone" as Milo.
+- [ ] `?send Hello everyone` from a member with **only** the Milo role (`MILO_ROLE_ID`) does the same.
+- [ ] `?rolemenu` from a member with **only** the Milo role does nothing at all (it's Manager-only).
 - [ ] `?send Hello everyone` from a non-Manager does nothing at all (no reply, no error).
 - [ ] `/help` lists every command **except** `?send`.
 - [ ] Typing `?send` doesn't show up anywhere in Discord's `/` command picker.
@@ -311,6 +327,7 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - [ ] `/emojify text:hi <:Milo:1554818642804482078>` (or any custom emoji/mention your server has) leaves the `<...>` part completely untouched instead of shredding its letters and digits into more emoji.
 - [ ] `/translate text:Hello to:fr` returns an actual French translation, not the "couldn't translate" fallback message. Check Render's logs for an `Translated via <provider>` line to see which of the three actually succeeded.
 - [ ] `/yesno` returns a yes/no/maybe answer with an image.
+- [ ] With `GROQ_API_KEY` set, `/ask question:Why is the sky blue?` returns a short answer in an embed. Without it set, `/ask` gives a clear "needs a free Groq API key" message.
 - [ ] With `CAT_API_KEY` set, `/catbreed` returns a random breed's name, temperament, origin, life span, and photo. Without it set, `/catbreed` gives a clear "needs an API key" message instead of a generic failure.
 - [ ] `/weather location:São Paulo` (a city with a space and an accent) resolves properly instead of timing out.
 - [ ] `/mock text:hello world` returns `HeLlO WoRlD`-style alternating case.
@@ -326,12 +343,14 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 
 - Discord only renders `[text](url)` markdown as a clickable link **inside embeds**, not in plain message content, so `/aboutme` sends a small embed to make "AAPoke" clickable.
 - `/poll` supports up to 5 options because Discord slash commands need fixed, named parameters rather than an open-ended list — `option3`–`option5` are optional.
-- `?rolemenu` and `?send` share the same `MANAGER_ROLE_ID` gate — set it once, both features use it.
+- `?send` accepts either `MANAGER_ROLE_ID` or `MILO_ROLE_ID`; `?rolemenu` accepts only `MANAGER_ROLE_ID`. A member holding both roles can use both commands.
 - `?rolemenu` can offer at most 25 roles (Discord's hard limit on buttons in one message); if `SELF_ROLES` has more, the extras are dropped with a log warning.
-- `?send` requires both `MANAGER_ROLE_ID` to be set and the Message Content intent to be enabled — without either, it silently does nothing.
+- `?send` requires at least one of `MANAGER_ROLE_ID` / `MILO_ROLE_ID` to be set, plus the Message Content intent to be enabled — without those, it silently does nothing.
 - Clicking your own **Interested** button is blocked with a friendly ephemeral message — remove that check in `bot.py` if you'd rather allow it.
 - Custom `/join` messages are capped at 300 characters; Discord's own per-message limit is 2000.
 - `/catfact`, `/meow`, `/quote`, `/weather`, `/translate`, `/yesno`, and `/react` all call free, keyless public APIs (catfact.ninja, cataas.com, zenquotes.io, Open-Meteo, Google Translate's web endpoint, yesno.wtf, otakugifs.xyz). None of them need an API key or env var, but they're third-party services outside your control — if one is briefly down, slow, or rate-limits you, the command replies with a friendly fallback message instead of crashing (and the reaction commands still post as plain text without the gif).
+- **How `/ask`'s rate limit works.** Groq's free tier limits are enforced per *model*, and `/ask` uses `llama-3.1-8b-instant` — chosen because it's the fastest model on Groq's hardware and has the most generous free daily cap: **30 requests per minute** and **14,400 requests per day** (the bigger 70B/120B models only get 1,000/day). Crucially, these limits belong to your **Groq account, not to individual Discord users** — every person on your server shares the same pool. So if 31 people use `/ask` inside the same minute, the 31st gets a friendly "slow down" reply instead of an answer (Groq returns a 429, which `/ask` catches). The per-minute cap resets continuously, so waiting a minute is enough. For a normal-sized server this is very hard to hit by accident. Groq's free-tier numbers can change over time — check console.groq.com/docs/rate-limits for current values.
+- `/ask` caps each question at 300 characters and each answer at roughly 300 tokens (and hard-truncates anything over 1000 characters) so one reply can never exceed Discord's embed field limits. It has no memory — every question is answered independently, with no conversation history carried over.
 - `/catbreed` is the one exception that **does** need a key: TheCatAPI started requiring `x-api-key` on its breeds endpoint in late September 2026 (previously it worked unauthenticated). A free account at thecatapi.com/signup gives you one. If TheCatAPI changes its policy again in the future, this is the place in `bot.py` to look (`CAT_API_KEY` and the `catbreed_slash` function).
 - Every `_fetch_json` call (used by every API-backed command) automatically retries once on a timeout before giving up, since free public APIs occasionally drop a single request without actually being down. Other failures (404, 429, connection refused) fail immediately without retrying.
 - `/weather` properly percent-encodes its input (via aiohttp's `params`) before building the request URL. An earlier version inserted raw user text directly into the URL string, so a city name with a space or accented letter could hang the request instead of cleanly failing.

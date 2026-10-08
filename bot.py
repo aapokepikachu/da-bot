@@ -69,6 +69,22 @@ MILO_EMOJI = os.getenv("MILO_EMOJI", "<:Milo:1554818642804482078>").strip()
 # message rather than failing silently.
 CAT_API_KEY = os.getenv("CAT_API_KEY", "").strip()
 
+# Optional: free API key from console.groq.com, needed for /ask. Groq is an
+# unrelated company to xAI/SpaceX despite the name sounding like "Grok" --
+# sign up there, not at x.ai or spacex.com.
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+# llama-3.1-8b-instant: the fastest model on Groq's already-very-fast
+# hardware, and by far the most generous free-tier daily cap (14,400
+# requests/day vs 1,000/day on the bigger 70B models) -- the right fit for
+# quick, simple Discord replies rather than deep reasoning.
+GROQ_MODEL = "llama-3.1-8b-instant"
+MILO_SYSTEM_PROMPT = (
+    "You are Milo, a friendly cat-themed Discord bot that helps manage a "
+    "community server. Answer questions clearly and helpfully in 2-4 short "
+    "sentences. Keep a warm, slightly playful tone, but don't overdo cat "
+    "puns -- a light touch is enough. Never claim to be a human."
+)
+
 _raw_allowed_guild = os.getenv("ALLOWED_GUILD_ID", "").strip()
 ALLOWED_GUILD_ID = int(_raw_allowed_guild) if _raw_allowed_guild.isdigit() else None
 
@@ -77,11 +93,17 @@ ALLOWED_GUILD_ID = int(_raw_allowed_guild) if _raw_allowed_guild.isdigit() else 
 _raw_welcome_channel = os.getenv("WELCOME_CHANNEL_ID", "").strip()
 WELCOME_CHANNEL_ID = int(_raw_welcome_channel) if _raw_welcome_channel.isdigit() else None
 
-# Optional: the one role allowed to use the hidden "?send" command AND to
-# post the self-assign role menu via ?rolemenu.
-# If not set, both of those features are disabled.
+# Optional: the Manager role. Can use BOTH hidden commands: "?send" and
+# "?rolemenu". If not set, ?rolemenu is disabled entirely (and ?send only
+# works for MILO_ROLE_ID below, if that's set).
 _raw_manager_role = os.getenv("MANAGER_ROLE_ID", "").strip()
 MANAGER_ROLE_ID = int(_raw_manager_role) if _raw_manager_role.isdigit() else None
+
+# Optional: a second, more limited role. Can use "?send" ONLY -- not
+# "?rolemenu", which stays Manager-only. If not set, only MANAGER_ROLE_ID
+# can use ?send.
+_raw_milo_role = os.getenv("MILO_ROLE_ID", "").strip()
+MILO_ROLE_ID = int(_raw_milo_role) if _raw_milo_role.isdigit() else None
 
 # Optional: self-assignable roles shown by ?rolemenu, as
 # "ROLE_ID|Label|Emoji,ROLE_ID|Label|Emoji,...". Emoji is optional per entry.
@@ -277,7 +299,9 @@ class MiloClient(discord.Client):
         if not WELCOME_CHANNEL_ID:
             logger.info("WELCOME_CHANNEL_ID not set -- welcome messages are disabled.")
         if not MANAGER_ROLE_ID:
-            logger.info("MANAGER_ROLE_ID not set -- the hidden ?send command is disabled.")
+            logger.info("MANAGER_ROLE_ID not set -- the hidden ?rolemenu command is disabled.")
+        if not MANAGER_ROLE_ID and not MILO_ROLE_ID:
+            logger.info("Neither MANAGER_ROLE_ID nor MILO_ROLE_ID set -- the hidden ?send command is disabled.")
 
     async def close(self) -> None:
         if self.session is not None:
@@ -1910,6 +1934,95 @@ async def meme_slash(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed)
 
 
+# ---------------------------------------------------------------------------
+# /ask: quick AI-backed Q&A via Groq (free tier, no credit card).
+# ---------------------------------------------------------------------------
+async def _ask_groq(question: str) -> tuple[str | None, str | None]:
+    """Returns (answer, error_reason). error_reason is "rate_limited", "error",
+    or None on success."""
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": MILO_SYSTEM_PROMPT},
+            {"role": "user", "content": question},
+        ],
+        "max_tokens": 300,
+        "temperature": 0.7,
+    }
+    try:
+        async with bot.session.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json=payload,
+        ) as resp:
+            if resp.status == 429:
+                logger.warning("Groq rate limit hit (429)")
+                return None, "rate_limited"
+            if resp.status != 200:
+                logger.warning("Groq returned status %s", resp.status)
+                return None, "error"
+            data = await resp.json(content_type=None)
+    except asyncio.TimeoutError:
+        logger.warning("Timed out waiting for Groq")
+        return None, "error"
+    except Exception:
+        logger.exception("Failed to reach Groq")
+        return None, "error"
+
+    try:
+        answer = data["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, TypeError):
+        logger.warning("Unexpected Groq response shape: %r", data)
+        return None, "error"
+
+    return answer, None
+
+
+@bot.tree.command(name="ask", description="Ask Milo a quick question (AI-powered).")
+@app_commands.describe(question="What do you want to ask?")
+async def ask_slash(interaction: discord.Interaction, question: app_commands.Range[str, 1, 300]):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    if not GROQ_API_KEY:
+        await interaction.response.send_message(
+            f"{MILO_EMOJI} `/ask` needs a free Groq API key to work -- ask whoever "
+            "runs this bot to grab one at console.groq.com and set `GROQ_API_KEY`.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer()
+    answer, error = await _ask_groq(question)
+
+    if error == "rate_limited":
+        await interaction.followup.send(
+            f"{MILO_EMOJI} Whoa, slow down! I'm getting asked too many questions "
+            "at once -- give it a minute and try again."
+        )
+        return
+    if error or not answer:
+        await interaction.followup.send(
+            f"{MILO_EMOJI} Couldn't think of an answer right now — try again soon."
+        )
+        return
+
+    # Safety net -- max_tokens should already keep this well under Discord's
+    # 1024-char field limit, but never trust an external API's output length
+    # blindly.
+    if len(answer) > 1000:
+        answer = answer[:1000].rstrip() + "…"
+
+    embed = discord.Embed(color=discord.Color.blurple())
+    embed.add_field(name="❓ You asked", value=question, inline=False)
+    embed.add_field(name=f"{MILO_EMOJI} Milo says", value=answer, inline=False)
+    await interaction.followup.send(embed=embed)
+
+
 @bot.tree.command(name="help", description="Shows all Milo commands.")
 async def help_slash(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -1984,6 +2097,11 @@ async def help_slash(interaction: discord.Interaction):
         inline=False,
     )
     embed.add_field(
+        name="🤖 Ask Milo",
+        value="`/ask question:<text>` — ask Milo anything, AI-powered (quick questions, not deep reasoning)",
+        inline=False,
+    )
+    embed.add_field(
         name="🛠️ Utility",
         value=(
             "`/avatar user:<member>` — full-size avatar\n"
@@ -2022,18 +2140,21 @@ async def on_app_command_error(
 # Hidden "?send" and "?rolemenu" commands + auto-responses
 #
 # Both are deliberately plain text commands, not slash commands, so neither
-# ever appears in Discord's "/" picker and neither is listed in /help. Only
-# members with MANAGER_ROLE_ID can use either one. Anyone else typing them
-# is silently ignored -- their existence isn't revealed.
+# ever appears in Discord's "/" picker and neither is listed in /help.
+#   ?send     -> MANAGER_ROLE_ID or MILO_ROLE_ID
+#   ?rolemenu -> MANAGER_ROLE_ID only
+# Anyone else typing either one is silently ignored -- their existence isn't
+# revealed.
 # ---------------------------------------------------------------------------
 async def _handle_send_command(message: discord.Message) -> None:
-    if not MANAGER_ROLE_ID:
-        return  # Feature disabled -- no manager role configured.
+    allowed_role_ids = {r for r in (MANAGER_ROLE_ID, MILO_ROLE_ID) if r is not None}
+    if not allowed_role_ids:
+        return  # Feature disabled -- neither role is configured.
     if message.guild is None or not isinstance(message.author, discord.Member):
         return  # Only works inside a server, where roles exist.
 
     author_role_ids = {role.id for role in message.author.roles}
-    if MANAGER_ROLE_ID not in author_role_ids:
+    if not (allowed_role_ids & author_role_ids):
         return  # Not authorized -- stay silent.
 
     content_to_send = message.content[len("?send "):].strip()
