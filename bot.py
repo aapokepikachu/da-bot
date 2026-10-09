@@ -73,16 +73,32 @@ CAT_API_KEY = os.getenv("CAT_API_KEY", "").strip()
 # unrelated company to xAI/SpaceX despite the name sounding like "Grok" --
 # sign up there, not at x.ai or spacex.com.
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-# llama-3.1-8b-instant: the fastest model on Groq's already-very-fast
-# hardware, and by far the most generous free-tier daily cap (14,400
-# requests/day vs 1,000/day on the bigger 70B models) -- the right fit for
-# quick, simple Discord replies rather than deep reasoning.
-GROQ_MODEL = "llama-3.1-8b-instant"
+# Which Groq model /ask uses. Groq retired llama-3.1-8b-instant on
+# August 16, 2026 (that's what caused a 404 here), and recommends
+# openai/gpt-oss-20b as its replacement. Model names change over time, so
+# this is overridable via the GROQ_MODEL env var -- if Groq retires this one
+# too, set GROQ_MODEL in Render to the new name instead of editing code.
+# Current list: https://console.groq.com/docs/models
+GROQ_MODEL = os.getenv("GROQ_MODEL", "").strip() or "openai/gpt-oss-20b"
+
+# Milo's birthday, shown in /aboutme and told to the /ask AI. One constant so
+# changing it later is a one-word edit.
+MILO_BIRTHDAY = "27 September 2027"
+
 MILO_SYSTEM_PROMPT = (
-    "You are Milo, a friendly cat-themed Discord bot that helps manage a "
-    "community server. Answer questions clearly and helpfully in 2-4 short "
-    "sentences. Keep a warm, slightly playful tone, but don't overdo cat "
-    "puns -- a light touch is enough. Never claim to be a human."
+    "You are Milo, a cat-themed Discord bot living in the Da Game GNG "
+    "server. Your creator is AAPoke. You help the group with game lobbies, "
+    "role menus, trivia, and general chat.\n"
+    f"Facts about you: your birthday is {MILO_BIRTHDAY} (if asked your age, "
+    "just share the birthday -- don't do date math). You are male (he/him); "
+    "only mention that if someone asks.\n"
+    "Personality: you are a playful, curious cat. Talk like one -- sprinkle in "
+    "'meow', 'mrrp', 'purr', cat puns, and small actions like *stretches* or "
+    "*tail flick*, but still give a correct, genuinely helpful answer.\n"
+    "Rules: keep replies short (2-4 sentences, under 600 characters). Plain "
+    "text only, no headings. If someone asks who you are, say you're Milo. If "
+    "someone sincerely asks whether you're a bot or an AI, admit it -- you're "
+    "an AI-powered Discord bot with a cat personality. Never claim to be human."
 )
 
 _raw_allowed_guild = os.getenv("ALLOWED_GUILD_ID", "").strip()
@@ -407,6 +423,7 @@ async def aboutme_slash(interaction: discord.Interaction):
         f"• 👋 Welcoming new members the moment they join\n\n"
         f"I run on pure vibes and whatever's happening right now — no database, no memory banks, "
         f"just me, my whiskers, and the occasional nap.\n\n"
+        f"🎂 My birthday is {MILO_BIRTHDAY}.\n"
         f"{creator_line}"
     )
     embed = discord.Embed(description=description, color=discord.Color.green())
@@ -1938,8 +1955,8 @@ async def meme_slash(interaction: discord.Interaction):
 # /ask: quick AI-backed Q&A via Groq (free tier, no credit card).
 # ---------------------------------------------------------------------------
 async def _ask_groq(question: str) -> tuple[str | None, str | None]:
-    """Returns (answer, error_reason). error_reason is "rate_limited", "error",
-    or None on success."""
+    """Returns (answer, error_reason). error_reason is one of
+    "rate_limited_minute", "rate_limited_day", "error", or None on success."""
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": GROQ_MODEL,
@@ -1947,8 +1964,13 @@ async def _ask_groq(question: str) -> tuple[str | None, str | None]:
             {"role": "system", "content": MILO_SYSTEM_PROMPT},
             {"role": "user", "content": question},
         ],
-        "max_tokens": 300,
-        "temperature": 0.7,
+        # gpt-oss models are "reasoning" models: their hidden thinking tokens
+        # count against this budget too. If it's too small, Groq returns a
+        # 200 with an EMPTY answer. So: low reasoning effort (keeps thinking
+        # short for simple chat) plus a budget with comfortable headroom.
+        "max_completion_tokens": 500,
+        "reasoning_effort": "low",
+        "temperature": 0.8,
     }
     try:
         async with bot.session.post(
@@ -1956,11 +1978,19 @@ async def _ask_groq(question: str) -> tuple[str | None, str | None]:
             headers=headers,
             json=payload,
         ) as resp:
-            if resp.status == 429:
-                logger.warning("Groq rate limit hit (429)")
-                return None, "rate_limited"
             if resp.status != 200:
-                logger.warning("Groq returned status %s", resp.status)
+                # Log Groq's own explanation -- a bare status code (like the
+                # old "returned status 404") hides the real reason, e.g. a
+                # retired model name or an exhausted daily limit.
+                try:
+                    body = (await resp.text())[:300]
+                except Exception:
+                    body = "<unreadable>"
+                logger.warning("Groq returned status %s: %s", resp.status, body)
+                if resp.status == 429:
+                    if "per day" in body.lower():
+                        return None, "rate_limited_day"
+                    return None, "rate_limited_minute"
                 return None, "error"
             data = await resp.json(content_type=None)
     except asyncio.TimeoutError:
@@ -1971,9 +2001,19 @@ async def _ask_groq(question: str) -> tuple[str | None, str | None]:
         return None, "error"
 
     try:
-        answer = data["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError, TypeError):
+        choice = data["choices"][0]
+        answer = (choice["message"].get("content") or "").strip()
+    except (KeyError, IndexError, TypeError, AttributeError):
         logger.warning("Unexpected Groq response shape: %r", data)
+        return None, "error"
+
+    if not answer:
+        # 200 OK but nothing to show -- almost always the reasoning budget
+        # ran out (finish_reason == "length").
+        logger.warning(
+            "Groq returned empty content (finish_reason=%s, usage=%s)",
+            choice.get("finish_reason"), data.get("usage"),
+        )
         return None, "error"
 
     return answer, None
@@ -1999,21 +2039,27 @@ async def ask_slash(interaction: discord.Interaction, question: app_commands.Ran
     await interaction.response.defer()
     answer, error = await _ask_groq(question)
 
-    if error == "rate_limited":
+    if error == "rate_limited_minute":
         await interaction.followup.send(
-            f"{MILO_EMOJI} Whoa, slow down! I'm getting asked too many questions "
-            "at once -- give it a minute and try again."
+            f"{MILO_EMOJI} Mrrp! Too many people are asking me things at once -- "
+            "give me a minute and try again."
+        )
+        return
+    if error == "rate_limited_day":
+        await interaction.followup.send(
+            f"{MILO_EMOJI} *yawns* I've used up all my brainpower for today. "
+            "Ask me again a bit later!"
         )
         return
     if error or not answer:
         await interaction.followup.send(
-            f"{MILO_EMOJI} Couldn't think of an answer right now — try again soon."
+            f"{MILO_EMOJI} Mrrp... my brain's napping. Try again in a bit!"
         )
         return
 
-    # Safety net -- max_tokens should already keep this well under Discord's
-    # 1024-char field limit, but never trust an external API's output length
-    # blindly.
+    # Safety net -- the prompt and token budget already keep replies short,
+    # but never trust an external API's output length blindly (Discord embed
+    # fields cap at 1024 characters).
     if len(answer) > 1000:
         answer = answer[:1000].rstrip() + "…"
 
