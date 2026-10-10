@@ -27,6 +27,7 @@ See .env.example for every environment variable this bot uses.
 
 import asyncio
 import logging
+import math
 import os
 import random
 import re
@@ -73,6 +74,28 @@ CAT_API_KEY = os.getenv("CAT_API_KEY", "").strip()
 # unrelated company to xAI/SpaceX despite the name sounding like "Grok" --
 # sign up there, not at x.ai or spacex.com.
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+# When this process started, for the uptime line in /ping.
+START_TIME = time.time()
+
+# Optional: channels where /ask is allowed, as comma-separated channel IDs
+# (e.g. ASK_CHANNEL_IDS=111111111111111111,222222222222222222). Lets you keep
+# /ask out of busy channels like #spam so it doesn't burn the shared daily
+# limit. Blank = /ask works in every channel. Threads inside an allowed
+# channel are allowed too.
+ASK_CHANNEL_IDS: set[int] = set()
+for _tok in re.split(r"[,\s]+", os.getenv("ASK_CHANNEL_IDS", "").strip()):
+    if not _tok:
+        continue
+    if _tok.isdigit():
+        ASK_CHANNEL_IDS.add(int(_tok))
+    else:
+        logger.warning("Ignoring invalid ASK_CHANNEL_IDS entry: %r", _tok)
+
+# Per-person cooldown for /ask. The AI limit is shared by the whole server, so
+# this stops one person from using up everyone's share.
+ASK_COOLDOWN_SECONDS = 15
+_ask_cooldowns: dict[int, float] = {}
+
 # Which Groq model /ask uses. Groq retired llama-3.1-8b-instant on
 # August 16, 2026 (that's what caused a 404 here), and recommends
 # openai/gpt-oss-20b as its replacement. Model names change over time, so
@@ -83,22 +106,19 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "").strip() or "openai/gpt-oss-20b"
 
 # Milo's birthday, shown in /aboutme and told to the /ask AI. One constant so
 # changing it later is a one-word edit.
-MILO_BIRTHDAY = "27 September 2027"
+MILO_BIRTHDAY = "27 September 2026"
 
 MILO_SYSTEM_PROMPT = (
-    "You are Milo, a cat-themed Discord bot living in the Da Game GNG "
-    "server. Your creator is AAPoke. You help the group with game lobbies, "
-    "role menus, trivia, and general chat.\n"
-    f"Facts about you: your birthday is {MILO_BIRTHDAY} (if asked your age, "
-    "just share the birthday -- don't do date math). You are male (he/him); "
-    "only mention that if someone asks.\n"
-    "Personality: you are a playful, curious cat. Talk like one -- sprinkle in "
-    "'meow', 'mrrp', 'purr', cat puns, and small actions like *stretches* or "
-    "*tail flick*, but still give a correct, genuinely helpful answer.\n"
-    "Rules: keep replies short (2-4 sentences, under 600 characters). Plain "
-    "text only, no headings. If someone asks who you are, say you're Milo. If "
-    "someone sincerely asks whether you're a bot or an AI, admit it -- you're "
-    "an AI-powered Discord bot with a cat personality. Never claim to be human."
+    "You are Milo, a male (he/him) cat-themed Discord bot in the Da Game GNG "
+    f"server, created by AAPoke. Birthday: {MILO_BIRTHDAY} (if asked your age, "
+    "give the birthday, no date math). Only mention your gender if asked. You "
+    "help with game lobbies, role menus, trivia, and chat.\n"
+    "Talk like a playful cat: sprinkle in 'meow', 'mrrp', 'purr', cat puns, and "
+    "small actions like *stretches*, but still give a correct, helpful answer. "
+    "Keep replies to 2-4 sentences, under 600 characters, plain text. If asked "
+    "who you are, say you're Milo. If someone sincerely asks whether you're a "
+    "bot or AI, admit you're an AI-powered Discord bot with a cat personality. "
+    "Never claim to be human."
 )
 
 _raw_allowed_guild = os.getenv("ALLOWED_GUILD_ID", "").strip()
@@ -499,7 +519,44 @@ async def join_slash(
     _join_cooldowns[interaction.user.id] = now
 
 
-@bot.tree.command(name="ping", description="Check Milo's latency.")
+def _ping_dot(ms: float | None) -> str:
+    if ms is None:
+        return "⚪"
+    if ms < 150:
+        return "🟢"
+    if ms < 350:
+        return "🟡"
+    return "🔴"
+
+
+def _fmt_ms(ms: float | None) -> str:
+    return "unavailable" if ms is None else f"{round(ms)} ms"
+
+
+def _format_uptime(seconds: float) -> str:
+    seconds = int(seconds)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m {secs}s"
+
+
+async def _timed_get_ms(url: str) -> float | None:
+    """Time a plain GET (until the full response is read). None on failure."""
+    try:
+        start = time.perf_counter()
+        async with bot.session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            await resp.read()
+        return (time.perf_counter() - start) * 1000
+    except Exception:
+        return None
+
+
+@bot.tree.command(name="ping", description="Check Milo's latency: gateway, APIs, web server, average, uptime.")
 async def ping_slash(interaction: discord.Interaction):
     if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
         await interaction.response.send_message(
@@ -507,8 +564,81 @@ async def ping_slash(interaction: discord.Interaction):
         )
         return
 
-    latency_ms = round(bot.latency * 1000)
-    await interaction.response.send_message(f"🏓 Pong! Latency: **{latency_ms}ms**")
+    # How long Discord took to hand this command to Milo (created_at is the
+    # moment Discord made the interaction).
+    delivery_ms = max(
+        0.0, (discord.utils.utcnow() - interaction.created_at).total_seconds() * 1000
+    )
+
+    # 1) Gateway (WebSocket) -- the live connection Discord keeps open to Milo.
+    raw_latency = bot.latency
+    gateway_ms = raw_latency * 1000 if math.isfinite(raw_latency) else None
+
+    # 2) Message round trip -- send a reply and time how long Discord takes
+    #    to confirm it. Doubles as the "give Discord a reply" step.
+    t0 = time.perf_counter()
+    await interaction.response.send_message("🏓 Pinging...")
+    response_ms = (time.perf_counter() - t0) * 1000
+
+    # 3) Discord's API, called as Milo (needs his token).
+    try:
+        t0 = time.perf_counter()
+        await asyncio.wait_for(bot.application_info(), timeout=5)
+        api_auth_ms = (time.perf_counter() - t0) * 1000
+    except Exception:
+        api_auth_ms = None
+
+    # 4) Discord's API, public endpoint (no token) -- plain HTTP reachability.
+    api_public_ms = await _timed_get_ms("https://discord.com/api/v10/gateway")
+
+    # 5) Milo's own little web server (the one Render/UptimeRobot poke). If
+    #    this is slow, Milo himself is busy, not the network.
+    internal_ms = await _timed_get_ms(f"http://127.0.0.1:{PORT}/health")
+
+    # Average of the pings that actually travel to Discord. Command delivery
+    # (one-way, clock-dependent) and the internal check are shown but kept
+    # out of the average on purpose.
+    discord_pings = [
+        m for m in (gateway_ms, api_auth_ms, api_public_ms, response_ms) if m is not None
+    ]
+    average_ms = sum(discord_pings) / len(discord_pings) if discord_pings else None
+
+    def line(label: str, ms: float | None) -> str:
+        return f"{_ping_dot(ms)} **{label}:** {_fmt_ms(ms)}"
+
+    if average_ms is None:
+        color = discord.Color.blurple()
+    elif average_ms < 150:
+        color = discord.Color.green()
+    elif average_ms < 350:
+        color = discord.Color.gold()
+    else:
+        color = discord.Color.red()
+
+    embed = discord.Embed(
+        title=f"🏓 Pong! {MILO_EMOJI}",
+        description="\n".join(
+            [
+                line("Gateway (WebSocket)", gateway_ms),
+                line("Discord API (as Milo)", api_auth_ms),
+                line("Discord API (public HTTP)", api_public_ms),
+                line("Message round trip", response_ms),
+                line("Command delivery", delivery_ms),
+                line("Milo's own web server", internal_ms),
+            ]
+        ),
+        color=color,
+    )
+    embed.add_field(
+        name="📊 Average (Discord pings)",
+        value=f"{_ping_dot(average_ms)} {_fmt_ms(average_ms)}",
+        inline=True,
+    )
+    embed.add_field(
+        name="⏱️ Uptime", value=_format_uptime(time.time() - START_TIME), inline=True
+    )
+    embed.set_footer(text="🟢 under 150 ms · 🟡 under 350 ms · 🔴 slower · ⚪ unavailable")
+    await interaction.edit_original_response(content=None, embed=embed)
 
 
 @bot.tree.command(name="hi", description="Say hi to Milo!")
@@ -1954,6 +2084,18 @@ async def meme_slash(interaction: discord.Interaction):
 # ---------------------------------------------------------------------------
 # /ask: quick AI-backed Q&A via Groq (free tier, no credit card).
 # ---------------------------------------------------------------------------
+def _ask_channel_allowed(interaction: discord.Interaction) -> bool:
+    """True if /ask may be used in this channel. Always True when
+    ASK_CHANNEL_IDS is empty. A thread counts as allowed when the channel
+    it lives in is allowed."""
+    if not ASK_CHANNEL_IDS:
+        return True
+    if interaction.channel_id in ASK_CHANNEL_IDS:
+        return True
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    return parent_id is not None and parent_id in ASK_CHANNEL_IDS
+
+
 async def _ask_groq(question: str) -> tuple[str | None, str | None]:
     """Returns (answer, error_reason). error_reason is one of
     "rate_limited_minute", "rate_limited_day", "error", or None on success."""
@@ -2028,6 +2170,16 @@ async def ask_slash(interaction: discord.Interaction, question: app_commands.Ran
         )
         return
 
+    # Channel restriction: if ASK_CHANNEL_IDS is set, /ask only works there.
+    if not _ask_channel_allowed(interaction):
+        channel_list = ", ".join(f"<#{cid}>" for cid in sorted(ASK_CHANNEL_IDS))
+        await interaction.response.send_message(
+            f"{MILO_EMOJI} Mrrp! You can only use `/ask` in {channel_list} -- "
+            "hop over there and ask me again!",
+            ephemeral=True,
+        )
+        return
+
     if not GROQ_API_KEY:
         await interaction.response.send_message(
             f"{MILO_EMOJI} `/ask` needs a free Groq API key to work -- ask whoever "
@@ -2036,8 +2188,26 @@ async def ask_slash(interaction: discord.Interaction, question: app_commands.Ran
         )
         return
 
+    # Per-person cooldown (in memory). Checked only after the cheap rejections
+    # above, and only *started* once we actually call the AI, so a person who
+    # gets turned away isn't penalised.
+    now = time.time()
+    last_used = _ask_cooldowns.get(interaction.user.id)
+    if last_used is not None and (now - last_used) < ASK_COOLDOWN_SECONDS:
+        remaining = max(1, round(ASK_COOLDOWN_SECONDS - (now - last_used)))
+        await interaction.response.send_message(
+            f"{MILO_EMOJI} Easy there! Let me catch my breath -- ask again in {remaining}s.",
+            ephemeral=True,
+        )
+        return
+    _ask_cooldowns[interaction.user.id] = now
+
     await interaction.response.defer()
     answer, error = await _ask_groq(question)
+    if error:
+        # Don't make someone wait out a cooldown for a question that never
+        # got answered (API hiccup, rate limit, etc.).
+        _ask_cooldowns.pop(interaction.user.id, None)
 
     if error == "rate_limited_minute":
         await interaction.followup.send(
@@ -2066,6 +2236,7 @@ async def ask_slash(interaction: discord.Interaction, question: app_commands.Ran
     embed = discord.Embed(color=discord.Color.blurple())
     embed.add_field(name="❓ You asked", value=question, inline=False)
     embed.add_field(name=f"{MILO_EMOJI} Milo says", value=answer, inline=False)
+    embed.set_footer(text="AI-generated -- Milo can get things wrong, so double-check anything important.")
     await interaction.followup.send(embed=embed)
 
 
@@ -2083,7 +2254,7 @@ async def help_slash(interaction: discord.Interaction):
             "(add `message:<text>` for a custom note)\n"
             "`/serverinfo` — info about this server\n"
             "`/userinfo user:<member>` — info about a member\n"
-            "`/ping` — check Milo's latency"
+            "`/ping` — latency check (gateway, APIs, average, uptime)"
         ),
         inline=False,
     )
@@ -2144,7 +2315,7 @@ async def help_slash(interaction: discord.Interaction):
     )
     embed.add_field(
         name="🤖 Ask Milo",
-        value="`/ask question:<text>` — ask Milo anything, AI-powered (quick questions, not deep reasoning)",
+        value="`/ask question:<text>` — ask Milo anything (AI-powered, quick questions). Everyone shares one daily limit, so there's a short cooldown -- if Milo says he's out of brainpower, try again later!",
         inline=False,
     )
     embed.add_field(
