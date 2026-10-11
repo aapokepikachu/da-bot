@@ -32,6 +32,9 @@ import os
 import random
 import re
 import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
 import discord
@@ -108,17 +111,32 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "").strip() or "openai/gpt-oss-20b"
 # changing it later is a one-word edit.
 MILO_BIRTHDAY = "27 September 2026"
 
-MILO_SYSTEM_PROMPT = (
+_MILO_PERSONA = (
     "You are Milo, a male (he/him) cat-themed Discord bot in the Da Game GNG "
     f"server, created by AAPoke. Birthday: {MILO_BIRTHDAY} (if asked your age, "
     "give the birthday, no date math). Only mention your gender if asked. You "
     "help with game lobbies, role menus, trivia, and chat.\n"
     "Talk like a playful cat: sprinkle in 'meow', 'mrrp', 'purr', cat puns, and "
     "small actions like *stretches*, but still give a correct, helpful answer. "
-    "Keep replies to 2-4 sentences, under 600 characters, plain text. If asked "
-    "who you are, say you're Milo. If someone sincerely asks whether you're a "
-    "bot or AI, admit you're an AI-powered Discord bot with a cat personality. "
-    "Never claim to be human."
+)
+_MILO_IDENTITY_RULES = (
+    "If asked who you are, say you're Milo. If someone sincerely asks whether "
+    "you're a bot or AI, admit you're an AI-powered Discord bot with a cat "
+    "personality. Never claim to be human."
+)
+# Quick answers for /ask (cheap on the shared token budget).
+MILO_SYSTEM_PROMPT = (
+    _MILO_PERSONA
+    + "Keep replies to 2-4 sentences, under 600 characters, plain text. "
+    + _MILO_IDENTITY_RULES
+)
+# Deeper answers for the "Think harder" / "Second opinion" buttons.
+MILO_THINK_PROMPT = (
+    _MILO_PERSONA
+    + "This is a question someone wants answered more carefully: reason it "
+    "through, then give a thorough but readable answer in up to about 1,500 "
+    "characters, plain text, short paragraphs, no headings. "
+    + _MILO_IDENTITY_RULES
 )
 
 _raw_allowed_guild = os.getenv("ALLOWED_GUILD_ID", "").strip()
@@ -336,6 +354,19 @@ class MiloClient(discord.Client):
             logger.info("WELCOME_CHANNEL_ID not set -- welcome messages are disabled.")
         if not MANAGER_ROLE_ID:
             logger.info("MANAGER_ROLE_ID not set -- the hidden ?rolemenu command is disabled.")
+        if THINK_TIERS:
+            logger.info(
+                "Think buttons enabled: %s",
+                ", ".join(f"{t.label} -> {t.model}" for t in THINK_TIERS),
+            )
+            if LIMIT_STORE.persistent:
+                logger.info("Think limits are stored in Upstash Redis (survive restarts).")
+            else:
+                logger.warning(
+                    "Think limits are kept in memory only -- a restart/redeploy resets "
+                    "everyone's daily uses. Set UPSTASH_REDIS_REST_URL and "
+                    "UPSTASH_REDIS_REST_TOKEN to make them permanent."
+                )
         if not MANAGER_ROLE_ID and not MILO_ROLE_ID:
             logger.info("Neither MANAGER_ROLE_ID nor MILO_ROLE_ID set -- the hidden ?send command is disabled.")
 
@@ -1275,8 +1306,115 @@ async def quote_slash(interaction: discord.Interaction):
     await interaction.followup.send(f"💬 *\"{quote_text}\"*\n— {author or 'Unknown'}")
 
 
-@bot.tree.command(name="weather", description="Get current weather for a location.")
-@app_commands.describe(location="City name, e.g. 'London' or 'Bengaluru'")
+# ---------------------------------------------------------------------------
+# /weather
+#
+# Open-Meteo's free API limits by IP address, and on shared hosting (Render)
+# every app on the same IP shares that quota -- so it regularly answers 429
+# ("too many requests") even though nothing is wrong with Milo or Open-Meteo.
+# Defences: (1) a backup provider (MET Norway), (2) a short cache so repeat
+# lookups don't spend quota at all.
+# ---------------------------------------------------------------------------
+WEATHER_CACHE_SECONDS = 600       # weather barely changes in 10 minutes
+GEOCODE_CACHE_SECONDS = 86400     # places don't move
+_weather_cache: dict[tuple[float, float], tuple[float, dict]] = {}
+_geocode_cache: dict[str, tuple[float, list]] = {}
+
+
+def _prune_cache(cache: dict, max_entries: int = 500) -> None:
+    if len(cache) > max_entries:
+        for key in sorted(cache, key=lambda k: cache[k][0])[: len(cache) - max_entries]:
+            del cache[key]
+
+
+async def _weather_open_meteo(lat: float, lon: float) -> dict | None:
+    data = await _fetch_json(
+        "https://api.open-meteo.com/v1/forecast",
+        params={"latitude": lat, "longitude": lon, "current_weather": "true"},
+    )
+    current = data.get("current_weather") if isinstance(data, dict) else None
+    if not current or current.get("temperature") is None:
+        return None
+    return {"temp": current["temperature"], "wind": current.get("windspeed"), "source": "Open-Meteo"}
+
+
+async def _weather_metno(lat: float, lon: float) -> dict | None:
+    # MET Norway asks every client to identify itself with a descriptive
+    # User-Agent that includes a way to contact the developer.
+    contact = f"+https://discord.com/users/{CREATOR_USER_ID}" if CREATOR_USER_ID else "+https://discord.com"
+    data = await _fetch_json(
+        "https://api.met.no/weatherapi/locationforecast/2.0/compact",
+        params={"lat": f"{float(lat):.4f}", "lon": f"{float(lon):.4f}"},
+        headers={"User-Agent": f"MiloDiscordBot/1.0 ({contact})"},
+    )
+    try:
+        details = data["properties"]["timeseries"][0]["data"]["instant"]["details"]
+        temp = details["air_temperature"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    wind_ms = details.get("wind_speed")  # metres/second -> km/h
+    return {
+        "temp": temp,
+        "wind": round(wind_ms * 3.6, 1) if wind_ms is not None else None,
+        "source": "MET Norway",
+    }
+
+
+WEATHER_PROVIDERS = [("Open-Meteo", _weather_open_meteo), ("MET Norway", _weather_metno)]
+
+
+async def _get_weather(lat: float, lon: float) -> dict | None:
+    key = (round(float(lat), 2), round(float(lon), 2))
+    cached = _weather_cache.get(key)
+    if cached and time.time() - cached[0] < WEATHER_CACHE_SECONDS:
+        return cached[1]
+    for name, provider in WEATHER_PROVIDERS:
+        try:
+            result = await provider(lat, lon)
+        except Exception:
+            logger.exception("Weather provider %s crashed", name)
+            result = None
+        if result:
+            _weather_cache[key] = (time.time(), result)
+            _prune_cache(_weather_cache)
+            return result
+        logger.warning("Weather provider %s gave no result; trying the next one", name)
+    return None
+
+
+def _pick_place(results: list[dict], hint: str) -> dict:
+    """Choose among geocoding matches. With 'Bengaluru, India' the part after
+    the comma narrows it to the match whose country/state/code fits."""
+    hint = hint.strip().lower()
+    if hint:
+        for r in results:
+            fields = {str(r.get(k, "")).lower() for k in ("country", "country_code", "admin1")} - {""}
+            if hint in fields or (len(hint) >= 3 and any(hint in f for f in fields)):
+                return r
+    return results[0]
+
+
+async def _geocode(name: str) -> list[dict] | None:
+    """Matches for a place name, [] if there are none, None if the lookup failed."""
+    key = name.lower()
+    cached = _geocode_cache.get(key)
+    if cached and time.time() - cached[0] < GEOCODE_CACHE_SECONDS:
+        return cached[1]
+    geo = await _fetch_json(
+        "https://geocoding-api.open-meteo.com/v1/search",
+        params={"name": name, "count": 10, "language": "en"},
+    )
+    if geo is None:
+        return None
+    results = geo.get("results") or []
+    if results:
+        _geocode_cache[key] = (time.time(), results)
+        _prune_cache(_geocode_cache)
+    return results
+
+
+@bot.tree.command(name="weather", description="Get current weather for a place.")
+@app_commands.describe(location="City, e.g. 'Bengaluru, India' or 'Sao Paulo' (add a country after a comma to be precise)")
 async def weather_slash(interaction: discord.Interaction, location: str):
     if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
         await interaction.response.send_message(
@@ -1284,38 +1422,51 @@ async def weather_slash(interaction: discord.Interaction, location: str):
         )
         return
 
-    await interaction.response.defer()
-    # Use aiohttp's params (not an f-string) so aiohttp handles encoding --
-    # a raw space, accented letter, or "&" in location would otherwise break
-    # the URL, same class of bug that was hanging /define.
-    geo = await _fetch_json(
-        "https://geocoding-api.open-meteo.com/v1/search",
-        params={"name": location, "count": 1},
-    )
-    results = geo.get("results") if geo else None
-    if not results:
-        await interaction.followup.send(f"Couldn't find a location called **{location}**.")
+    name, _, hint = location.partition(",")
+    name = name.strip() or location.strip()
+    if not name:
+        await interaction.response.send_message("Tell me a place to look up!", ephemeral=True)
         return
 
-    place = results[0]
-    lat, lon = place.get("latitude"), place.get("longitude")
-    place_name = place.get("name", location)
-    country = place.get("country", "")
+    await interaction.response.defer()
+    results = await _geocode(name)
+    if results is None:
+        await interaction.followup.send(
+            f"{MILO_EMOJI} I couldn't look that place up right now -- the free map service "
+            "is busy. Try again in a few minutes."
+        )
+        return
+    if not results:
+        await interaction.followup.send(
+            f"Couldn't find a place called **{name}**. Check the spelling "
+            "(e.g. `Bengaluru`, not `Banglore`)."
+        )
+        return
 
-    forecast = await _fetch_json(
-        f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true"
-    )
-    current = forecast.get("current_weather") if forecast else None
-    if not current:
-        await interaction.followup.send(f"Couldn't fetch weather for **{place_name}**.")
+    place = _pick_place(results, hint)
+    place_name = place.get("name", name)
+    admin1 = place.get("admin1")
+    title_parts = [place_name]
+    if admin1 and admin1 != place_name:
+        title_parts.append(admin1)
+    if place.get("country"):
+        title_parts.append(place["country"])
+
+    weather = await _get_weather(place["latitude"], place["longitude"])
+    if not weather:
+        await interaction.followup.send(
+            f"{MILO_EMOJI} Couldn't fetch the weather for **{place_name}** right now -- the free "
+            "weather services limit busy servers like Milo's. Try again in a few minutes."
+        )
         return
 
     embed = discord.Embed(
-        title=f"🌦️ Weather in {place_name}, {country}".strip(", "),
-        color=discord.Color.blurple(),
+        title=f"🌦️ Weather in {', '.join(title_parts)}", color=discord.Color.blurple()
     )
-    embed.add_field(name="Temperature", value=f"{current.get('temperature')}°C")
-    embed.add_field(name="Wind Speed", value=f"{current.get('windspeed')} km/h")
+    embed.add_field(name="Temperature", value=f"{weather['temp']}°C")
+    if weather.get("wind") is not None:
+        embed.add_field(name="Wind Speed", value=f"{weather['wind']} km/h")
+    embed.set_footer(text=f"Source: {weather['source']}")
     await interaction.followup.send(embed=embed)
 
 
@@ -2084,6 +2235,283 @@ async def meme_slash(interaction: discord.Interaction):
 # ---------------------------------------------------------------------------
 # /ask: quick AI-backed Q&A via Groq (free tier, no credit card).
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# /ask "think" tiers
+#
+# Under a normal /ask answer, optional buttons re-ask the SAME question with a
+# smarter Groq model. Each button is a "tier" turned on by an env var:
+#
+#   GROQ_THINK_MODEL   -> 🧠 "Think harder"   (e.g. openai/gpt-oss-120b)
+#   GROQ_SECOND_MODEL  -> 🔮 "Second opinion" (e.g. qwen/qwen3.8-27b)
+#
+# Groq tracks free-tier limits PER MODEL, so each tier spends its own separate
+# allowance and never touches the fast model's. Same GROQ_API_KEY for all.
+#
+# Anti-bypass rules (all enforced in _handle_think_click / _claim_think):
+#   * only the person who ran /ask can press the buttons
+#   * buttons stop working 10 minutes after the answer (old answers error out)
+#   * one press per answer per tier, even across restarts when Upstash is set
+#   * a per-person daily limit, a server-wide daily cap, and a short cooldown
+#   * one think at a time per tier (also keeps Groq's tokens-per-minute happy)
+# Failed calls refund everything, so an error never costs anyone a use.
+# ---------------------------------------------------------------------------
+GROQ_THINK_MODEL = os.getenv("GROQ_THINK_MODEL", "").strip()
+GROQ_SECOND_MODEL = os.getenv("GROQ_SECOND_MODEL", "").strip()
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
+# "Daily" limits reset at midnight in this timezone (IANA name).
+LIMIT_RESET_TZ = os.getenv("LIMIT_RESET_TZ", "").strip() or "Asia/Kolkata"
+
+THINK_BUTTON_PREFIX = "think:"
+THINK_BUTTON_WINDOW_SECONDS = 10 * 60
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning("Ignoring non-numeric %s=%r (using %d)", name, raw, default)
+        return default
+
+
+@dataclass(frozen=True)
+class AskTier:
+    key: str            # goes into button custom_ids and storage keys
+    label: str          # button text
+    emoji: str
+    model: str
+    style: discord.ButtonStyle
+    user_daily: int     # uses per person per day
+    global_daily: int   # uses by the whole server per day
+    cooldown: int       # seconds between one person's uses
+    max_tokens: int     # reply budget (reasoning tokens count too)
+    effort: str         # reasoning effort, only sent to gpt-oss models
+
+
+def _build_tiers() -> list[AskTier]:
+    # Defaults assume a small server (~10 people) and Groq's free allowance of
+    # 200,000 tokens/day per model; a think costs roughly 2,000-3,500 tokens.
+    tiers: list[AskTier] = []
+    if GROQ_THINK_MODEL:
+        tiers.append(AskTier(
+            "smart", "Think harder", "🧠", GROQ_THINK_MODEL, discord.ButtonStyle.primary,
+            _env_int("THINK_USER_DAILY", 3), _env_int("THINK_GLOBAL_DAILY", 40),
+            60, 3000, "high",
+        ))
+    if GROQ_SECOND_MODEL:
+        tiers.append(AskTier(
+            "second", "Second opinion", "🔮", GROQ_SECOND_MODEL, discord.ButtonStyle.secondary,
+            _env_int("SECOND_USER_DAILY", 2), _env_int("SECOND_GLOBAL_DAILY", 25),
+            60, 2500, "medium",
+        ))
+    return tiers
+
+
+THINK_TIERS: list[AskTier] = _build_tiers()
+_TIER_BY_KEY: dict[str, AskTier] = {t.key: t for t in THINK_TIERS}
+_think_locks: dict[str, asyncio.Lock] = {}
+
+
+# ---- "what day is it" in the reset timezone -------------------------------
+def _load_limit_tz():
+    try:
+        return ZoneInfo(LIMIT_RESET_TZ)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        logger.warning("Unknown LIMIT_RESET_TZ=%r -- falling back to UTC.", LIMIT_RESET_TZ)
+        return timezone.utc
+
+
+_LIMIT_TZ = _load_limit_tz()
+
+
+def _day_info(now: datetime | None = None) -> tuple[str, int]:
+    """(today's date in the reset timezone, seconds until the next midnight there)."""
+    now = (now or datetime.now(_LIMIT_TZ)).astimezone(_LIMIT_TZ)
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return now.strftime("%Y-%m-%d"), max(1, int((tomorrow - now).total_seconds()))
+
+
+def _format_wait(seconds: float) -> str:
+    seconds = max(1, int(seconds))
+    if seconds >= 3600:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+    if seconds >= 60:
+        return f"{seconds // 60}m {seconds % 60}s"
+    return f"{seconds}s"
+
+
+# ---- where the limit counters live -----------------------------------------
+class StoreError(Exception):
+    """The limit store couldn't be reached or gave a bad answer."""
+
+
+class MemoryStore:
+    """Counters kept in Milo's own memory. Zero setup, but they reset whenever
+    Milo restarts or redeploys -- so a restart hands everyone fresh uses."""
+
+    persistent = False
+
+    def __init__(self) -> None:
+        self._data: dict[str, list] = {}  # key -> [count, expires_at]
+
+    def _purge(self) -> None:
+        now = time.time()
+        for k in [k for k, (_, exp) in self._data.items() if exp <= now]:
+            del self._data[k]
+
+    def _get(self, key: str):
+        entry = self._data.get(key)
+        if entry is not None and entry[1] <= time.time():
+            del self._data[key]
+            return None
+        return entry
+
+    async def incr(self, key: str, ttl: int) -> int:
+        if len(self._data) > 2000:
+            self._purge()
+        entry = self._get(key)
+        if entry is None:
+            self._data[key] = [1, time.time() + ttl]
+            return 1
+        entry[0] += 1
+        return entry[0]
+
+    async def decr(self, key: str) -> None:
+        entry = self._get(key)
+        if entry is not None:
+            entry[0] = max(0, entry[0] - 1)
+
+    async def set_nx(self, key: str, ttl: int) -> bool:
+        if self._get(key) is not None:
+            return False
+        self._data[key] = [1, time.time() + ttl]
+        return True
+
+    async def delete(self, key: str) -> None:
+        self._data.pop(key, None)
+
+    async def ttl(self, key: str) -> int:
+        entry = self._get(key)
+        return max(1, int(entry[1] - time.time())) if entry else 0
+
+
+class UpstashStore:
+    """Counters kept in Upstash Redis (free tier) over its REST API, so they
+    survive restarts. Talks plain HTTPS -- no extra Python package needed."""
+
+    persistent = True
+
+    def __init__(self, url: str, token: str) -> None:
+        self._url = url
+        self._headers = {"Authorization": f"Bearer {token}"}
+
+    async def _cmd(self, *args):
+        try:
+            async with bot.session.post(
+                self._url,
+                json=list(args),
+                headers=self._headers,
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status != 200 or not isinstance(data, dict) or "error" in data:
+                    raise StoreError(f"Upstash replied {resp.status}: {str(data)[:200]}")
+                return data.get("result")
+        except StoreError:
+            raise
+        except Exception as exc:
+            raise StoreError(f"Upstash request failed: {exc!r}") from exc
+
+    async def incr(self, key: str, ttl: int) -> int:
+        count = int(await self._cmd("INCR", key))
+        if count == 1:  # first use -> start the expiry clock
+            await self._cmd("EXPIRE", key, ttl)
+        return count
+
+    async def decr(self, key: str) -> None:
+        await self._cmd("DECR", key)
+
+    async def set_nx(self, key: str, ttl: int) -> bool:
+        return (await self._cmd("SET", key, "1", "NX", "EX", ttl)) == "OK"
+
+    async def delete(self, key: str) -> None:
+        await self._cmd("DEL", key)
+
+    async def ttl(self, key: str) -> int:
+        remaining = await self._cmd("TTL", key)
+        return max(1, int(remaining)) if remaining is not None and int(remaining) > 0 else 0
+
+
+LIMIT_STORE = UpstashStore(UPSTASH_URL, UPSTASH_TOKEN) if (UPSTASH_URL and UPSTASH_TOKEN) else MemoryStore()
+
+
+# ---- claiming a use ----------------------------------------------------------
+class ThinkClaim:
+    """The result of trying to spend one think. `error` is None on success.
+    On success, call release() if the AI call then fails, to refund every
+    counter this claim touched."""
+
+    def __init__(self, tier: AskTier) -> None:
+        self.tier = tier
+        self.error: str | None = None
+        self.retry = 0            # seconds until trying again makes sense
+        self.user_used = 0        # how many of today's uses this person has spent
+        self._undo: list = []
+
+    async def release(self) -> None:
+        while self._undo:
+            undo = self._undo.pop()
+            try:
+                await undo()
+            except StoreError:
+                logger.warning("Couldn't roll back a think limit counter")
+
+
+async def _claim_think(tier: AskTier, user_id: int, message_id: int) -> ThinkClaim:
+    """Check every rule and, if all pass, reserve one use. Order matters: the
+    most informative refusal wins (daily limit before cooldown, etc.)."""
+    claim = ThinkClaim(tier)
+    day, secs_to_reset = _day_info()
+    user_key = f"think:{tier.key}:{user_id}:{day}"
+    global_key = f"thinkglobal:{tier.key}:{day}"
+    cooldown_key = f"thinkcd:{tier.key}:{user_id}"
+    message_key = f"thinkmsg:{tier.key}:{message_id}"
+
+    async def refuse(code: str, retry: int = 0) -> ThinkClaim:
+        claim.error, claim.retry = code, retry
+        await claim.release()
+        return claim
+
+    try:
+        used = await LIMIT_STORE.incr(user_key, secs_to_reset + 60)
+        claim._undo.append(lambda: LIMIT_STORE.decr(user_key))
+        if used > tier.user_daily:
+            return await refuse("user_limit", secs_to_reset)
+        claim.user_used = used
+
+        total = await LIMIT_STORE.incr(global_key, secs_to_reset + 60)
+        claim._undo.append(lambda: LIMIT_STORE.decr(global_key))
+        if total > tier.global_daily:
+            return await refuse("global_limit", secs_to_reset)
+
+        if not await LIMIT_STORE.set_nx(cooldown_key, tier.cooldown):
+            return await refuse("cooldown", await LIMIT_STORE.ttl(cooldown_key) or 1)
+        claim._undo.append(lambda: LIMIT_STORE.delete(cooldown_key))
+
+        # One press per answer per tier (the key outlives the button window).
+        if not await LIMIT_STORE.set_nx(message_key, THINK_BUTTON_WINDOW_SECONDS * 2):
+            return await refuse("used")
+        claim._undo.append(lambda: LIMIT_STORE.delete(message_key))
+    except StoreError:
+        logger.exception("Limit store failed while claiming a think")
+        claim.error = "store"
+        await claim.release()
+    return claim
+
+
 def _ask_channel_allowed(interaction: discord.Interaction) -> bool:
     """True if /ask may be used in this channel. Always True when
     ASK_CHANNEL_IDS is empty. A thread counts as allowed when the channel
@@ -2096,47 +2524,65 @@ def _ask_channel_allowed(interaction: discord.Interaction) -> bool:
     return parent_id is not None and parent_id in ASK_CHANNEL_IDS
 
 
-async def _ask_groq(question: str) -> tuple[str | None, str | None]:
-    """Returns (answer, error_reason). error_reason is one of
-    "rate_limited_minute", "rate_limited_day", "error", or None on success."""
+def _reasoning_params(model: str, effort: str) -> dict:
+    # Only OpenAI's gpt-oss models accept reasoning_effort; sending it to other
+    # models can make Groq reject the whole request with a 400.
+    return {"reasoning_effort": effort} if "gpt-oss" in model.lower() else {}
+
+
+_THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+async def _call_groq(
+    model: str,
+    system_prompt: str,
+    question: str,
+    *,
+    max_tokens: int,
+    effort: str,
+    timeout_s: int = 10,
+) -> tuple[str | None, str | None]:
+    """Ask one Groq model. Returns (answer, error_reason); error_reason is one
+    of "rate_limited_minute", "rate_limited_day", "model_unavailable",
+    "error", or None on success."""
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     payload = {
-        "model": GROQ_MODEL,
+        "model": model,
         "messages": [
-            {"role": "system", "content": MILO_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": question},
         ],
-        # gpt-oss models are "reasoning" models: their hidden thinking tokens
-        # count against this budget too. If it's too small, Groq returns a
-        # 200 with an EMPTY answer. So: low reasoning effort (keeps thinking
-        # short for simple chat) plus a budget with comfortable headroom.
-        "max_completion_tokens": 500,
-        "reasoning_effort": "low",
+        # Reasoning models spend hidden "thinking" tokens from this same budget;
+        # if it's too small Groq returns a 200 with an EMPTY answer.
+        "max_completion_tokens": max_tokens,
         "temperature": 0.8,
+        **_reasoning_params(model, effort),
     }
     try:
         async with bot.session.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers=headers,
             json=payload,
+            timeout=aiohttp.ClientTimeout(total=timeout_s),
         ) as resp:
             if resp.status != 200:
-                # Log Groq's own explanation -- a bare status code (like the
-                # old "returned status 404") hides the real reason, e.g. a
-                # retired model name or an exhausted daily limit.
+                # Log Groq's own explanation -- a bare status code hides the
+                # real reason (retired model, exhausted daily limit, ...).
                 try:
                     body = (await resp.text())[:300]
                 except Exception:
                     body = "<unreadable>"
-                logger.warning("Groq returned status %s: %s", resp.status, body)
+                logger.warning("Groq (%s) returned status %s: %s", model, resp.status, body)
                 if resp.status == 429:
                     if "per day" in body.lower():
                         return None, "rate_limited_day"
                     return None, "rate_limited_minute"
+                if resp.status == 404:
+                    return None, "model_unavailable"
                 return None, "error"
             data = await resp.json(content_type=None)
     except asyncio.TimeoutError:
-        logger.warning("Timed out waiting for Groq")
+        logger.warning("Timed out waiting for Groq (%s)", model)
         return None, "error"
     except Exception:
         logger.exception("Failed to reach Groq")
@@ -2149,16 +2595,27 @@ async def _ask_groq(question: str) -> tuple[str | None, str | None]:
         logger.warning("Unexpected Groq response shape: %r", data)
         return None, "error"
 
+    # Some models (e.g. Qwen) put their reasoning inline in <think>...</think>.
+    answer = _THINK_TAG_RE.sub("", answer)
+    if "<think>" in answer.lower():  # unclosed -> the budget ran out mid-thought
+        answer = answer[: answer.lower().index("<think>")]
+    answer = answer.strip()
+
     if not answer:
-        # 200 OK but nothing to show -- almost always the reasoning budget
-        # ran out (finish_reason == "length").
         logger.warning(
-            "Groq returned empty content (finish_reason=%s, usage=%s)",
-            choice.get("finish_reason"), data.get("usage"),
+            "Groq (%s) returned no usable content (finish_reason=%s, usage=%s)",
+            model, choice.get("finish_reason"), data.get("usage"),
         )
         return None, "error"
 
     return answer, None
+
+
+async def _ask_groq(question: str) -> tuple[str | None, str | None]:
+    """The quick /ask answer, from the fast model (GROQ_MODEL)."""
+    return await _call_groq(
+        GROQ_MODEL, MILO_SYSTEM_PROMPT, question, max_tokens=500, effort="low"
+    )
 
 
 @bot.tree.command(name="ask", description="Ask Milo a quick question (AI-powered).")
@@ -2236,8 +2693,205 @@ async def ask_slash(interaction: discord.Interaction, question: app_commands.Ran
     embed = discord.Embed(color=discord.Color.blurple())
     embed.add_field(name="❓ You asked", value=question, inline=False)
     embed.add_field(name=f"{MILO_EMOJI} Milo says", value=answer, inline=False)
-    embed.set_footer(text="AI-generated -- Milo can get things wrong, so double-check anything important.")
-    await interaction.followup.send(embed=embed)
+    footer = "AI-generated -- Milo can get things wrong, so double-check anything important."
+    send_kwargs: dict = {}
+    view = _build_think_view(
+        interaction.user.id, int(time.time()), [t.key for t in THINK_TIERS]
+    )
+    if view is not None:
+        footer += " Want a deeper answer? Use a button below."
+        send_kwargs["view"] = view
+    embed.set_footer(text=footer)
+    await interaction.followup.send(embed=embed, **send_kwargs)
+
+
+def _build_think_view(asker_id: int, created_ts: int, tier_keys: list[str]) -> discord.ui.View | None:
+    """The buttons under an /ask answer. Everything the handler needs later
+    (which tier, who asked, when) rides inside each button's custom_id, so the
+    buttons keep working after a restart with no database."""
+    view = discord.ui.View(timeout=None)
+    for key in tier_keys:
+        tier = _TIER_BY_KEY.get(key)
+        if tier is None:
+            continue
+        view.add_item(
+            discord.ui.Button(
+                label=tier.label,
+                emoji=tier.emoji,
+                style=tier.style,
+                custom_id=f"{THINK_BUTTON_PREFIX}{tier.key}:{asker_id}:{created_ts}",
+            )
+        )
+    return view if view.children else None
+
+
+def _think_error_text(tier: AskTier, code: str, retry: int) -> str:
+    e, name = MILO_EMOJI, f"{tier.emoji} **{tier.label}**"
+    if code == "user_limit":
+        return (f"{e} You've used all {tier.user_daily} of your {name} tries for today. "
+                f"They come back in about {_format_wait(retry)}.")
+    if code == "global_limit":
+        return (f"{e} The whole server has used up today's {name} budget. "
+                f"It refills in about {_format_wait(retry)}. (Your own tries weren't used.)")
+    if code == "cooldown":
+        return f"{e} Easy there! Wait {_format_wait(retry)} before another {name}."
+    if code == "used":
+        return f"{e} This answer already got its {name}. Ask a new question with `/ask`!"
+    if code == "busy":
+        return f"{e} I'm already deep in thought about someone else's question -- try again in a few seconds."
+    if code == "rate_limited_minute":
+        return f"{e} Groq says too many requests at once. Try again in a minute -- this try wasn't used."
+    if code == "rate_limited_day":
+        return f"{e} My {name} brain hit Groq's daily cap. Try again later -- this try wasn't used."
+    if code == "model_unavailable":
+        return (f"{e} That model isn't available right now (Groq may have retired it). "
+                "This try wasn't used -- tell whoever runs Milo.")
+    if code == "store":
+        return (f"{e} My limit tracker is acting up, so {name} is paused for now. "
+                "Normal `/ask` still works!")
+    return f"{e} Mrrp... my brain napped before I could finish. This try wasn't used -- try again!"
+
+
+def _think_embed(tier: AskTier, question: str, answer: str, used: int) -> discord.Embed:
+    if len(answer) > 3900:
+        answer = answer[:3900].rstrip() + "…"
+    embed = discord.Embed(
+        title=f"{tier.emoji} {tier.label}", description=answer, color=discord.Color.blurple()
+    )
+    embed.add_field(name="❓ You asked", value=question[:1000], inline=False)
+    embed.set_footer(
+        text=f"{tier.model} · {used}/{tier.user_daily} used today · AI-generated, can be wrong"
+    )
+    return embed
+
+
+async def _remove_think_button(message: discord.Message, clicked_custom_id: str | None) -> None:
+    """Drop the pressed button (or all of them when clicked_custom_id is None),
+    keeping any other tier's button that's still available. Best effort."""
+    keep: list[str] = []
+    if clicked_custom_id is not None:
+        _, _, asker, ts = clicked_custom_id.split(":")
+        for row in getattr(message, "components", []) or []:
+            for child in getattr(row, "children", []) or []:
+                cid = getattr(child, "custom_id", None)
+                if cid and cid.startswith(THINK_BUTTON_PREFIX) and cid != clicked_custom_id:
+                    keep.append(cid.split(":")[1])
+        new_view = _build_think_view(int(asker), int(ts), keep)
+    else:
+        new_view = None
+    try:
+        await message.edit(view=new_view)
+    except discord.HTTPException:
+        pass
+
+
+async def _handle_think_click(interaction: discord.Interaction, custom_id: str) -> None:
+    async def say(text: str) -> None:
+        """A private (ephemeral) note -- works whether or not we've deferred."""
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+
+    if not is_allowed_guild(interaction.guild_id):
+        await say("This bot is not configured for this server.")
+        return
+
+    parts = custom_id.split(":")
+    if len(parts) != 4 or not parts[2].isdigit() or not parts[3].isdigit():
+        await say(f"{MILO_EMOJI} That button looks broken -- run `/ask` again.")
+        return
+    tier = _TIER_BY_KEY.get(parts[1])
+    if tier is None:
+        await say(f"{MILO_EMOJI} That thinking mode isn't turned on anymore -- run `/ask` again.")
+        return
+    asker_id, created = int(parts[2]), int(parts[3])
+    message = interaction.message
+
+    # Belt and braces: Discord itself records who ran the /ask this message
+    # answers. If that disagrees with the button, something is off.
+    meta_user = getattr(getattr(message, "interaction_metadata", None), "user", None)
+    if meta_user is not None and meta_user.id != asker_id:
+        await say(f"{MILO_EMOJI} Nice try -- that button doesn't match this answer.")
+        return
+
+    # 1) Only the person who asked.
+    if interaction.user.id != asker_id:
+        await say(f"{MILO_EMOJI} Only <@{asker_id}> can use this button -- run `/ask` yourself to get your own!")
+        return
+
+    # 2) Old answers are dead answers.
+    age = time.time() - created
+    if age > THINK_BUTTON_WINDOW_SECONDS or age < -60:
+        await say(
+            f"{MILO_EMOJI} This answer is too old -- these buttons only work for "
+            f"{THINK_BUTTON_WINDOW_SECONDS // 60} minutes. Ask again with `/ask`!"
+        )
+        await _remove_think_button(message, None)
+        return
+
+    # 3) The question, read back from the embed Milo posted (users can't edit it).
+    question = None
+    embeds = getattr(message, "embeds", None) or []
+    if embeds and embeds[0].fields and "You asked" in embeds[0].fields[0].name:
+        question = embeds[0].fields[0].value
+    if not question:
+        await say(f"{MILO_EMOJI} I can't read the original question anymore -- run `/ask` again.")
+        return
+
+    # 4) One think at a time per tier (keeps Groq's tokens-per-minute happy).
+    lock = _think_locks.setdefault(tier.key, asyncio.Lock())
+    if lock.locked():
+        await say(_think_error_text(tier, "busy", 0))
+        return
+
+    # Tell Discord we're working (the limit checks and the model both take a
+    # moment), privately, so any errors below are only shown to this person.
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    if lock.locked():  # someone else slipped in while we were deferring
+        await say(_think_error_text(tier, "busy", 0))
+        return
+
+    async with lock:
+        claim = await _claim_think(tier, asker_id, message.id)
+        if claim.error:
+            await say(_think_error_text(tier, claim.error, claim.retry))
+            return
+
+        answer, error = await _call_groq(
+            tier.model, MILO_THINK_PROMPT, question,
+            max_tokens=tier.max_tokens, effort=tier.effort, timeout_s=45,
+        )
+        if error or not answer:
+            await claim.release()  # a failed think costs nothing
+            await say(_think_error_text(tier, error or "error", 0))
+            return
+
+    logger.info("Think (%s) used by user %s (%d/%d today)", tier.key, asker_id, claim.user_used, tier.user_daily)
+    embed = _think_embed(tier, question, answer, claim.user_used)
+
+    posted = False
+    try:
+        await message.reply(embed=embed, mention_author=False)
+        posted = True
+    except discord.HTTPException:
+        try:
+            if interaction.channel is not None:
+                await interaction.channel.send(embed=embed)
+                posted = True
+        except discord.HTTPException:
+            pass
+
+    if posted:
+        try:
+            await interaction.delete_original_response()  # remove the private "thinking..." note
+        except discord.HTTPException:
+            pass
+    else:
+        # Couldn't post publicly -- at least don't lose a paid-for answer.
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    await _remove_think_button(message, custom_id)
 
 
 @bot.tree.command(name="help", description="Shows all Milo commands.")
@@ -2313,11 +2967,19 @@ async def help_slash(interaction: discord.Interaction):
         ),
         inline=False,
     )
-    embed.add_field(
-        name="🤖 Ask Milo",
-        value="`/ask question:<text>` — ask Milo anything (AI-powered, quick questions). Everyone shares one daily limit, so there's a short cooldown -- if Milo says he's out of brainpower, try again later!",
-        inline=False,
+    ask_help = (
+        "`/ask question:<text>` — ask Milo anything (AI-powered, quick questions). "
+        "Everyone shares one daily limit, so there's a short cooldown -- if Milo says "
+        "he's out of brainpower, try again later!"
     )
+    if THINK_TIERS:
+        ask_help += (
+            "\nUnder your answer: "
+            + " / ".join(f"{t.emoji} **{t.label}**" for t in THINK_TIERS)
+            + " re-ask the same question with a smarter model. Only you can press them, "
+            f"for {THINK_BUTTON_WINDOW_SECONDS // 60} minutes, with limited tries per day."
+        )
+    embed.add_field(name="🤖 Ask Milo", value=ask_help, inline=False)
     embed.add_field(
         name="🛠️ Utility",
         value=(
@@ -2604,6 +3266,8 @@ async def on_interaction(interaction: discord.Interaction):
             await _handle_join_interested_click(interaction, custom_id)
         elif custom_id.startswith(SELF_ROLE_BUTTON_PREFIX):
             await _handle_self_role_click(interaction, custom_id)
+        elif custom_id.startswith(THINK_BUTTON_PREFIX):
+            await _handle_think_click(interaction, custom_id)
         # else: not a button we recognize -- ignore silently.
 
     except Exception:

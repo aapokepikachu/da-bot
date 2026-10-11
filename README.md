@@ -233,7 +233,7 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | Command | Description |
 |---|---|
 | `/quote` | A random inspirational quote, via [zenquotes.io](https://zenquotes.io). |
-| `/weather location:<place>` | Current temperature & wind speed, via [Open-Meteo](https://open-meteo.com) (no API key needed). |
+| `/weather location:<place>` | Current temperature & wind speed. Add a country after a comma to be precise — `Bengaluru, India`. Tries [Open-Meteo](https://open-meteo.com) first, then [MET Norway](https://api.met.no) if Open-Meteo is rate-limiting Milo's shared IP; results are cached for 10 minutes. The footer says which one answered. |
 | `/translate text:<text> to:<lang>` | Translates text using a language code (`es`, `fr`, `hi`, ...). Tries Google Translate, then MyMemory, then LibreTranslate, in order, so one being rate-limited doesn't take the whole command down. |
 | `/joke` | A random dad joke, via [icanhazdadjoke.com](https://icanhazdadjoke.com). |
 | `/advice` | A random piece of life advice, via [api.adviceslip.com](https://api.adviceslip.com). |
@@ -244,7 +244,7 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 
 | Command | Description |
 |---|---|
-| `/ask question:<text>` | Ask Milo a quick question (up to 300 characters), answered by `openai/gpt-oss-20b` via [Groq](https://console.groq.com) in Milo's cat-themed voice. **Requires `GROQ_API_KEY`** (free signup, no credit card) — see Section 10. Quick answers, not deep reasoning. Can be limited to certain channels with `ASK_CHANNEL_IDS`, has a 15-second per-person cooldown, and shows an "AI can be wrong" footer. Milo knows his own birthday and, if asked, that he's male. |
+| `/ask question:<text>` | Ask Milo a quick question (up to 300 characters), answered by `openai/gpt-oss-20b` via [Groq](https://console.groq.com) in Milo's cat-themed voice. **Requires `GROQ_API_KEY`** (free, no credit card). Can be limited to certain channels (`ASK_CHANNEL_IDS`), has a 15-second per-person cooldown, and shows an "AI can be wrong" footer. Under each answer, optional **🧠 Think harder** / **🔮 Second opinion** buttons re-ask the question with a smarter model — only the asker can press them, for 10 minutes, with daily limits (see Section 14). Milo knows his own birthday and, if asked, that he's male. |
 
 ### Utility
 
@@ -273,6 +273,12 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `ALLOWED_GUILD_ID` | Recommended | Restricts the bot to one server and makes slash commands sync instantly. |
 | `MILO_EMOJI` | Optional | The server's `:Milo:` emoji code. Defaults to `<:Milo:1554818642804482078>`. |
 | `ASK_CHANNEL_IDS` | Optional | Channel ID(s) where `/ask` is allowed, comma-separated (e.g. `111111111111111111,222222222222222222`). Anywhere else, `/ask` politely points people to the allowed channel(s) and doesn't use any AI budget. Threads inside an allowed channel count as allowed. Blank = `/ask` works in every channel. To get an ID: Discord Settings → Advanced → Developer Mode on, then right-click the channel → Copy Channel ID. |
+| `GROQ_THINK_MODEL` | Optional | Turns on the 🧠 **Think harder** button using this Groq model. Recommended: `openai/gpt-oss-120b`. Same `GROQ_API_KEY` — no second key. Blank = no button. |
+| `GROQ_SECOND_MODEL` | Optional | Turns on the 🔮 **Second opinion** button using a different model. Recommended: `qwen/qwen3.8-27b` (a *preview* model — can be withdrawn at short notice). Blank = no button. |
+| `THINK_USER_DAILY` / `THINK_GLOBAL_DAILY` | Optional | Tries per person / for the whole server per day on 🧠. Defaults `3` / `40` (sized for ~10 people). |
+| `SECOND_USER_DAILY` / `SECOND_GLOBAL_DAILY` | Optional | Same, for 🔮. Defaults `2` / `25`. |
+| `LIMIT_RESET_TZ` | Optional | Timezone (IANA name) whose midnight resets the daily limits. Default `Asia/Kolkata`. |
+| `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | Optional | A free [Upstash](https://upstash.com) Redis database, so the daily limits survive restarts. Without them limits live in memory and **reset on every restart/redeploy**. The token is a secret — treat it like `DISCORD_TOKEN`. |
 | `GROQ_MODEL` | Optional | Which Groq model `/ask` uses. Defaults to `openai/gpt-oss-20b`. Groq retires models over time — if `/ask` suddenly starts failing with a 404 (`model_not_found` in the Render logs), set this to a current model from [console.groq.com/docs/models](https://console.groq.com/docs/models) instead of editing code. |
 | `GROQ_API_KEY` | Optional | Free key from [console.groq.com](https://console.groq.com), needed for `/ask`. Command is disabled with a clear message if blank. Groq is unrelated to xAI/Grok or SpaceX despite the similar-sounding name. |
 | `CAT_API_KEY` | Optional | Free key from [thecatapi.com/signup](https://thecatapi.com/signup), needed for `/catbreed`. Command is disabled with a clear message if blank. |
@@ -321,6 +327,10 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - [ ] `/react reaction:hug user:<someone>` posts a reaction gif (or falls back to text-only if the gif API is briefly down).
 - [ ] `/react` — typing a few letters in the `reaction` field (e.g. `cr`) shows matching suggestions (e.g. `cry`, `celebrate`); picking one and a user posts that reaction's gif.
 - [ ] `/quote`, `/weather location:London`, and `/translate text:Hello to:es` each return live results.
+- [ ] With `GROQ_THINK_MODEL` set, an `/ask` answer shows a 🧠 **Think harder** button. Pressing it as the asker posts a longer answer as a reply (footer shows the model and `1/3 used today`), and the button disappears from the original.
+- [ ] Someone **else** pressing the button gets a private "only <@asker> can use this" message. Pressing a button on an answer older than 10 minutes gets a private "too old" message. Pressing twice on the same answer gets "already got its…".
+- [ ] After your daily tries are spent, the button says so privately and tells you how long until it resets.
+- [ ] Redeploy Milo, then press a button on a *recent* answer: it still works (the buttons carry their own data). If you've set Upstash, your used-up daily tries are still used up; without Upstash they reset.
 - [ ] `/firstmessage` jump-links to the oldest message in the current channel.
 - [ ] `/color hex_code:ff6600` shows a swatch; an invalid code like `/color hex_code:zzz` gives a friendly error instead of crashing.
 - [ ] `/riddle` posts a question; clicking "Reveal Answer" shows the answer only to you (ephemeral).
@@ -337,7 +347,7 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - [ ] `/ping` shows all six readings, an average, and an uptime; nothing says `unavailable` on a healthy deploy (if one does, that specific path is the one having trouble).
 - [ ] If `/ask` ever fails, check the Render logs: a line like `Groq returned status 404: ...model_not_found...` now says exactly why.
 - [ ] With `CAT_API_KEY` set, `/catbreed` returns a random breed's name, temperament, origin, life span, and photo. Without it set, `/catbreed` gives a clear "needs an API key" message instead of a generic failure.
-- [ ] `/weather location:São Paulo` (a city with a space and an accent) resolves properly instead of timing out.
+- [ ] `/weather location:Sao Paulo` and `/weather location:Bengaluru, India` work; the title shows the full match (e.g. `Bengaluru, Karnataka, India`). If Open-Meteo is rate-limiting, the footer reads `Source: MET Norway` instead of failing. Asking the same place twice within 10 minutes is instant.
 - [ ] `/mock text:hello world` returns `HeLlO WoRlD`-style alternating case.
 - [ ] `/fortune`, `/compliment`, `/icebreaker`, `/tableflip`, `/unflip` each respond instantly (no network call, so no way for these to be slow or fail).
 - [ ] `/joke`, `/advice`, `/comic`, `/meme` each return live results.
@@ -358,10 +368,11 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - Custom `/join` messages are capped at 300 characters; Discord's own per-message limit is 2000.
 - `/catfact`, `/meow`, `/quote`, `/weather`, `/translate`, `/yesno`, and `/react` all call free, keyless public APIs (catfact.ninja, cataas.com, zenquotes.io, Open-Meteo, Google Translate's web endpoint, yesno.wtf, otakugifs.xyz). None of them need an API key or env var, but they're third-party services outside your control — if one is briefly down, slow, or rate-limits you, the command replies with a friendly fallback message instead of crashing (and the reaction commands still post as plain text without the gif).
 - **How `/ask`'s rate limit works.** `/ask` uses `openai/gpt-oss-20b` on Groq's free tier, which allows **30 requests/minute, 1,000 requests/day, 8,000 tokens/minute, and 200,000 tokens/day** — and you're held to whichever limit you hit *first*. These belong to your **Groq account, not to individual Discord users**: everyone on the server shares one pool. A "token" is roughly a small piece of a word, and every question spends some on Milo's personality prompt (~170), your question, the model's brief hidden "thinking", and the answer — roughly 350–550 in total. That means the **token limits bite long before the request limits do**: expect about **400–550 questions a day** (not 1,000) and about **10–15 a minute** across the whole server. (These are estimates, not guarantees.) When a limit is hit, Groq replies 429 and `/ask` answers with a friendly in-character message instead of crashing, telling a per-minute limit ("give me a minute") apart from a daily one ("I've used up my brainpower for today"). To protect the shared pool, `/ask` also has a 15-second per-person cooldown (a failed question doesn't count against it) and can be restricted to specific channels with `ASK_CHANNEL_IDS`. Groq's free-tier numbers change over time — see console.groq.com/docs/rate-limits.
-- **Why `/ask` uses `GROQ_MODEL` instead of a hard-coded name.** The first version of `/ask` used `llama-3.1-8b-instant`, which Groq shut down on August 16, 2026 — every request then failed with a 404. The model name is now an overridable env var (default `openai/gpt-oss-20b`) so the next retirement is a one-line change in Render, not a code fix. `gpt-oss` models are *reasoning* models whose hidden thinking tokens count against the response budget, so `/ask` requests low reasoning effort and a 500-token budget; if the budget ever runs out, Groq returns an empty answer, which `/ask` detects and logs (`finish_reason=length`) rather than posting a blank embed.
+- **Why `/ask` uses `GROQ_MODEL` instead of a hard-coded name.** The first version of `/ask` used `llama-3.1-8b-instant`, which Groq shut down for regular accounts on August 16, 2026 (its model page now lists it as Enterprise-only) — every request then failed with a 404. The model name is now an overridable env var (default `openai/gpt-oss-20b`) so the next retirement is a one-line change in Render, not a code fix. `gpt-oss` models are *reasoning* models whose hidden thinking tokens count against the response budget, so `/ask` requests low reasoning effort and a 500-token budget; if the budget ever runs out, Groq returns an empty answer, which `/ask` detects and logs (`finish_reason=length`) rather than posting a blank embed.
 - `/ask` caps each question at 300 characters and each answer at roughly 300 tokens (and hard-truncates anything over 1000 characters) so one reply can never exceed Discord's embed field limits. It has no memory — every question is answered independently, with no conversation history carried over.
 - `/catbreed` is the one exception that **does** need a key: TheCatAPI started requiring `x-api-key` on its breeds endpoint in late September 2026 (previously it worked unauthenticated). A free account at thecatapi.com/signup gives you one. If TheCatAPI changes its policy again in the future, this is the place in `bot.py` to look (`CAT_API_KEY` and the `catbreed_slash` function).
 - Every `_fetch_json` call (used by every API-backed command) automatically retries once on a timeout before giving up, since free public APIs occasionally drop a single request without actually being down. Other failures (404, 429, connection refused) fail immediately without retrying.
+- **Why `/weather` sometimes said "can't get" (HTTP 429).** Open-Meteo's free API limits by *IP address*, and on shared hosting like Render every app on the same IP shares one quota — so it can answer 429 ("too many requests") even though neither Milo nor Open-Meteo is broken. The same root cause as `/translate`'s old failures. Milo now falls back to MET Norway (Norway's national weather service; free, no key, asks clients to identify themselves — Milo's User-Agent includes your Discord profile link) and caches each place for 10 minutes. Geocoding (turning "Bengaluru" into coordinates) also goes through Open-Meteo and is cached for 24 hours; if *that* is rate-limited Milo says the map service is busy rather than pretending the place doesn't exist. Typos matter: `Banglore` fuzzy-matched somewhere in Pakistan once — use `Bengaluru`.
 - `/weather` properly percent-encodes its input (via aiohttp's `params`) before building the request URL. An earlier version inserted raw user text directly into the URL string, so a city name with a space or accented letter could hang the request instead of cleanly failing.
 - `/react` covers every otakugifs.xyz category via autocomplete in one command rather than a dedicated slash command per reaction — Discord caps a fixed dropdown at 25 choices, and there are nearly 70 categories, so this was simpler to maintain than keeping separate `/hug`, `/slap`, `/pat`, `/fistbump`, `/nudge` commands around too.
 - `/define` was removed entirely: it depended on dictionaryapi.dev, which had a confirmed, chronic multi-week outage pattern (independently verified via third-party uptime monitoring) rather than an occasional blip. No reliable free, keyless alternative was found — every "no signup" option that turned up was either the same broken service under a different URL, or an unverified hobby project. A paid-free-tier option like Wordnik (free account, no card) would fix this properly if you want dictionary lookups back someday.
@@ -396,3 +407,65 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - **Milo can be wrong.** He's an AI with a cat's personality — double-check anything important.
 
 **If Milo ever says "my brain's napping":** the AI service had a hiccup. Just try again in a bit.
+
+---
+
+## 14. The thinking buttons (🧠 Think harder / 🔮 Second opinion)
+
+Under a normal `/ask` answer, optional buttons re-ask **the same question** with a smarter model. They're switched on by environment variables — **the same `GROQ_API_KEY` works for every model**, you only name the extra models.
+
+### Which Groq models are free right now
+
+Checked against Groq's docs (October 2026). Every free chat model gets the same allowance, and **each model has its own separate allowance** — using one never uses up another's:
+
+| Model | Role in Milo | Free allowance (per model) |
+|---|---|---|
+| `openai/gpt-oss-20b` | **Fast** — plain `/ask` (`GROQ_MODEL`) | 30 requests/min · 1,000/day · 8,000 tokens/min · 200,000 tokens/day |
+| `openai/gpt-oss-120b` | **Smart** — 🧠 (`GROQ_THINK_MODEL`) | same |
+| `qwen/qwen3.8-27b` *(preview)* | **Second opinion** — 🔮 (`GROQ_SECOND_MODEL`) | same |
+
+Not usable on a free account: `llama-3.3-70b-versatile`, `llama-3.1-8b-instant` and `minimaxai/minimax-m2.7` are listed as Enterprise-only; `openai/gpt-oss-safeguard-20b`, the Prompt Guard models, Whisper and Orpheus are safety/audio/speech models, not chat models. Groq's docs say the exact numbers for *your* account are on [console.groq.com/settings/limits](https://console.groq.com/settings/limits) — check there if anything looks off. Qwen3.8-27B isn't necessarily "smarter" than the 120B, which is why its button says *Second opinion*.
+
+### Default limits, sized for ~10 people
+
+A think uses roughly 2,000–3,500 tokens (hidden reasoning + the answer), against 200,000 tokens/day per model.
+
+| Button | Per person / day | Whole server / day | Cooldown | Worst-case daily token use |
+|---|---|---|---|---|
+| 🧠 Think harder | 3 | 40 | 60 s | 10 people × 3 = 30 thinks ≈ 60–105K (of 200K) |
+| 🔮 Second opinion | 2 | 25 | 60 s | 10 people × 2 = 20 thinks ≈ 40–70K (of 200K) |
+
+The server-wide cap is a safety net, not the normal limit: with 10 people it only matters if they all max out *and* the server grows. If it grows, raise `THINK_GLOBAL_DAILY`, but keep (cap × ~3,500) under 200,000. Only **one think runs at a time per button**, which also keeps Groq's 8,000-tokens-per-minute cap from being tripped.
+
+### Why people can't skip the limits
+
+| Attempt | What happens |
+|---|---|
+| Someone else presses your button | Private "only @you can use this" message. Nothing is counted. |
+| Pressing a button on an old answer | Buttons last **10 minutes**; after that: private "too old" message, and the buttons are removed. The timestamp rides inside the button itself, so it also works across restarts. |
+| Pressing twice on the same answer | "Already got its…" — one press per answer per button. |
+| Running `/ask` over and over to get more buttons | Limits are per **person per day**, not per answer. A new answer doesn't add tries. |
+| Spamming the button | 60-second cooldown, and one think at a time. |
+| A button edited/forged to claim someone else's answer | Milo cross-checks it against Discord's own record of who ran the `/ask`. |
+| Using up everyone's budget | The server-wide daily cap stops it; everyone else keeps their own tries. |
+
+Every refusal has its own message (not yours / too old / already used / your daily limit with a countdown / server limit / cooldown / Milo busy / Groq's per-minute limit / Groq's daily limit / model unavailable / limit tracker down). **A think that fails for any reason is refunded** — errors never cost a try.
+
+What these rules can't stop: a person using a second Discord account. That's what the server-wide cap is for.
+
+### Making the daily limit permanent (Upstash)
+
+By default the counters live in Milo's memory, so **a restart or redeploy hands everyone fresh tries** (Milo logs a warning about this at startup). For a limit that actually survives restarts:
+
+1. Make a free account at [upstash.com](https://upstash.com) and create a **Redis** database (free plan, pick the region nearest your Render region).
+2. On the database page, open the **REST API** section and copy the URL and token.
+3. In Render → Environment add `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`, then redeploy.
+4. The startup log should now say *"Think limits are stored in Upstash Redis (survive restarts)"*.
+
+Upstash's free plan is far more than this needs (a button press costs a handful of Redis commands). If Upstash is ever unreachable, the thinking buttons pause with a friendly message (they **fail closed** rather than letting everyone through) and normal `/ask` keeps working.
+
+> **Note:** the Upstash code follows Upstash's documented REST format and is tested against a simulated server, but it couldn't be tried against a real Upstash database when it was written — so watch the first startup log and try one button press after adding the variables.
+
+### `/ask` limits in plain English (for members)
+
+> There's a **fast brain** for normal questions, and two **deeper brains** behind the 🧠 and 🔮 buttons. Each brain has its own daily allowance that the whole server shares. You get a few deeper tries per day (they come back at midnight IST), only you can press the buttons on your answer, and they stop working after 10 minutes. If Milo says he's busy or out of brainpower, nothing is lost — try again later.
