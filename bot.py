@@ -31,6 +31,7 @@ import math
 import os
 import random
 import re
+import signal
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -369,8 +370,27 @@ class MiloClient(discord.Client):
                 )
         if not MANAGER_ROLE_ID and not MILO_ROLE_ID:
             logger.info("Neither MANAGER_ROLE_ID nor MILO_ROLE_ID set -- the hidden ?send command is disabled.")
+        if not MANAGER_ROLE_ID:
+            logger.info("MANAGER_ROLE_ID not set -- the hidden ?updateDB command is disabled.")
+        # Load points (or switch to memory-only with a loud warning) and start
+        # the background autosave. /slots, /points and /leaderboard stay
+        # politely unavailable until the load succeeds.
+        POINTS.start()
 
     async def close(self) -> None:
+        # Last chance to save: Render gives ~30 seconds after SIGTERM. The save
+        # needs the HTTP session, so it must happen BEFORE the session closes.
+        POINTS.stop()
+        try:
+            ok, people, detail = await asyncio.wait_for(POINTS.flush("shutdown"), timeout=20)
+            if ok and detail != "nothing unsaved":
+                logger.info("Shutdown save done: %d people's points saved.", people)
+            elif not ok and POINTS.store is not None and POINTS.ready:
+                logger.error("SHUTDOWN SAVE FAILED -- recent points may be lost: %s", detail)
+        except asyncio.TimeoutError:
+            logger.error("SHUTDOWN SAVE TIMED OUT -- recent points may be lost.")
+        except Exception:
+            logger.exception("Unexpected error during the shutdown save")
         if self.session is not None:
             await self.session.close()
         await super().close()
@@ -470,6 +490,7 @@ async def aboutme_slash(interaction: discord.Interaction):
         f"Here's what I get up to around here:\n"
         f"• 🏐 Rounding up players for game lobbies with `/join`\n"
         f"• 🎭 Letting you pick your own roles\n"
+        f"• 🎰 Handing out points in `/slots` (and keeping a leaderboard)\n"
         f"• 🐾 Saying hi, flipping coins, rolling dice, answering the magic 8-ball, and running polls\n"
         f"• 👋 Welcoming new members the moment they join\n\n"
         f"I run on pure vibes and whatever's happening right now — no database, no memory banks, "
@@ -1721,30 +1742,6 @@ async def riddle_slash(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=view)
 
 
-SLOT_SYMBOLS = ["🍒", "🍋", "🍉", "🍇", "⭐", "7️⃣"]
-
-
-@bot.tree.command(name="slots", description="Spin the emoji slot machine.")
-async def slots_slash(interaction: discord.Interaction):
-    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
-        await interaction.response.send_message(
-            "This bot is not configured for this server.", ephemeral=True
-        )
-        return
-
-    reels = [random.choice(SLOT_SYMBOLS) for _ in range(3)]
-    reels_text = " | ".join(reels)
-
-    if reels[0] == reels[1] == reels[2]:
-        result = f"🎉 JACKPOT! All three match! {MILO_EMOJI}"
-    elif reels[0] == reels[1] or reels[1] == reels[2] or reels[0] == reels[2]:
-        result = "✨ Almost! Two matched."
-    else:
-        result = "No match — try again!"
-
-    await interaction.response.send_message(f"🎰 [ {reels_text} ]\n{result}")
-
-
 # Matches any Discord markup token wrapped in angle brackets: custom emoji
 # (<:name:id> / <a:name:id>), user/role/channel mentions (<@id>, <@&id>,
 # <#id>), and timestamps (<t:...>). These need to pass through completely
@@ -2444,6 +2441,28 @@ class UpstashStore:
         remaining = await self._cmd("TTL", key)
         return max(1, int(remaining)) if remaining is not None and int(remaining) > 0 else 0
 
+    async def pipeline(self, commands: list[list]) -> list:
+        """Send several commands in ONE request. Upstash still bills each
+        command separately, but a save finishes in a single round trip -- which
+        matters when Render only gives us ~30 seconds at shutdown. Replies come
+        back in order, each either {"result": ...} or {"error": "..."}; the
+        commands run one after another and are NOT all-or-nothing."""
+        try:
+            async with bot.session.post(
+                f"{self._url}/pipeline",
+                json=commands,
+                headers=self._headers,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status != 200 or not isinstance(data, list) or len(data) != len(commands):
+                    raise StoreError(f"Upstash pipeline replied {resp.status}: {str(data)[:200]}")
+                return data
+        except StoreError:
+            raise
+        except Exception as exc:
+            raise StoreError(f"Upstash pipeline failed: {exc!r}") from exc
+
 
 LIMIT_STORE = UpstashStore(UPSTASH_URL, UPSTASH_TOKEN) if (UPSTASH_URL and UPSTASH_TOKEN) else MemoryStore()
 
@@ -2512,16 +2531,569 @@ async def _claim_think(tier: AskTier, user_id: int, message_id: int) -> ThinkCla
     return claim
 
 
-def _ask_channel_allowed(interaction: discord.Interaction) -> bool:
-    """True if /ask may be used in this channel. Always True when
-    ASK_CHANNEL_IDS is empty. A thread counts as allowed when the channel
-    it lives in is allowed."""
-    if not ASK_CHANNEL_IDS:
+# ---------------------------------------------------------------------------
+# Points economy: /slots, /points, /leaderboard, and the hidden ?updateDB
+#
+# HOW SAVING WORKS ("memory first, saved in the background")
+#   * Everything people do (spins, points, rank) is read and changed in Milo's
+#     memory, so commands are instant and cost ZERO Upstash commands -- spam
+#     can't touch the database budget.
+#   * Changes are saved to Upstash as DELTAS ("+40 since last save"), never as
+#     totals ("balance = 140"). Deltas can't overwrite someone's points with a
+#     stale number -- important because Render runs the old and new Milo side
+#     by side for ~60 seconds during a deploy.
+#   * Saves happen: every POINTS_SAVE_MINUTES (default 5), when Render shuts
+#     Milo down (SIGTERM, ~30 s grace), and on demand with ?updateDB.
+#   * On startup Milo LOADS everyone's points before /slots works. If loading
+#     fails, points switch off with a friendly message (they never start from
+#     zero and then overwrite the real data), and loading retries every minute.
+#   * Daily counters reset at midnight in LIMIT_RESET_TZ (default IST).
+#   * Things that are fine to lose stay memory-only: the pity counter and the
+#     spin cooldown.
+# ---------------------------------------------------------------------------
+def _parse_id_set(env_name: str) -> set[int]:
+    ids: set[int] = set()
+    for tok in re.split(r"[,\s]+", os.getenv(env_name, "").strip()):
+        if not tok:
+            continue
+        if tok.isdigit():
+            ids.add(int(tok))
+        else:
+            logger.warning("Ignoring invalid %s entry: %r", env_name, tok)
+    return ids
+
+
+# Channels where /slots works (blank = anywhere). Keeps spins out of #general.
+SLOTS_CHANNEL_IDS: set[int] = _parse_id_set("SLOTS_CHANNEL_IDS")
+SLOTS_FREE_SPINS = _env_int("SLOTS_FREE_SPINS", 25)    # free spins per person per day
+SLOTS_PAID_SPINS = _env_int("SLOTS_PAID_SPINS", 10)    # extra spins bought with points, per day
+SLOTS_SPIN_COST = _env_int("SLOTS_SPIN_COST", 5)       # points per extra spin
+SLOTS_COOLDOWN_SECONDS = 5                             # between one person's spins
+SLOTS_PITY_AT = 20                                     # the 20th spin without a win always wins (0 = off)
+LEADERBOARD_MIN_POINTS = _env_int("LEADERBOARD_MIN_POINTS", 1000)
+POINTS_SAVE_SECONDS = _env_int("POINTS_SAVE_MINUTES", 5) * 60
+POINTS_RESYNC_DELAY = 120   # one re-load after startup, once Render's old/new overlap is over
+_PIPELINE_CHUNK = 200
+
+# Pays only when all three reels match. Each triple is a 1-in-216 chance.
+SLOT_PAYOUTS = {"7️⃣": 100, "⭐": 50, "🍇": 25, "🍉": 15, "🍋": 10, "🍒": 5}
+SLOT_SYMBOLS = list(SLOT_PAYOUTS)
+SLOT_PITY_SYMBOLS = ["🍒", "🍋"]   # pity only ever pays the LOW tier, so jackpots stay rare
+
+POINTS_KEY_BALANCE = "milo:points:balance"   # HASH  user id -> current balance
+POINTS_KEY_EARNED = "milo:points:earned"     # ZSET  user id -> lifetime points earned (the leaderboard)
+POINTS_KEY_DAY = "milo:points:day:"          # + YYYY-MM-DD, HASH "<id>:f"/"<id>:p" -> spins used that day
+
+_POINTS_UNAVAILABLE = (
+    f"{MILO_EMOJI} My points book isn't open right now (I'm having trouble reaching "
+    "my storage). Give me a minute and try again!"
+)
+
+
+def _to_int(value) -> int:
+    return int(float(value))
+
+
+def _flat_pairs(result) -> list[tuple[str, object]]:
+    """Redis replies for hashes/sorted sets arrive as a flat [k, v, k, v...]
+    list (or, in some modes, pairs or a dict). Normalise to (key, value)."""
+    if not result:
+        return []
+    if isinstance(result, dict):
+        return [(str(k), v) for k, v in result.items()]
+    if isinstance(result, list):
+        if isinstance(result[0], (list, tuple)):
+            return [(str(p[0]), p[1]) for p in result]
+        return [(str(result[i]), result[i + 1]) for i in range(0, len(result) - 1, 2)]
+    return []
+
+
+class PointsManager:
+    def __init__(self) -> None:
+        self.ready = False
+        self.balance: dict[int, int] = {}
+        self.earned: dict[int, int] = {}
+        self.spins: dict[tuple[str, int], list[int]] = {}      # (day, user) -> [free used, bonus used]
+        # Changes made since the last successful save (what gets sent to Upstash):
+        self._p_bal: dict[int, int] = {}
+        self._p_earn: dict[int, int] = {}
+        self._p_spins: dict[tuple[str, int], list[int]] = {}
+        self._expire_sent: set[str] = set()
+        # Memory-only, fine to lose:
+        self.pity: dict[int, int] = {}
+        self.last_spin: dict[int, float] = {}
+        self._io_lock = asyncio.Lock()
+        self._task: asyncio.Task | None = None
+        self.last_saved: float | None = None
+        self.last_error: str | None = None
+
+    @property
+    def store(self) -> "UpstashStore | None":
+        return LIMIT_STORE if isinstance(LIMIT_STORE, UpstashStore) else None
+
+    # ---- reading / changing (instant, no database calls) --------------------
+    def used(self, uid: int, day: str | None = None) -> tuple[int, int]:
+        free, bonus = self.spins.get((day or _day_info()[0], uid), (0, 0))
+        return free, bonus
+
+    def points(self, uid: int) -> int:
+        return self.balance.get(uid, 0)
+
+    def total_earned(self, uid: int) -> int:
+        return self.earned.get(uid, 0)
+
+    def record_spin(self, uid: int, *, paid: bool, cost: int, payout: int, day: str | None = None) -> None:
+        key = (day or _day_info()[0], uid)
+        idx = 1 if paid else 0
+        self.spins.setdefault(key, [0, 0])[idx] += 1
+        self._p_spins.setdefault(key, [0, 0])[idx] += 1
+        delta = payout - (cost if paid else 0)
+        if delta:
+            self.balance[uid] = self.balance.get(uid, 0) + delta
+            self._p_bal[uid] = self._p_bal.get(uid, 0) + delta
+        if payout:
+            self.earned[uid] = self.earned.get(uid, 0) + payout
+            self._p_earn[uid] = self._p_earn.get(uid, 0) + payout
+
+    # ---- leaderboard ----------------------------------------------------------
+    def qualified(self) -> list[tuple[int, int]]:
+        board = [(u, e) for u, e in self.earned.items() if e >= LEADERBOARD_MIN_POINTS]
+        return sorted(board, key=lambda t: (-t[1], t[0]))
+
+    def rank_of(self, uid: int) -> int | None:
+        for i, (u, _) in enumerate(self.qualified(), 1):
+            if u == uid:
+                return i
+        return None
+
+    def closest(self, n: int = 3) -> list[tuple[int, int]]:
+        near = [(u, e) for u, e in self.earned.items() if 0 < e < LEADERBOARD_MIN_POINTS]
+        return sorted(near, key=lambda t: (-t[1], t[0]))[:n]
+
+    # ---- saving ------------------------------------------------------------------
+    def unsaved_users(self) -> set[int]:
+        users = {u for u, d in self._p_bal.items() if d} | {u for u, d in self._p_earn.items() if d}
+        users |= {u for (_, u), c in self._p_spins.items() if any(c)}
+        return users
+
+    def _build_flush(self) -> tuple[list[list], list[tuple]]:
+        cmds: list[list] = []
+        meta: list[tuple] = []
+        for uid, d in self._p_bal.items():
+            if d:
+                cmds.append(["HINCRBY", POINTS_KEY_BALANCE, str(uid), d])
+                meta.append(("bal", uid, d))
+        for uid, d in self._p_earn.items():
+            if d:
+                cmds.append(["ZINCRBY", POINTS_KEY_EARNED, d, str(uid)])
+                meta.append(("earn", uid, d))
+        expire_queued: set[str] = set()
+        for (day, uid), (free, bonus) in self._p_spins.items():
+            key = POINTS_KEY_DAY + day
+            if free:
+                cmds.append(["HINCRBY", key, f"{uid}:f", free])
+                meta.append(("free", (day, uid), free))
+            if bonus:
+                cmds.append(["HINCRBY", key, f"{uid}:p", bonus])
+                meta.append(("paid", (day, uid), bonus))
+            if (free or bonus) and day not in self._expire_sent and day not in expire_queued:
+                cmds.append(["EXPIRE", key, 172800])   # day hashes tidy themselves up after 2 days
+                meta.append(("expire", day, 0))
+                expire_queued.add(day)
+        return cmds, meta
+
+    def _apply_saved(self, kind: str, ref, delta: int, result) -> None:
+        """A change reached the database: stop counting it as unsaved, and
+        re-base the live number on the database's own total (which also
+        quietly picks up anything another Milo instance saved meanwhile)."""
+        if kind in ("bal", "earn"):
+            pending = self._p_bal if kind == "bal" else self._p_earn
+            live = self.balance if kind == "bal" else self.earned
+            left = pending.get(ref, 0) - delta
+            if left:
+                pending[ref] = left
+            else:
+                pending.pop(ref, None)
+            live[ref] = _to_int(result) + left
+        elif kind in ("free", "paid"):
+            idx = 0 if kind == "free" else 1
+            pend = self._p_spins.get(ref)
+            left = 0
+            if pend is not None:
+                pend[idx] -= delta
+                left = pend[idx]
+                if not any(pend):
+                    del self._p_spins[ref]
+            self.spins.setdefault(ref, [0, 0])[idx] = _to_int(result) + left
+        elif kind == "expire":
+            self._expire_sent.add(ref)
+
+    def _prune_days(self) -> None:
+        yesterday = _day_info(datetime.now(_LIMIT_TZ) - timedelta(days=1))[0]
+        for key in [k for k in self.spins if k[0] < yesterday and k not in self._p_spins]:
+            del self.spins[key]
+
+    async def flush(self, reason: str) -> tuple[bool, int, str]:
+        """Save every unsaved change. Returns (ok, people_saved, detail)."""
+        store = self.store
+        if store is None:
+            return False, 0, "no Upstash database is configured"
+        if not self.ready:
+            return False, 0, "points haven't been loaded from the database yet"
+        async with self._io_lock:
+            cmds, meta = self._build_flush()
+            if not cmds:
+                return True, 0, "nothing unsaved"
+            saved: set[int] = set()
+            failures = 0
+            for start in range(0, len(cmds), _PIPELINE_CHUNK):
+                chunk = cmds[start:start + _PIPELINE_CHUNK]
+                try:
+                    results = await store.pipeline(chunk)
+                except StoreError as exc:
+                    self.last_error = str(exc)
+                    logger.warning("Points save (%s) failed, will retry: %s", reason, exc)
+                    return False, len(saved), f"couldn't reach the database ({exc})"
+                for item, (kind, ref, delta) in zip(results, meta[start:start + _PIPELINE_CHUNK]):
+                    if not isinstance(item, dict) or "error" in item:
+                        failures += 1
+                        continue
+                    self._apply_saved(kind, ref, delta, item.get("result"))
+                    if kind in ("bal", "earn"):
+                        saved.add(ref)
+                    elif kind in ("free", "paid"):
+                        saved.add(ref[1])
+            self._prune_days()
+            if failures:
+                self.last_error = f"{failures} change(s) rejected"
+                logger.warning("Points save (%s): %d change(s) were rejected", reason, failures)
+                return False, len(saved), f"{failures} change(s) were rejected by the database"
+            self.last_saved, self.last_error = time.time(), None
+            logger.info("Points saved (%s): %d change(s) for %d people", reason, len(cmds), len(saved))
+            return True, len(saved), "ok"
+
+    async def hydrate(self) -> None:
+        """Load everyone's points from Upstash. Safe to run again later: it
+        MERGES (database total + our own unsaved changes) instead of replacing."""
+        store = self.store
+        if store is None:
+            return
+        async with self._io_lock:
+            day = _day_info()[0]
+            results = await store.pipeline([
+                ["HGETALL", POINTS_KEY_BALANCE],
+                ["ZRANGE", POINTS_KEY_EARNED, 0, -1, "WITHSCORES"],
+                ["HGETALL", POINTS_KEY_DAY + day],
+            ])
+            for item in results:
+                if not isinstance(item, dict) or "error" in item:
+                    raise StoreError(f"Upstash refused the load: {str(item)[:200]}")
+            bal = {int(k): _to_int(v) for k, v in _flat_pairs(results[0].get("result")) if k.isdigit()}
+            earn = {int(k): _to_int(v) for k, v in _flat_pairs(results[1].get("result")) if k.isdigit()}
+            counts: dict[tuple[int, int], int] = {}
+            for field, v in _flat_pairs(results[2].get("result")):
+                uid_s, _, kind = field.partition(":")
+                if uid_s.isdigit() and kind in ("f", "p"):
+                    counts[(int(uid_s), 0 if kind == "f" else 1)] = _to_int(v)
+            for uid in set(bal) | set(self._p_bal):
+                self.balance[uid] = bal.get(uid, 0) + self._p_bal.get(uid, 0)
+            for uid in set(earn) | set(self._p_earn):
+                self.earned[uid] = earn.get(uid, 0) + self._p_earn.get(uid, 0)
+            for uid in {u for (u, _) in counts} | {u for (d, u) in self._p_spins if d == day}:
+                live = self.spins.setdefault((day, uid), [0, 0])
+                pend = self._p_spins.get((day, uid), [0, 0])
+                for idx in (0, 1):
+                    live[idx] = counts.get((uid, idx), 0) + pend[idx]
+            self.ready = True
+            self.last_error = None
+
+    async def run(self) -> None:
+        """Background job: load (retrying), one re-sync after the deploy overlap,
+        then save changes every POINTS_SAVE_SECONDS."""
+        while not self.ready:
+            try:
+                await self.hydrate()
+                logger.info(
+                    "Points loaded from Upstash: %d people, %d on the leaderboard.",
+                    len(self.earned), len(self.qualified()),
+                )
+            except StoreError as exc:
+                self.last_error = str(exc)
+                logger.warning("Points not loaded yet (%s) -- retrying in 60s", exc)
+                await asyncio.sleep(60)
+        await asyncio.sleep(POINTS_RESYNC_DELAY)
+        try:
+            await self.hydrate()
+        except StoreError as exc:
+            logger.warning("Points re-sync skipped (%s)", exc)
+        while True:
+            await asyncio.sleep(POINTS_SAVE_SECONDS)
+            await self.flush("autosave")
+
+    def start(self) -> None:
+        if self.store is None:
+            self.ready = True
+            logger.warning(
+                "Points are kept in MEMORY ONLY (no Upstash configured) -- every restart "
+                "or redeploy wipes everyone's points. Set UPSTASH_REDIS_REST_URL and "
+                "UPSTASH_REDIS_REST_TOKEN to save them."
+            )
+            return
+        self._task = asyncio.create_task(self.run())
+        logger.info(
+            "Points will be loaded from Upstash and saved every %d min, on shutdown, and on ?updateDB.",
+            POINTS_SAVE_SECONDS // 60,
+        )
+
+    def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            self._task = None
+
+
+POINTS = PointsManager()
+
+
+# ---- the slot machine ------------------------------------------------------------
+def _roll_slots(since_win: int) -> tuple[list[str], int, bool]:
+    """One spin. `since_win` = spins since this person's last win. Returns
+    (reels, payout, pity_triggered)."""
+    if SLOTS_PITY_AT and since_win + 1 >= SLOTS_PITY_AT:
+        sym = random.choice(SLOT_PITY_SYMBOLS)
+        return [sym] * 3, SLOT_PAYOUTS[sym], True
+    reels = [random.choice(SLOT_SYMBOLS) for _ in range(3)]
+    won = reels[0] == reels[1] == reels[2]
+    return reels, (SLOT_PAYOUTS[reels[0]] if won else 0), False
+
+
+@bot.tree.command(name="slots", description="Spin the slot machine and win points.")
+async def slots_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    if not _channel_allowed(interaction, SLOTS_CHANNEL_IDS):
+        channels = ", ".join(f"<#{cid}>" for cid in sorted(SLOTS_CHANNEL_IDS))
+        await interaction.response.send_message(
+            f"🎰 You can only use `/slots` in {channels} -- hop over there and spin!",
+            ephemeral=True,
+        )
+        return
+
+    if not POINTS.ready:
+        await interaction.response.send_message(_POINTS_UNAVAILABLE, ephemeral=True)
+        return
+
+    uid = interaction.user.id
+    now = time.time()
+    last = POINTS.last_spin.get(uid)
+    if last is not None and now - last < SLOTS_COOLDOWN_SECONDS:
+        wait = max(1, round(SLOTS_COOLDOWN_SECONDS - (now - last)))
+        await interaction.response.send_message(
+            f"🎰 The reels are still spinning! Try again in {wait}s.", ephemeral=True
+        )
+        return
+
+    day, secs_to_reset = _day_info()
+    free_used, bonus_used = POINTS.used(uid, day)
+    if free_used < SLOTS_FREE_SPINS:
+        paid, cost = False, 0
+    elif bonus_used < SLOTS_PAID_SPINS:
+        balance = POINTS.points(uid)
+        if balance < SLOTS_SPIN_COST:
+            await interaction.response.send_message(
+                f"🎰 You've used all {SLOTS_FREE_SPINS} free spins today. A bonus spin costs "
+                f"{SLOTS_SPIN_COST} points and you have {balance}. Fresh free spins in "
+                f"{_format_wait(secs_to_reset)}!",
+                ephemeral=True,
+            )
+            return
+        paid, cost = True, SLOTS_SPIN_COST
+    else:
+        await interaction.response.send_message(
+            f"🎰 You've used all {SLOTS_FREE_SPINS} free spins and {SLOTS_PAID_SPINS} bonus spins "
+            f"for today. They come back in {_format_wait(secs_to_reset)}!",
+            ephemeral=True,
+        )
+        return
+
+    # Everything from here to the reply is instant memory work -- no awaits --
+    # so two quick spins can never both sneak under a limit.
+    POINTS.last_spin[uid] = now
+    since_win = POINTS.pity.get(uid, 0)
+    reels, payout, pity_hit = _roll_slots(since_win)
+    POINTS.pity[uid] = 0 if payout else since_win + 1
+    POINTS.record_spin(uid, paid=paid, cost=cost, payout=payout, day=day)
+
+    symbol = reels[0]
+    if payout and symbol == "7️⃣":
+        headline, color = f"💥 **JACKPOT!!!** Triple 7️⃣ — **+{payout} points!**", discord.Color.gold()
+    elif payout and symbol == "⭐":
+        headline, color = f"🌟 **Triple stars!** **+{payout} points!**", discord.Color.gold()
+    elif payout:
+        headline, color = f"🎉 **Triple {symbol}!** **+{payout} points!**", discord.Color.green()
+    elif len({*reels}) == 2:
+        headline, color = "✨ Almost! Two matched.", discord.Color.dark_grey()
+    else:
+        headline, color = "No match — spin again!", discord.Color.dark_grey()
+    if pity_hit:
+        headline += f"\n🍀 *Pity win! Milo felt bad after {SLOTS_PITY_AT - 1} misses.* {MILO_EMOJI}"
+
+    free_left = SLOTS_FREE_SPINS - POINTS.used(uid, day)[0]
+    bonus_left = SLOTS_PAID_SPINS - POINTS.used(uid, day)[1]
+    spin_line = f"💰 Bonus spin (−{cost} points)" if paid else "🆓 Free spin"
+    embed = discord.Embed(
+        title="🎰 Slots",
+        description=f"**[ {' | '.join(reels)} ]**\n{headline}\n{spin_line}",
+        color=color,
+    )
+    footer = (
+        f"Balance: {POINTS.points(uid):,} pts · Free spins left: {free_left}/{SLOTS_FREE_SPINS} "
+        f"· Bonus spins left: {bonus_left}/{SLOTS_PAID_SPINS}"
+    )
+    until_pity = SLOTS_PITY_AT - POINTS.pity.get(uid, 0)
+    if SLOTS_PITY_AT and not payout and until_pity <= 5:
+        footer += f" · 🍀 Win guaranteed within {until_pity} spin{'s' if until_pity != 1 else ''}"
+    embed.set_footer(text=footer)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="points", description="Check your Milo points, rank, and spins left.")
+@app_commands.describe(user="Whose points to check (defaults to you)")
+async def points_slash(interaction: discord.Interaction, user: discord.Member | None = None):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+    if not POINTS.ready:
+        await interaction.response.send_message(_POINTS_UNAVAILABLE, ephemeral=True)
+        return
+
+    target = user or interaction.user
+    uid = target.id
+    earned = POINTS.total_earned(uid)
+    rank = POINTS.rank_of(uid)
+    if rank is not None:
+        board_text = f"#{rank} on the leaderboard"
+    else:
+        board_text = (
+            f"Not on it yet — **{earned:,}/{LEADERBOARD_MIN_POINTS:,}** points earned. "
+            f"Earn {LEADERBOARD_MIN_POINTS - earned:,} more to get on the leaderboard!"
+        )
+
+    embed = discord.Embed(
+        title=f"{MILO_EMOJI} {target.display_name}'s points", color=discord.Color.blurple()
+    )
+    embed.add_field(name="💰 Balance", value=f"{POINTS.points(uid):,}")
+    embed.add_field(name="🏆 Total earned", value=f"{earned:,}")
+    embed.add_field(name="📊 Leaderboard", value=board_text, inline=False)
+    if target.id == interaction.user.id:
+        day, secs = _day_info()
+        free_used, bonus_used = POINTS.used(uid, day)
+        embed.add_field(
+            name="🎰 Spins today",
+            value=(
+                f"Free: **{SLOTS_FREE_SPINS - free_used}/{SLOTS_FREE_SPINS}** left · "
+                f"Bonus ({SLOTS_SPIN_COST} pts each): **{SLOTS_PAID_SPINS - bonus_used}/{SLOTS_PAID_SPINS}** left\n"
+                f"Resets in {_format_wait(secs)}."
+            ),
+            inline=False,
+        )
+    if POINTS.store is None:
+        embed.set_footer(text="⚠️ Points aren't being saved yet (no database is set up).")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="leaderboard", description="See the top 10 point earners.")
+async def leaderboard_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+    if not POINTS.ready:
+        await interaction.response.send_message(_POINTS_UNAVAILABLE, ephemeral=True)
+        return
+
+    board = POINTS.qualified()
+    embed = discord.Embed(title="🏆 Milo Leaderboard", color=discord.Color.gold())
+    if board:
+        medals = ["🥇", "🥈", "🥉"]
+        lines = [
+            f"{medals[i] if i < 3 else f'`#{i + 1}`'} <@{uid}> — **{earned:,}** pts"
+            for i, (uid, earned) in enumerate(board[:10])
+        ]
+        embed.description = "\n".join(lines)
+        embed.set_footer(
+            text=f"Ranked by total points earned · {len(board)} on the board · "
+                 f"earn {LEADERBOARD_MIN_POINTS:,} to join"
+        )
+    else:
+        near = POINTS.closest()
+        text = (
+            f"Nobody's on the board yet! **Earn your first {LEADERBOARD_MIN_POINTS:,} points "
+            f"to reach the leaderboard.** Win them in `/slots`! 🎰"
+        )
+        if near:
+            text += "\n\n**Closest so far:**\n" + "\n".join(
+                f"<@{uid}> — {earned:,}/{LEADERBOARD_MIN_POINTS:,}" for uid, earned in near
+            )
+        embed.description = text
+    await interaction.response.send_message(embed=embed)
+
+
+# ---- hidden Manager-only command: ?updateDB --------------------------------------
+async def _handle_updatedb_command(message: discord.Message) -> None:
+    if not MANAGER_ROLE_ID:
+        return
+    if message.guild is None or not isinstance(message.author, discord.Member):
+        return
+    if MANAGER_ROLE_ID not in {role.id for role in message.author.roles}:
+        return  # not authorised -- stay silent, like ?send / ?rolemenu
+
+    try:
+        await message.delete()
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        pass
+
+    if POINTS.store is None:
+        text = (
+            "⚠️ No Upstash database is configured, so points only exist in memory and "
+            "**WILL be lost on redeploy.** Set `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` first."
+        )
+    elif not POINTS.ready:
+        text = "❌ Points haven't been loaded from the database yet, so there's nothing safe to save. Try again in a minute."
+    else:
+        try:
+            ok, people, detail = await asyncio.wait_for(POINTS.flush("manual"), timeout=25)
+        except asyncio.TimeoutError:
+            ok, people, detail = False, 0, "the database took too long to answer"
+        if ok and detail == "nothing unsaved":
+            text = "✅ Everything was already saved — nothing new since the last save. **Safe to redeploy.**"
+        elif ok:
+            text = f"✅ Saved {people} {'person' if people == 1 else 'people'}'s points to Upstash. **Safe to redeploy.**"
+        else:
+            text = f"❌ **NOT saved:** {detail}. **Don't redeploy yet** — try `?updateDB` again in a minute."
+    await message.channel.send(text, delete_after=120)
+
+
+def _channel_allowed(interaction: discord.Interaction, allowed_ids: set[int]) -> bool:
+    """True if a command may be used in this channel. Always True when the
+    allow-list is empty. A thread counts as allowed when the channel it lives
+    in is allowed."""
+    if not allowed_ids:
         return True
-    if interaction.channel_id in ASK_CHANNEL_IDS:
+    if interaction.channel_id in allowed_ids:
         return True
     parent_id = getattr(interaction.channel, "parent_id", None)
-    return parent_id is not None and parent_id in ASK_CHANNEL_IDS
+    return parent_id is not None and parent_id in allowed_ids
+
+
+def _ask_channel_allowed(interaction: discord.Interaction) -> bool:
+    return _channel_allowed(interaction, ASK_CHANNEL_IDS)
 
 
 def _reasoning_params(model: str, effort: str) -> dict:
@@ -2934,11 +3506,22 @@ async def help_slash(interaction: discord.Interaction):
             "`/trivia` — answer a random trivia question (solo, private)\n"
             "`/grouptrivia` — everyone can answer; winners revealed after 60s\n"
             "`/riddle` — a riddle with the answer hidden behind a button\n"
-            "`/slots` — spin the emoji slot machine\n"
             "`/yesno` — a random yes/no answer with a reaction gif\n"
             "`/throw user` — throw something at someone (or nearby, if left blank)\n"
             "`/react reaction:<search> user` — react at someone (hug, slap, wave, cry, "
             "dance, punch, and ~65 more), type to search"
+        ),
+        inline=False,
+    )
+    payout_line = " · ".join(f"{sym} {pts}" for sym, pts in SLOT_PAYOUTS.items())
+    embed.add_field(
+        name="🎰 Slots & Points",
+        value=(
+            f"`/slots` — spin for points: **{SLOTS_FREE_SPINS} free spins a day**, then up to "
+            f"{SLOTS_PAID_SPINS} bonus spins at {SLOTS_SPIN_COST} points each\n"
+            f"Match all 3 to win: {payout_line}\n"
+            "`/points` — your balance, rank and spins left\n"
+            f"`/leaderboard` — the top 10 (earn {LEADERBOARD_MIN_POINTS:,} points to get on it)"
         ),
         inline=False,
     )
@@ -3137,6 +3720,10 @@ async def on_message(message: discord.Message):
 
     if message.content.strip().lower() == "?rolemenu":
         await _handle_rolemenu_command(message)
+        return
+
+    if message.content.strip().lower() == "?updatedb":
+        await _handle_updatedb_command(message)
         return
 
     if not AUTO_RESPONSES:
@@ -3349,9 +3936,29 @@ async def start_http_server() -> None:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+_background_tasks: set[asyncio.Task] = set()
+
+
 async def main() -> None:
     logger.info("Starting Milo...")
     await start_http_server()
+
+    # Render stops a service with SIGTERM and kills it ~30 seconds later. By
+    # default Python would just die on SIGTERM; instead, close() so unsaved
+    # points are written to Upstash first.
+    loop = asyncio.get_running_loop()
+
+    def _request_shutdown() -> None:
+        logger.info("Shutdown requested -- saving points, then closing.")
+        task = loop.create_task(bot.close())
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _request_shutdown)
+        except (NotImplementedError, RuntimeError):
+            pass  # e.g. Windows: Ctrl+C raises KeyboardInterrupt instead, which also closes cleanly
 
     logger.info("Connecting to Discord...")
     async with bot:

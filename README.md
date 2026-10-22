@@ -3,11 +3,12 @@
 A simple, single-server, **cat-themed** Discord bot built with **Python 3.12+** and **discord.py 2.x**.
 
 Features:
-- 41 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, party/social, AI, lookups, and utility — see Section 9 for the full list
+- 43 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, points & slots, party/social, AI, lookups, and utility — see Section 9 for the full list
+- A points economy: win points in `/slots` (25 free spins a day, then bonus spins for points), check them with `/points`, climb `/leaderboard` — kept in memory and saved to Upstash in the background (Section 15)
 - A persistent **✔️ Interested** button on `/join` messages — survives bot restarts, **no database required**
 - A cat-themed welcome message when new members join
 - Self-assign roles (button-based, no database), posted via the hidden `?rolemenu` command
-- Two hidden text commands — `?send` (Manager role **or** Milo role) and `?rolemenu` (Manager role only) — the **only** `?`-prefixed commands in the whole bot. Neither shows up in Discord's `/` picker and neither is listed in `/help`; they're documented here in the README only.
+- Three hidden text commands — `?send` (Manager role **or** Milo role), `?rolemenu` and `?updateDB` (both Manager role only) — the **only** `?`-prefixed commands in the whole bot. None shows up in Discord's `/` picker and none is listed in `/help`; they're documented here in the README only.
 - Several commands call free, keyless public APIs (cat facts/photos, quotes, dictionary, weather, translation, reaction gifs) — every call has a graceful fallback message if the API is briefly down or slow
 - Runs as a **Render Free Web Service** (Discord Gateway + a tiny HTTP health server in one process)
 - Secrets stay in environment variables, never in code
@@ -156,22 +157,23 @@ This works exactly like the Interested button — no database. Each role button'
 
 ---
 
-## 8. The hidden `?send` and `?rolemenu` commands
+## 8. The hidden `?send`, `?rolemenu` and `?updateDB` commands
 
-These are the **only two `?`-prefixed commands in the bot** — everything else is a slash command. Both are plain text commands (not slash commands), so neither ever appears in Discord's `/` picker, and neither is listed in `/help`. They have different access levels: `?send` works for the Manager role (`MANAGER_ROLE_ID`) **or** a second, more limited role (`MILO_ROLE_ID`, e.g. a role you name "Milo"), while `?rolemenu` is Manager-only.
+These are the **only three `?`-prefixed commands in the bot** — everything else is a slash command. All three are plain text commands (not slash commands), so neither ever appears in Discord's `/` picker, and neither is listed in `/help`. They have different access levels: `?send` works for the Manager role (`MANAGER_ROLE_ID`) **or** a second, more limited role (`MILO_ROLE_ID`, e.g. a role you name "Milo"), while `?rolemenu` is Manager-only.
 
 | Command | What it does |
 |---|---|
 | `?send <message>` | Posts `<message>` in the current channel, exactly as Milo, then deletes the original command message. Example: a Manager types `?send Server maintenance tonight at 9 PM!` in `#announcements`, and Milo deletes their message and posts it in its place. |
 | `?rolemenu` | Posts the self-assign roles embed + buttons in the current channel (see Section 7), then deletes the original command message. |
+| `?updateDB` | **Saves everyone's points to Upstash right now** and replies `✅ Saved N people's points… Safe to redeploy`, or `❌ NOT saved… Don't redeploy yet` if Upstash can't be reached. Run it before every redeploy (Section 15). Manager only. |
 
 If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_ID` isn't set, `?rolemenu` is completely disabled. If someone without a permitted role tries either one, nothing happens at all — no reply, no error.
 
-| Role | `?send` | `?rolemenu` |
-|---|---|---|
-| Manager (`MANAGER_ROLE_ID`) | ✅ | ✅ |
-| Milo (`MILO_ROLE_ID`) | ✅ | ❌ |
-| Everyone else | ❌ | ❌ |
+| Role | `?send` | `?rolemenu` | `?updateDB` |
+|---|---|---|---|
+| Manager (`MANAGER_ROLE_ID`) | ✅ | ✅ | ✅ |
+| Milo (`MILO_ROLE_ID`) | ✅ | ❌ | ❌ |
+| Everyone else | ❌ | ❌ | ❌ |
 
 ---
 
@@ -210,11 +212,18 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `/rps choice:rock` | Rock-paper-scissors against Milo, instant result. |
 | `/trivia` | A random trivia question with answer buttons (60s to answer, nothing persisted). |
 | `/riddle` | A random riddle; the answer is hidden behind a "Reveal Answer" button (ephemeral, only you see it). |
-| `/slots` | Spins a 3-reel emoji slot machine — jackpot on all 3 matching, a near-miss on 2. |
 | `/yesno` | A random yes/no answer with a reaction gif, via [yesno.wtf](https://yesno.wtf). |
 | `/react reaction:<search> user:<member>` | Any otakugifs.xyz reaction (hug, slap, pat, wave, handhold, cry, dance, punch, wink, and ~60 more) — start typing in the `reaction` field to search and pick one. |
 | `/throw user:<member>` | Throw a random absurdly-specific item at someone (or a random nearby person if left blank) — a Roomba fighting a cat, a Nokia 3310, a printer jam of biblical proportions, etc. Mirrors YAGPDB's own `/fun throw`: 5% chance of a triple throw, 10% chance of a double, otherwise a single. |
 | `/grouptrivia` | A live group round: everyone in the channel can answer the same question. What each person picked stays secret, but their name appears in a visibly growing "answered so far" list the moment they lock one in. After 60 seconds, the correct answer and everyone who got it right are revealed. No database — all state lives in memory for that 60-second window only. |
+
+### Slots & points
+
+| Command | Description |
+|---|---|
+| `/slots` | Spin a 3-reel slot machine for points. **25 free spins a day**, then up to **10 bonus spins at 5 points each**. Match all three to win: 7️⃣ 100 · ⭐ 50 · 🍇 25 · 🍉 15 · 🍋 10 · 🍒 5. 5-second cooldown. A pity rule guarantees a small win on the 20th spin without one. Can be limited to certain channels with `SLOTS_CHANNEL_IDS`. |
+| `/points user:<member>` | Your balance, total points earned, leaderboard rank (or progress toward it), and spins left today. Private to you. Add a member to peek at theirs (spins hidden). |
+| `/leaderboard` | The top 10 by **total points earned**. You need 1,000 earned (`LEADERBOARD_MIN_POINTS`) to appear; until anyone does, it shows who's closest. |
 
 ### Party & social
 
@@ -258,9 +267,10 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 
 | Command | Description |
 |---|---|
-| `/help` | Shows the full command list (minus the hidden `?send` and `?rolemenu`). |
+| `/help` | Shows the full command list (minus the hidden `?send`, `?rolemenu` and `?updateDB`). |
 | `?send <message>` | **Hidden.** Manager role or Milo role. Posts `<message>` as Milo. Not in `/help`, not a slash command. |
 | `?rolemenu` | **Hidden.** Manager-role-only. Posts the self-assign roles menu. Not in `/help`, not a slash command. |
+| `?updateDB` | **Hidden.** Manager-role-only. Saves all points to Upstash now and confirms. Not in `/help`, not a slash command. |
 
 ---
 
@@ -273,12 +283,16 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `ALLOWED_GUILD_ID` | Recommended | Restricts the bot to one server and makes slash commands sync instantly. |
 | `MILO_EMOJI` | Optional | The server's `:Milo:` emoji code. Defaults to `<:Milo:1554818642804482078>`. |
 | `ASK_CHANNEL_IDS` | Optional | Channel ID(s) where `/ask` is allowed, comma-separated (e.g. `111111111111111111,222222222222222222`). Anywhere else, `/ask` politely points people to the allowed channel(s) and doesn't use any AI budget. Threads inside an allowed channel count as allowed. Blank = `/ask` works in every channel. To get an ID: Discord Settings → Advanced → Developer Mode on, then right-click the channel → Copy Channel ID. |
+| `SLOTS_CHANNEL_IDS` | Optional | Channel ID(s) where `/slots` is allowed, comma-separated. Anywhere else `/slots` points people to the right channel and spends nothing. Threads inside an allowed channel count. Blank = every channel. |
+| `SLOTS_FREE_SPINS` / `SLOTS_PAID_SPINS` / `SLOTS_SPIN_COST` | Optional | Free spins per person per day (default `25`), bonus spins per day (`10`), and points per bonus spin (`5`). |
+| `LEADERBOARD_MIN_POINTS` | Optional | Total points a person must have *earned* to appear on `/leaderboard`. Default `1000`. |
+| `POINTS_SAVE_MINUTES` | Optional | How often changed points are saved to Upstash. Default `5`. |
 | `GROQ_THINK_MODEL` | Optional | Turns on the 🧠 **Think harder** button using this Groq model. Recommended: `openai/gpt-oss-120b`. Same `GROQ_API_KEY` — no second key. Blank = no button. |
 | `GROQ_SECOND_MODEL` | Optional | Turns on the 🔮 **Second opinion** button using a different model. Recommended: `qwen/qwen3.8-27b` (a *preview* model — can be withdrawn at short notice). Blank = no button. |
 | `THINK_USER_DAILY` / `THINK_GLOBAL_DAILY` | Optional | Tries per person / for the whole server per day on 🧠. Defaults `3` / `40` (sized for ~10 people). |
 | `SECOND_USER_DAILY` / `SECOND_GLOBAL_DAILY` | Optional | Same, for 🔮. Defaults `2` / `25`. |
 | `LIMIT_RESET_TZ` | Optional | Timezone (IANA name) whose midnight resets the daily limits. Default `Asia/Kolkata`. |
-| `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | Optional | A free [Upstash](https://upstash.com) Redis database, so the daily limits survive restarts. Without them limits live in memory and **reset on every restart/redeploy**. The token is a secret — treat it like `DISCORD_TOKEN`. |
+| `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | Recommended | A free [Upstash](https://upstash.com) Redis database. It stores **the points** and the 🧠/🔮 daily limits, so both survive restarts. Without it, points work but live in memory only and are **wiped on every restart/redeploy** (Milo logs a loud warning). The token is a secret — treat it like `DISCORD_TOKEN`. |
 | `GROQ_MODEL` | Optional | Which Groq model `/ask` uses. Defaults to `openai/gpt-oss-20b`. Groq retires models over time — if `/ask` suddenly starts failing with a 404 (`model_not_found` in the Render logs), set this to a current model from [console.groq.com/docs/models](https://console.groq.com/docs/models) instead of editing code. |
 | `GROQ_API_KEY` | Optional | Free key from [console.groq.com](https://console.groq.com), needed for `/ask`. Command is disabled with a clear message if blank. Groq is unrelated to xAI/Grok or SpaceX despite the similar-sounding name. |
 | `CAT_API_KEY` | Optional | Free key from [thecatapi.com/signup](https://thecatapi.com/signup), needed for `/catbreed`. Command is disabled with a clear message if blank. |
@@ -353,6 +367,12 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - [ ] `/joke`, `/advice`, `/comic`, `/meme` each return live results.
 - [ ] `/throw` and `/throw user:<someone>` both work; roughly 1 in 20 throws should be a "TRIPLE THROW", 1 in 10 a "DOUBLE THROW".
 - [ ] `/grouptrivia`: have 2+ people click different answer buttons. Confirm everyone who answered shows up by name in the embed, but nobody can see what anyone else picked. After 60 seconds, confirm the correct answer reveals and only the people who picked right get mentioned as winners.
+- [ ] `/slots` shows the reels, the result, your balance, and spins left. A win adds points; a loss doesn't take any (free spins are free). Spinning twice within 5 seconds gives a private "reels are still spinning".
+- [ ] After 25 free spins, the next `/slots` is a **bonus spin** that costs 5 points; with fewer than 5 points it explains why it can't. After 10 bonus spins it says you're done until midnight.
+- [ ] With `SLOTS_CHANNEL_IDS` set, `/slots` in another channel replies privately with the right channel and spends nothing.
+- [ ] `/points` shows balance, total earned, leaderboard progress, spins left. `/leaderboard` says nobody's on it until someone has earned 1,000.
+- [ ] `?updateDB` from a Manager replies `✅ Saved … Safe to redeploy`; from anyone else, nothing happens at all. Check Upstash's Data Browser: keys starting `milo:points:` should appear.
+- [ ] **Redeploy test:** win a few points, run `?updateDB`, redeploy, then `/points` — the same balance and spins-left come back. Render's log should say `Points loaded from Upstash: N people`.
 - [ ] Visiting `https://your-render-url.onrender.com/` shows `Milo is running.`
 
 ---
@@ -455,6 +475,8 @@ What these rules can't stop: a person using a second Discord account. That's wha
 
 ### Making the daily limit permanent (Upstash)
 
+> The same Upstash database also stores Milo's **points** (Section 15), so setting it up once covers both.
+
 By default the counters live in Milo's memory, so **a restart or redeploy hands everyone fresh tries** (Milo logs a warning about this at startup). For a limit that actually survives restarts:
 
 1. Make a free account at [upstash.com](https://upstash.com) and create a **Redis** database (free plan, pick the region nearest your Render region).
@@ -469,3 +491,82 @@ Upstash's free plan is far more than this needs (a button press costs a handful 
 ### `/ask` limits in plain English (for members)
 
 > There's a **fast brain** for normal questions, and two **deeper brains** behind the 🧠 and 🔮 buttons. Each brain has its own daily allowance that the whole server shares. You get a few deeper tries per day (they come back at midnight IST), only you can press the buttons on your answer, and they stop working after 10 minutes. If Milo says he's busy or out of brainpower, nothing is lost — try again later.
+
+---
+
+## 15. Points, `/slots`, and how saving works
+
+### The rules
+
+| | |
+|---|---|
+| Free spins | **25 per person per day** (`SLOTS_FREE_SPINS`) |
+| Bonus spins | up to **10 more per day**, **5 points** each (`SLOTS_PAID_SPINS`, `SLOTS_SPIN_COST`) — needs the points in your balance |
+| Cooldown | 5 seconds between your spins |
+| Wins (all 3 reels match; each is 1-in-216) | 7️⃣ **100** · ⭐ **50** · 🍇 **25** · 🍉 **15** · 🍋 **10** · 🍒 **5** |
+| Pity | the **20th** spin since your last win is a guaranteed 🍒 or 🍋 triple (low tier only, so jackpots stay rare). Memory only — resets on redeploy. |
+| Reset | midnight in `LIMIT_RESET_TZ` (default IST) |
+| Leaderboard | ranked by **total points earned** (spending never lowers it); you need `LEADERBOARD_MIN_POINTS` (default 1,000) to appear |
+
+Points are **virtual only** — they can't be bought or cashed out. Keep it that way: once real money or valuable prizes are involved, a slot machine becomes a gambling feature, which means legal and Discord-policy trouble.
+
+### The numbers (simulated with the real code)
+
+- **Free spins only:** about **30 points per person per day** (≈300 a day across 10 people). Thanks to pity, no day ends with zero wins (without pity, about half would).
+- **7️⃣7️⃣7️⃣** turns up roughly every 9 days at 25 spins a day (about every 6 days if you also use all 10 bonus spins).
+- **A bonus spin is a deliberate points sink:** it costs 5 and pays back about 1.2 on average (≈24%). At most 50 points per person per day (≈500 across 10 people) can be burned this way, and only if they have them. Rule of thumb: every spin returns about 1.2 points on average.
+- **The leaderboard takes a while:** at ~30 points a day, the first person reaches 1,000 earned in about **a month** (≈27 days if they also use bonus spins, since winnings count even when you spent points to get them). If you'd rather have a lively board from the start, set `LEADERBOARD_MIN_POINTS` to 300–500.
+
+### How saving works: memory first, saved in the background
+
+Everything — spins, balances, rank — is read and changed in Milo's **memory**, so commands are instant and cost **zero** Upstash commands. Spamming `/slots`, `/points` or `/leaderboard` cannot touch your database budget.
+
+Changed points are written to Upstash:
+
+1. **every 5 minutes** (`POINTS_SAVE_MINUTES`), only for people who changed,
+2. **when Render shuts Milo down** (it sends a stop signal, then waits ~30 seconds before killing it — a save takes about a second), and
+3. **on demand with `?updateDB`**.
+
+Two details make this safe:
+
+- **Deltas, not totals.** Milo saves "+40 since last save", never "balance = 140". Render runs the old and new Milo side by side for about a minute during a deploy; saving totals could let one overwrite the other with a stale number, but adding deltas can't.
+- **Load before opening.** On startup Milo loads everyone's points, today's spins used, and the leaderboard from Upstash *before* `/slots` works (until then it says "my points book isn't open" — it never starts everyone at zero and then overwrites the real data). If the load fails it retries every minute. It does one more re-sync about two minutes after boot, to catch anything the old copy saved during the overlap.
+
+| Thing | Where it lives |
+|---|---|
+| Balances, total earned, today's spins used | Memory, saved to Upstash (every 5 min / shutdown / `?updateDB`) |
+| 🧠/🔮 daily limits | Upstash immediately (strict limits shouldn't wait for a timer) |
+| Pity counter, 5-second cooldown | Memory only — fine to lose |
+| `/points` and `/leaderboard` | Computed from memory (0 Upstash commands) |
+
+### Redeploying safely
+
+1. Type **`?updateDB`** (Manager only).
+2. Wait for **`✅ … Safe to redeploy`**. If you get **`❌ NOT saved`**, don't redeploy — try again in a minute.
+3. Redeploy. Milo saves again on shutdown automatically, so even if you forget step 1 you only risk the last few minutes. After it boots, Render's log should say `Points loaded from Upstash: N people`.
+
+### Does it fit the free limits? (measured, 10 members)
+
+Measured by running the actual save and limit code through simulated days. Upstash's free plan allows **500,000 commands a month** (about 16,700 a day); reads and writes both count, and batching doesn't reduce the count.
+
+| Day type | Upstash commands/day | /month | Share of 500K |
+|---|---|---|---|
+| Normal — 2 play sessions each, ~35 spins, 2 think presses | 170 | 5,100 | 1.0% |
+| Busy — play spread over 12 time-slots, all 5 think presses each | 386 | 11,580 | 2.3% |
+| Extreme — every member spinning non-stop all day, all think presses | 564 | 16,920 | 3.4% |
+
+A successful 🧠/🔮 press costs about 4.4 commands. Each active member costs roughly 16 commands a day, so the free plan only runs out at around **1,000 daily-active members**. Render usage is unaffected: the save is a tiny background task in the same process, so it uses no extra instance hours.
+
+### What can still go wrong (honestly)
+
+- **A hard crash with no warning** loses at most the last save interval (default 5 minutes) of play. Render's normal redeploy/restart sends a stop signal first, which triggers a save.
+- **A save whose reply gets lost on the way back** may be retried and credited twice. Rare, and at most one save's worth.
+- **During a deploy**, both Milo copies answer for about a minute. Totals stay correct (deltas), but someone could squeeze in a couple of extra spins in that window.
+- **If Upstash is down:** spins keep working from memory and saves retry every 5 minutes. If it's still down when Milo *restarts*, points stay paused until it returns.
+- **No backups.** `?updateDB` is a save, not a backup, and the free plan shouldn't be assumed to keep backups.
+- **Alt accounts** can't be stopped — each account gets its own daily spins. The daily cap bounds it.
+- **Not tried against a real Upstash database** when written — the commands follow Upstash's documented REST format and were tested against a simulated server. After adding the variables, check the first startup log, run `?updateDB`, and look for `milo:points:*` keys in Upstash's Data Browser.
+
+### `/slots` in plain English (for members)
+
+> You get **25 free spins a day** (they reset at midnight IST). Match all three symbols to win points — 7️⃣ pays the most. After your free spins you can buy up to 10 bonus spins for 5 points each. If you go a long time without winning, Milo gives you a small guaranteed win. Check `/points` for your balance and `/leaderboard` for the top 10 — earn 1,000 points in total to get on it. Points are just for fun.
