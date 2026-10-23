@@ -376,6 +376,12 @@ class MiloClient(discord.Client):
         # the background autosave. /slots, /points and /leaderboard stay
         # politely unavailable until the load succeeds.
         POINTS.start()
+        if LOG_CHANNEL_ID:
+            task = asyncio.create_task(_log_startup_and_daily_snapshots())
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
+        else:
+            logger.info("LOG_CHANNEL_ID not set -- the manager log channel is disabled.")
 
     async def close(self) -> None:
         # Last chance to save: Render gives ~30 seconds after SIGTERM. The save
@@ -392,6 +398,10 @@ class MiloClient(discord.Client):
             logger.error("SHUTDOWN SAVE TIMED OUT -- recent points may be lost.")
         except Exception:
             logger.exception("Unexpected error during the shutdown save")
+        try:
+            await asyncio.wait_for(log_event("🔴 **Milo is shutting down** (redeploy or restart) — points were saved first."), timeout=4)
+        except Exception:
+            pass
         if self.session is not None:
             await self.session.close()
         await super().close()
@@ -2632,6 +2642,7 @@ class PointsManager:
         self._task: asyncio.Task | None = None
         self.last_saved: float | None = None
         self.last_error: str | None = None
+        self._save_fails = 0
 
     @property
     def store(self) -> "UpstashStore | None":
@@ -2660,6 +2671,12 @@ class PointsManager:
         if payout:
             self.earned[uid] = self.earned.get(uid, 0) + payout
             self._p_earn[uid] = self._p_earn.get(uid, 0) + payout
+
+    def adjust_balance(self, uid: int, delta: int) -> None:
+        """Manager change (?give / ?set / ?undo): balance only, never 'earned'."""
+        if delta:
+            self.balance[uid] = self.balance.get(uid, 0) + delta
+            self._p_bal[uid] = self._p_bal.get(uid, 0) + delta
 
     def apply_gamble(self, uid: int, delta: int) -> None:
         """Gamblin result: moves the balance only (never the all-time 'earned' board)."""
@@ -2847,7 +2864,19 @@ class PointsManager:
             await asyncio.sleep(POINTS_SAVE_SECONDS)
             if GAMBLIN is not None:
                 continue  # Gamblin is live: one batched save happens when it ends
-            await self.flush("autosave")
+            ok, _, detail = await self.flush("autosave")
+            if self.store is not None:
+                if ok:
+                    if self._save_fails >= 2:
+                        await log_event("✅ Saving to Upstash works again.")
+                    self._save_fails = 0
+                else:
+                    self._save_fails += 1
+                    if self._save_fails == 2:
+                        await log_event(
+                            f"⚠️ **Saving points to Upstash has failed twice in a row** ({detail}). "
+                            "Points are safe in memory — don't redeploy until this clears; try `?updateDB`."
+                        )
 
     def start(self) -> None:
         if self.store is None:
@@ -3189,6 +3218,7 @@ async def _handle_updatedb_command(message: discord.Message) -> None:
         else:
             text = f"❌ **NOT saved:** {detail}. **Don't redeploy yet** — try `?updateDB` again in a minute."
     await message.channel.send(text, delete_after=120)
+    await log_event(f"💾 `?updateDB` by <@{message.author.id}>: {text}")
 
 
 def _channel_allowed(interaction: discord.Interaction, allowed_ids: set[int]) -> bool:
@@ -4037,6 +4067,11 @@ class GamblinSession:
                 await self._edit(self.msg, view=None)
             if GAMBLIN is self:
                 GAMBLIN = None
+        if self.players:
+            lines = [f"<@{p.uid}> {p.net:+,}" for p in sorted(self.players.values(), key=lambda q: -q.net)]
+            await log_event(
+                f"🎰 Gamblin {'ended early' if self.aborted else 'finished'} — {len(self.players)} players:\n" + "\n".join(lines)
+            )
         if not self.shutting_down:
             ok, people, detail = await POINTS.flush("gamblin")
             if ok:
@@ -4471,6 +4506,7 @@ async def _handle_gamblin_command(message: discord.Message) -> None:
     _background_tasks.add(GAMBLIN.task)
     GAMBLIN.task.add_done_callback(_background_tasks.discard)
     await reply(f"🎰 Gamblin is starting in {channel.mention}!")
+    await log_event(f"🎰 Gamblin started by <@{message.author.id}> in {channel.mention}.")
 
 
 async def _gamblin_shutdown() -> None:
@@ -4484,6 +4520,301 @@ async def _gamblin_shutdown() -> None:
         await asyncio.wait_for(asyncio.shield(g.task), timeout=5)
     except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
         pass
+
+
+
+# ---------------------------------------------------------------------------
+# 🛠️ Manager toolbox -- hidden ?commands (Manager role only, silent to others)
+#
+#   ?give @user +300 pts     add points   (or -40 pts to take some away)
+#   ?set @user 500           set someone's balance to an exact number
+#   ?undo                    reverse the last ?give / ?set (this session)
+#   ?check @user             a person's balance, earned, rank, spins today
+#   ?balances                everyone's current points (shown here, then vanishes)
+#   ?resetspins @user        give someone their free + bonus spins back for today
+#   ?snapshot                post everyone's points to the log channel right now
+#   ?mhelp                   this list
+#
+# Every change is also written to the log channel (LOG_CHANNEL_ID, optional),
+# which also gets a "points at reset" snapshot every night at the daily reset.
+# These change balances only -- never the all-time "earned" leaderboard.
+# ---------------------------------------------------------------------------
+_raw_log_channel = os.getenv("LOG_CHANNEL_ID", "").strip()
+LOG_CHANNEL_ID = int(_raw_log_channel) if _raw_log_channel.isdigit() else None
+MGR_MAX_AMOUNT = 1_000_000
+_MGR_TARGET = r"(?:<@!?(\d+)>|(\d{15,20}))"
+_GIVE_RE = re.compile(rf"^\?give\s+{_MGR_TARGET}\s+([+-]?[\d,]+)\s*(?:pts?|points?)?\s*(.*)$", re.I | re.S)
+_SET_RE = re.compile(rf"^\?set\s+{_MGR_TARGET}\s+([\d,]+)\s*(?:pts?|points?)?\s*(.*)$", re.I | re.S)
+_ONLY_TARGET_RE = re.compile(rf"^\?\w+\s+{_MGR_TARGET}\s*$", re.I)
+_MGR_WORDS = {"?give", "?set", "?undo", "?check", "?balances", "?resetspins", "?snapshot", "?mhelp"}
+_mgr_history: list[dict] = []           # recent balance changes, newest last (memory only)
+
+
+async def log_event(text: str | None = None, embed: discord.Embed | None = None) -> None:
+    """Write to the log channel (if LOG_CHANNEL_ID is set). Never raises."""
+    if text:
+        logger.info("LOG: %s", text.replace("\n", " | "))
+    if not LOG_CHANNEL_ID:
+        return
+    try:
+        channel = bot.get_channel(LOG_CHANNEL_ID) or await bot.fetch_channel(LOG_CHANNEL_ID)
+        await channel.send(content=text, embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except Exception:
+        logger.warning("Couldn't write to the log channel (check LOG_CHANNEL_ID and Milo's permissions).", exc_info=True)
+
+
+def _snapshot_embeds(title: str) -> list[discord.Embed]:
+    """Everyone's current points, richest first, split into as many embeds as needed."""
+    rows = sorted(((u, b) for u, b in POINTS.balance.items() if b != 0), key=lambda t: (-t[1], t[0]))
+    total = sum(b for _, b in rows)
+    footer = f"{len(rows)} people with points · {total:,} pts in total"
+    if not rows:
+        return [discord.Embed(title=title, description="Nobody has any points yet.", color=discord.Color.dark_teal())]
+    chunks: list[list[str]] = [[]]
+    size = 0
+    for i, (uid, bal) in enumerate(rows, 1):
+        line = f"`#{i}` <@{uid}> — **{bal:,}** (earned {POINTS.total_earned(uid):,})"
+        if size + len(line) > 3500:
+            chunks.append([])
+            size = 0
+        chunks[-1].append(line)
+        size += len(line) + 1
+    embeds = []
+    for n, lines in enumerate(chunks, 1):
+        e = discord.Embed(
+            title=title if n == 1 else f"{title} (cont. {n})",
+            description="\n".join(lines), color=discord.Color.dark_teal(),
+        )
+        if n == len(chunks):
+            e.set_footer(text=footer)
+        embeds.append(e)
+    return embeds
+
+
+async def post_snapshot(title: str) -> None:
+    for e in _snapshot_embeds(title):
+        await log_event(embed=e)
+
+
+async def _log_startup_and_daily_snapshots() -> None:
+    """Background task: say hello in the log channel, then post everyone's
+    points every night at the daily reset (LIMIT_RESET_TZ, default IST)."""
+    await bot.wait_until_ready()
+    while not POINTS.ready:
+        await asyncio.sleep(5)
+    await log_event(f"🟢 **Milo is online** — points loaded for {len(POINTS.balance)} people.")
+    while True:
+        day, secs = _day_info()
+        await asyncio.sleep(secs + 2)
+        try:
+            await post_snapshot(f"🌙 Daily reset — everyone's points at the end of {day}")
+        except Exception:
+            logger.exception("Daily snapshot failed")
+
+
+def _mgr_rank_text(uid: int) -> str:
+    rank = POINTS.rank_of(uid)
+    return f"#{rank}" if rank else f"not on it ({POINTS.total_earned(uid):,}/{LEADERBOARD_MIN_POINTS:,})"
+
+
+async def _handle_manager_command(message: discord.Message, word: str) -> bool:
+    """Returns True if the message was a manager command from a real Manager.
+    Anyone else gets silence (and the message is left alone)."""
+    if not MANAGER_ROLE_ID or message.guild is None or not isinstance(message.author, discord.Member):
+        return False
+    if MANAGER_ROLE_ID not in {role.id for role in message.author.roles}:
+        return False
+    try:
+        await message.delete()
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        pass
+
+    async def reply(text: str, keep: int = 60) -> None:
+        await message.channel.send(text, delete_after=keep, allowed_mentions=discord.AllowedMentions.none())
+
+    text = message.content.strip()
+    mgr = message.author
+
+    async def find_member(uid_text: str) -> discord.Member | None:
+        uid = int(uid_text)
+        member = message.guild.get_member(uid)
+        if member is None:
+            try:
+                member = await message.guild.fetch_member(uid)
+            except discord.HTTPException:
+                member = None
+        if member is None or member.bot:
+            await reply("❌ I can't find that person in this server (bots don't count).")
+            return None
+        return member
+
+    def guard() -> str | None:
+        if not POINTS.ready:
+            return "❌ Points haven't loaded from the database yet — try again in a minute."
+        if GAMBLIN is not None:
+            return "🎰 Gamblin is running — balance changes would clash with held bets. Wait for it to end or use `?gamblin stop`."
+        return None
+
+    async def change(member: discord.Member, *, delta: int | None, set_to: int | None, note: str, kind: str) -> None:
+        blocked = guard()
+        if blocked:
+            await reply(blocked)
+            return
+        uid = member.id
+        before = POINTS.points(uid)
+        d = (set_to - before) if set_to is not None else delta
+        clamped = False
+        if before + d < 0:
+            d, clamped = -before, True          # balances never go below 0
+        if d == 0:
+            await reply(f"ℹ️ No change — {member.display_name} already has {before:,} points.")
+            return
+        POINTS.adjust_balance(uid, d)
+        after = POINTS.points(uid)
+        _mgr_history.append({"uid": uid, "applied": d, "before": before, "after": after, "undone": False, "kind": kind})
+        del _mgr_history[:-25]
+        msg = f"✅ **{member.display_name}**: {before:,} → **{after:,}** ({d:+,})"
+        if clamped:
+            msg += " — they didn't have that many, so it stopped at 0"
+        await reply(msg + "\nSaved within a few minutes (or run `?updateDB`).")
+        extra = f" — {note}" if note else ""
+        await log_event(f"🧾 `{kind}` by <@{mgr.id}>: <@{uid}> {before:,} → **{after:,}** ({d:+,}){extra}")
+
+    # ---- ?give ----
+    if word == "?give":
+        m = _GIVE_RE.match(text)
+        amount = int(m.group(3).replace(",", "")) if m and m.group(3).replace(",", "").lstrip("+-").isdigit() else None
+        if not m or amount is None:
+            await reply("Usage: `?give @user +300 pts` · `?give @user -40 pts`")
+            return
+        if abs(amount) > MGR_MAX_AMOUNT:
+            await reply(f"❌ That's a lot — the limit per command is {MGR_MAX_AMOUNT:,}.")
+            return
+        member = await find_member(m.group(1) or m.group(2))
+        if member:
+            await change(member, delta=amount, set_to=None, note=m.group(4).strip(), kind="?give")
+        return
+
+    # ---- ?set ----
+    if word == "?set":
+        m = _SET_RE.match(text)
+        if not m or not m.group(3).replace(",", "").isdigit():
+            await reply("Usage: `?set @user 500`")
+            return
+        value = int(m.group(3).replace(",", ""))
+        if value > MGR_MAX_AMOUNT * 10:
+            await reply("❌ That number is too big.")
+            return
+        member = await find_member(m.group(1) or m.group(2))
+        if member:
+            await change(member, delta=None, set_to=value, note=m.group(4).strip(), kind="?set")
+        return
+
+    # ---- ?undo ----
+    if word == "?undo":
+        blocked = guard()
+        if blocked:
+            await reply(blocked)
+            return
+        entry = next((h for h in reversed(_mgr_history) if not h["undone"]), None)
+        if entry is None:
+            await reply("ℹ️ Nothing to undo (only changes since Milo last started are remembered).")
+            return
+        uid = entry["uid"]
+        before = POINTS.points(uid)
+        d = -entry["applied"]
+        if before + d < 0:
+            d = -before
+        entry["undone"] = True
+        if d:
+            POINTS.adjust_balance(uid, d)
+        after = POINTS.points(uid)
+        await reply(f"↩️ Undid {entry['kind']} for <@{uid}>: {before:,} → **{after:,}** ({d:+,})")
+        await log_event(f"↩️ `?undo` by <@{mgr.id}>: <@{uid}> {before:,} → **{after:,}** ({d:+,})")
+        return
+
+    # ---- ?check / ?resetspins (need a target) ----
+    if word in ("?check", "?resetspins"):
+        m = _ONLY_TARGET_RE.match(text)
+        if not m:
+            await reply(f"Usage: `{word} @user`")
+            return
+        member = await find_member(m.group(1) or m.group(2))
+        if member is None:
+            return
+        uid = member.id
+        day, secs = _day_info()
+        if word == "?check":
+            free, bonus = POINTS.used(uid, day)
+            unsaved = "yes" if uid in POINTS.unsaved_users() else "no"
+            await reply(
+                f"🔎 **{member.display_name}**\n"
+                f"Balance **{POINTS.points(uid):,}** · earned {POINTS.total_earned(uid):,} · leaderboard {_mgr_rank_text(uid)}\n"
+                f"Spins today: {free}/{SLOTS_FREE_SPINS} free, {bonus}/{SLOTS_PAID_SPINS} bonus · unsaved changes: {unsaved}",
+                keep=90,
+            )
+            return
+        if not POINTS.ready:
+            await reply("❌ Points haven't loaded from the database yet — try again in a minute.")
+            return
+        key = (day, uid)
+        cur = POINTS.spins.get(key, [0, 0])
+        used = list(cur)
+        if not any(used):
+            await reply(f"ℹ️ {member.display_name} hasn't used any spins today.")
+            return
+        for idx in (0, 1):
+            if used[idx]:
+                POINTS.spins[key][idx] = 0
+                POINTS._p_spins.setdefault(key, [0, 0])[idx] -= used[idx]
+        POINTS.pity.pop(uid, None)
+        POINTS.last_spin.pop(uid, None)
+        await reply(f"🔄 Reset today's spins for **{member.display_name}** ({used[0]} free + {used[1]} bonus given back).")
+        await log_event(f"🔄 `?resetspins` by <@{mgr.id}>: <@{uid}> ({used[0]} free + {used[1]} bonus spins restored)")
+        return
+
+    # ---- ?balances ----
+    if word == "?balances":
+        if not POINTS.ready:
+            await reply("❌ Points haven't loaded from the database yet — try again in a minute.")
+            return
+        embeds = _snapshot_embeds("💰 Everyone's points right now")
+        await message.channel.send(
+            embed=embeds[0], delete_after=120, allowed_mentions=discord.AllowedMentions.none()
+        )
+        if len(embeds) > 1:
+            await reply(f"…plus {len(embeds) - 1} more page(s) — use `?snapshot` to post them all to the log channel.")
+        return
+
+    # ---- ?snapshot ----
+    if word == "?snapshot":
+        if not POINTS.ready:
+            await reply("❌ Points haven't loaded from the database yet — try again in a minute.")
+            return
+        if not LOG_CHANNEL_ID:
+            await reply("⚠️ Set `LOG_CHANNEL_ID` first so I know where to post it.")
+            return
+        await post_snapshot(f"📸 Snapshot requested by {mgr.display_name}")
+        await reply("📸 Posted to the log channel.")
+        return
+
+    # ---- ?mhelp ----
+    if word == "?mhelp":
+        await reply(
+            "🛠️ **Manager commands** (only you can use these)\n"
+            "`?give @user +300 pts` / `-40 pts` — add or remove points (optional note after it)\n"
+            "`?set @user 500` — set an exact balance\n"
+            "`?undo` — reverse the last ?give / ?set\n"
+            "`?check @user` — balance, earned, rank, spins today\n"
+            "`?balances` — everyone's points\n"
+            "`?resetspins @user` — restore today's spins\n"
+            "`?snapshot` — post everyone's points to the log channel\n"
+            "`?updateDB` — save to Upstash now · `?gamblin` / `?gamblin stop` · `?rolemenu` · `?send`\n"
+            "Changes only move balances (never the all-time leaderboard).",
+            keep=120,
+        )
+        return
+    return True
 
 
 
@@ -4507,10 +4838,13 @@ async def on_message(message: discord.Message):
         await _handle_updatedb_command(message)
         return
 
-    _first_word = message.content.strip().lower().split(" ", 1)[0]
+    _first_word = message.content.strip().lower().split(None, 1)[0] if message.content.strip() else ""
     if _first_word == "?gamblin":
         await _handle_gamblin_command(message)
         return
+    if _first_word in _MGR_WORDS:
+        if await _handle_manager_command(message, _first_word) is not False:
+            return  # a Manager used it. Everyone else falls through, untouched.
 
     if not AUTO_RESPONSES:
         return

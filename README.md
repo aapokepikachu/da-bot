@@ -8,7 +8,7 @@ Features:
 - A persistent **✔️ Interested** button on `/join` messages — survives bot restarts, **no database required**
 - A cat-themed welcome message when new members join
 - Self-assign roles (button-based, no database), posted via the hidden `?rolemenu` command
-- Four hidden text commands — `?send` (Manager role **or** Milo role), `?rolemenu`, `?updateDB` and `?gamblin` (all Manager role only; see Section 16 for Gamblin) — the **only** `?`-prefixed commands in the whole bot. None shows up in Discord's `/` picker and none is listed in `/help`; they're documented here in the README only.
+- Hidden text commands — `?send` (Manager role **or** Milo role), `?rolemenu`, `?updateDB`, `?gamblin` and the Manager toolbox (`?give`, `?set`, `?undo`, `?check`, `?balances`, `?resetspins`, `?snapshot`, `?mhelp`). All Manager role only, silent to everyone else; see Sections 16 and 17. — the **only** `?`-prefixed commands in the whole bot. None shows up in Discord's `/` picker and none is listed in `/help`; they're documented here in the README only.
 - Several commands call free, keyless public APIs (cat facts/photos, quotes, dictionary, weather, translation, reaction gifs) — every call has a graceful fallback message if the API is briefly down or slow
 - Runs as a **Render Free Web Service** (Discord Gateway + a tiny HTTP health server in one process)
 - Secrets stay in environment variables, never in code
@@ -267,7 +267,7 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 
 | Command | Description |
 |---|---|
-| `/help` | Shows the full command list (minus the hidden `?send`, `?rolemenu`, `?updateDB` and `?gamblin`). |
+| `/help` | Shows the full command list (minus all the hidden `?` commands). |
 | `?send <message>` | **Hidden.** Manager role or Milo role. Posts `<message>` as Milo. Not in `/help`, not a slash command. |
 | `?rolemenu` | **Hidden.** Manager-role-only. Posts the self-assign roles menu. Not in `/help`, not a slash command. |
 | `?updateDB` | **Hidden.** Manager-role-only. Saves all points to Upstash now and confirms. Not in `/help`, not a slash command. |
@@ -286,6 +286,7 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `ASK_CHANNEL_IDS` | Optional | Channel ID(s) where `/ask` is allowed, comma-separated (e.g. `111111111111111111,222222222222222222`). Anywhere else, `/ask` politely points people to the allowed channel(s) and doesn't use any AI budget. Threads inside an allowed channel count as allowed. Blank = `/ask` works in every channel. To get an ID: Discord Settings → Advanced → Developer Mode on, then right-click the channel → Copy Channel ID. |
 | `SLOTS_CHANNEL_IDS` | Optional | Channel ID(s) where `/slots` is allowed, comma-separated. Anywhere else `/slots` points people to the right channel and spends nothing. Threads inside an allowed channel count. Blank = every channel. |
 | `SLOTS_FREE_SPINS` / `SLOTS_PAID_SPINS` / `SLOTS_SPIN_COST` | Optional | Free spins per person per day (default `25`), bonus spins per day (`10`), and points per bonus spin (`5`). |
+| `LOG_CHANNEL_ID` | Optional | A private staff channel where Milo logs manager actions, Gamblin results, save problems, online/offline notices, and everyone's points at the nightly reset. See Section 17. |
 | `GAMBLIN_CHANNEL_ID` | Needed for Gamblin | The channel Gamblin runs in. Without it `?gamblin` just tells the manager to set it. See Section 16. |
 | `GAMBLIN_LOBBY_SECONDS` / `GAMBLIN_ROUNDS` | Optional | Join window (default `90`) and rounds per event (default `3`). |
 | `GAMBLIN_BET_SECONDS` / `GAMBLIN_REEL_SECONDS` | Optional | Betting window before reel 1 (default `40`) and before reels 2 and 3 (default `25`). |
@@ -610,3 +611,31 @@ The Gamblin reels are weighted: 🍒 24% · 🍋 21% · 🍉 18% · 🍇 16% · 
 - A session lives only in memory: a restart ends it (buttons then say "that Gamblin session is over").
 - Only one Gamblin at a time. Late joiners wait for the next one.
 - Points are virtual only — never cash or prizes.
+
+
+## 17. Manager toolbox & log channel
+
+All of these are **hidden** `?` commands: Manager role only, silent to everyone else, and Milo deletes your command message so chat stays clean. They never appear in `/help`. (`?send` is unchanged.) Type `?mhelp` any time for the list.
+
+| Command | What it does |
+|---|---|
+| `?give @user +300 pts` | Adds points. `?give @user -40 pts` removes them (it stops at 0, never negative). Add a note after it if you like: `?give @Archo -40 pts typo fix` — the note goes in the log. A user ID works instead of a mention. Limit 1,000,000 per command. |
+| `?set @user 500` | Sets someone's balance to an exact number. |
+| `?undo` | Reverses the most recent `?give` / `?set`. Run it again to step back further. Remembers the last 25 changes since Milo started. |
+| `?check @user` | Balance, total earned, leaderboard rank, spins used today, and whether they have unsaved changes. |
+| `?balances` | Everyone's current points, richest first. Shows in the channel and disappears after 2 minutes. |
+| `?resetspins @user` | Gives someone today's free + bonus spins back (and clears their cooldown/pity). For when something glitched. |
+| `?snapshot` | Posts everyone's points to the log channel right now. |
+| `?updateDB` · `?gamblin` · `?rolemenu` · `?send` | Existing commands, unchanged. |
+
+**What these change:** balances only. `?give` / `?set` never touch the all-time "total earned", so the top-earners leaderboard stays fair; they do show on **Richest right now**. Changes are saved to Upstash with the normal 5-minute autosave (or instantly with `?updateDB`). They're blocked while Gamblin is running so held bets can't be disturbed.
+
+### The log channel (`LOG_CHANNEL_ID`, optional)
+Make a private staff channel, give Milo **Send Messages + Embed Links** there, and set `LOG_CHANNEL_ID`. If it's empty, logging is simply off. Milo posts there:
+- 🧾 every `?give` / `?set` / `?undo` (who did it, who got it, before → after, your note), plus `?resetspins` and `?updateDB`
+- 🌙 **every night at the daily reset** (`LIMIT_RESET_TZ`, default IST): everyone's points, richest first, with earned totals and the grand total (split across several messages if there are many people)
+- 🎰 Gamblin started / finished, with each player's profit or loss
+- 🟢 / 🔴 Milo online (after points load) and shutting down
+- ⚠️ if saving to Upstash fails twice in a row (and ✅ when it works again)
+
+Cost: the log channel uses **0 Upstash commands** — it's all from memory.
