@@ -8,7 +8,7 @@ Features:
 - A persistent **✔️ Interested** button on `/join` messages — survives bot restarts, **no database required**
 - A cat-themed welcome message when new members join
 - Self-assign roles (button-based, no database), posted via the hidden `?rolemenu` command
-- Three hidden text commands — `?send` (Manager role **or** Milo role), `?rolemenu` and `?updateDB` (both Manager role only) — the **only** `?`-prefixed commands in the whole bot. None shows up in Discord's `/` picker and none is listed in `/help`; they're documented here in the README only.
+- Four hidden text commands — `?send` (Manager role **or** Milo role), `?rolemenu`, `?updateDB` and `?gamblin` (all Manager role only; see Section 16 for Gamblin) — the **only** `?`-prefixed commands in the whole bot. None shows up in Discord's `/` picker and none is listed in `/help`; they're documented here in the README only.
 - Several commands call free, keyless public APIs (cat facts/photos, quotes, dictionary, weather, translation, reaction gifs) — every call has a graceful fallback message if the API is briefly down or slow
 - Runs as a **Render Free Web Service** (Discord Gateway + a tiny HTTP health server in one process)
 - Secrets stay in environment variables, never in code
@@ -267,10 +267,11 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 
 | Command | Description |
 |---|---|
-| `/help` | Shows the full command list (minus the hidden `?send`, `?rolemenu` and `?updateDB`). |
+| `/help` | Shows the full command list (minus the hidden `?send`, `?rolemenu`, `?updateDB` and `?gamblin`). |
 | `?send <message>` | **Hidden.** Manager role or Milo role. Posts `<message>` as Milo. Not in `/help`, not a slash command. |
 | `?rolemenu` | **Hidden.** Manager-role-only. Posts the self-assign roles menu. Not in `/help`, not a slash command. |
 | `?updateDB` | **Hidden.** Manager-role-only. Saves all points to Upstash now and confirms. Not in `/help`, not a slash command. |
+| `?gamblin` / `?gamblin stop` | **Hidden.** Manager-role-only. Starts / ends a Gamblin betting event in `GAMBLIN_CHANNEL_ID` (Section 16). |
 
 ---
 
@@ -285,6 +286,11 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `ASK_CHANNEL_IDS` | Optional | Channel ID(s) where `/ask` is allowed, comma-separated (e.g. `111111111111111111,222222222222222222`). Anywhere else, `/ask` politely points people to the allowed channel(s) and doesn't use any AI budget. Threads inside an allowed channel count as allowed. Blank = `/ask` works in every channel. To get an ID: Discord Settings → Advanced → Developer Mode on, then right-click the channel → Copy Channel ID. |
 | `SLOTS_CHANNEL_IDS` | Optional | Channel ID(s) where `/slots` is allowed, comma-separated. Anywhere else `/slots` points people to the right channel and spends nothing. Threads inside an allowed channel count. Blank = every channel. |
 | `SLOTS_FREE_SPINS` / `SLOTS_PAID_SPINS` / `SLOTS_SPIN_COST` | Optional | Free spins per person per day (default `25`), bonus spins per day (`10`), and points per bonus spin (`5`). |
+| `GAMBLIN_CHANNEL_ID` | Needed for Gamblin | The channel Gamblin runs in. Without it `?gamblin` just tells the manager to set it. See Section 16. |
+| `GAMBLIN_LOBBY_SECONDS` / `GAMBLIN_ROUNDS` | Optional | Join window (default `90`) and rounds per event (default `3`). |
+| `GAMBLIN_BET_SECONDS` / `GAMBLIN_REEL_SECONDS` | Optional | Betting window before reel 1 (default `40`) and before reels 2 and 3 (default `25`). |
+| `GAMBLIN_MIN_BET` / `GAMBLIN_MAX_BET` | Optional | Smallest and largest single bet. Defaults `5` and `100`. |
+| `GAMBLIN_MAX_PLAYERS` / `GAMBLIN_MAX_MULT` | Optional | Table size (default `25`) and the cap on 3-of-a-kind multipliers (default `500`). |
 | `LEADERBOARD_MIN_POINTS` | Optional | Total points a person must have *earned* to appear on `/leaderboard`. Default `1000`. |
 | `POINTS_SAVE_MINUTES` | Optional | How often changed points are saved to Upstash. Default `5`. |
 | `GROQ_THINK_MODEL` | Optional | Turns on the 🧠 **Think harder** button using this Groq model. Recommended: `openai/gpt-oss-120b`. Same `GROQ_API_KEY` — no second key. Blank = no button. |
@@ -570,3 +576,37 @@ A successful 🧠/🔮 press costs about 4.4 commands. Each active member costs 
 ### `/slots` in plain English (for members)
 
 > You get **25 free spins a day** (they reset at midnight IST). Match all three symbols to win points — 7️⃣ pays the most. After your free spins you can buy up to 10 bonus spins for 5 points each. If you go a long time without winning, Milo gives you a small guaranteed win. Check `/points` for your balance and `/leaderboard` for the top 10 — earn 1,000 points in total to get on it. Points are just for fun.
+
+
+## 16. Gamblin (button-only betting event)
+
+A Manager types **`?gamblin`** (from anywhere). Milo runs the whole event in `GAMBLIN_CHANNEL_ID`. **`?gamblin stop`** ends it early. Both are silent to everyone without the Manager role.
+
+### Channel setup (so nobody can type)
+In the Gamblin channel: deny **Send Messages** (and Create Threads) for `@everyone`, keep **View Channel**, **Read Message History** and **Use Application Commands**. Give **Milo** Send Messages, Embed Links, Manage Messages and **Mention Everyone** (needed for the `@everyone` ping). Buttons and the custom-bet popup still work for members; they just can't chat.
+
+### How an event runs
+1. **Lobby.** Milo posts `@everyone`, three empty reels `[ ❔ | ❔ | ❔ ]`, a **Join** button and a countdown. Each join gets a "`@name` is participating!" line. You need at least `GAMBLIN_MIN_BET` points to join. When the timer ends the lobby message is deleted.
+2. **Rounds** (`GAMBLIN_ROUNDS`, default 3). One shared machine per round. Reel 1, 2 and 3 stop one at a time, with a betting window before each:
+   - **🎰 Jackpot Spin** — one bet on the whole spin, placed *before reel 1*. Pick: a specific triple (3× 🍒 …), **Any triple**, or **Pair or better**.
+   - **🎚️ Reel Rush** — bet on each reel separately: pick the symbol that reel will land on. Skip any reel you like.
+   - You choose one mode per round. Once you lock a bet it can't be changed, and Jackpot Spin players simply wait while the reels stop.
+3. **Betting is private.** Buttons open a panel only you can see: pick → stake (5% / 10% / 25% / All-in-or-Max / ✏️ Custom popup) → confirm → 🔒 Lock. Bets are `GAMBLIN_MIN_BET`–`GAMBLIN_MAX_BET`.
+4. **Results** are posted after each reel (and the whole spin after reel 3), then standings at the end.
+
+### What Milo pauses while it runs
+`/slots`, `/ask` (+ the think buttons), `/grouptrivia` and the 5-minute autosave. `?updateDB` tells the manager to wait (or use `?gamblin stop`). Everything resumes automatically when it ends.
+
+### The odds (computed from the real reel weights)
+The Gamblin reels are weighted: 🍒 24% · 🍋 21% · 🍉 18% · 🍇 16% · ⭐ 12% · 7️⃣ 9%. Every multiplier is `0.92 ÷ chance`, so over a long time the house keeps about 8%. Reel Rush pays x3.8 (🍒) up to x10.2 (7️⃣). Jackpot Spin pays e.g. Pair or better x1.9, Any triple x25.9, 3× 🍒 x66.5, 3× ⭐ and 3× 7️⃣ capped at x500 (`GAMBLIN_MAX_MULT`). **The cap makes the two rarest triples worse value than the rest** — that's on purpose, so one lucky bet can't wreck the economy.
+
+### Points and saving
+- A stake is only *held* until its reel stops (it still shows in your balance, but you can't bet it twice). Then your real balance changes in memory.
+- Gamblin only moves **balances**. It never adds to "total earned", so the all-time leaderboard stays slots-only; gambling shows up in the **Richest right now** board.
+- When the event ends, Milo does **one batched save** to Upstash: about **1 command per player whose balance changed** (10 players ≈ 10 commands, a few % of 1 day's normal use). Nothing is written during the event.
+- If Milo crashes mid-event, Upstash still holds the pre-event balances, so at worst the event's results are lost, never half-applied. On a normal shutdown (SIGTERM) Milo stops Gamblin, never charges unresolved bets, and saves what already landed.
+
+### Limits (honest)
+- A session lives only in memory: a restart ends it (buttons then say "that Gamblin session is over").
+- Only one Gamblin at a time. Late joiners wait for the next one.
+- Points are virtual only — never cash or prizes.
