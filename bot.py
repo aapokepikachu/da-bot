@@ -2666,6 +2666,11 @@ class PointsManager:
                 return i
         return None
 
+    def richest(self, n: int = 5) -> list[tuple[int, int]]:
+        """Top current balances (what people are holding right now)."""
+        board = [(u, b) for u, b in self.balance.items() if b > 0]
+        return sorted(board, key=lambda t: (-t[1], t[0]))[:n]
+
     def closest(self, n: int = 3) -> list[tuple[int, int]]:
         near = [(u, e) for u, e in self.earned.items() if 0 < e < LEADERBOARD_MIN_POINTS]
         return sorted(near, key=lambda t: (-t[1], t[0]))[:n]
@@ -2866,62 +2871,39 @@ def _roll_slots(since_win: int) -> tuple[list[str], int, bool]:
     return reels, (SLOT_PAYOUTS[reels[0]] if won else 0), False
 
 
-@bot.tree.command(name="slots", description="Spin the slot machine and win points.")
-async def slots_slash(interaction: discord.Interaction):
-    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
-        await interaction.response.send_message(
-            "This bot is not configured for this server.", ephemeral=True
-        )
-        return
-
-    if not _channel_allowed(interaction, SLOTS_CHANNEL_IDS):
-        channels = ", ".join(f"<#{cid}>" for cid in sorted(SLOTS_CHANNEL_IDS))
-        await interaction.response.send_message(
-            f"🎰 You can only use `/slots` in {channels} -- hop over there and spin!",
-            ephemeral=True,
-        )
-        return
-
-    if not POINTS.ready:
-        await interaction.response.send_message(_POINTS_UNAVAILABLE, ephemeral=True)
-        return
-
-    uid = interaction.user.id
+def _spin_precheck(uid: int) -> tuple[str, dict]:
+    """Instant memory check for a spin. Returns (status, info):
+    "cooldown" / "broke" / "exhausted" -> info["msg"] is the private reply;
+    "ok" -> info has paid, cost, day."""
     now = time.time()
     last = POINTS.last_spin.get(uid)
     if last is not None and now - last < SLOTS_COOLDOWN_SECONDS:
         wait = max(1, round(SLOTS_COOLDOWN_SECONDS - (now - last)))
-        await interaction.response.send_message(
-            f"🎰 The reels are still spinning! Try again in {wait}s.", ephemeral=True
-        )
-        return
+        return "cooldown", {"msg": f"🎰 The reels are still spinning! Try again in {wait}s."}
 
     day, secs_to_reset = _day_info()
     free_used, bonus_used = POINTS.used(uid, day)
     if free_used < SLOTS_FREE_SPINS:
-        paid, cost = False, 0
-    elif bonus_used < SLOTS_PAID_SPINS:
+        return "ok", {"paid": False, "cost": 0, "day": day}
+    if bonus_used < SLOTS_PAID_SPINS:
         balance = POINTS.points(uid)
         if balance < SLOTS_SPIN_COST:
-            await interaction.response.send_message(
+            return "broke", {"msg": (
                 f"🎰 You've used all {SLOTS_FREE_SPINS} free spins today. A bonus spin costs "
                 f"{SLOTS_SPIN_COST} points and you have {balance}. Fresh free spins in "
-                f"{_format_wait(secs_to_reset)}!",
-                ephemeral=True,
-            )
-            return
-        paid, cost = True, SLOTS_SPIN_COST
-    else:
-        await interaction.response.send_message(
-            f"🎰 You've used all {SLOTS_FREE_SPINS} free spins and {SLOTS_PAID_SPINS} bonus spins "
-            f"for today. They come back in {_format_wait(secs_to_reset)}!",
-            ephemeral=True,
-        )
-        return
+                f"{_format_wait(secs_to_reset)}!"
+            )}
+        return "ok", {"paid": True, "cost": SLOTS_SPIN_COST, "day": day}
+    return "exhausted", {"msg": (
+        f"🎰 You've used all {SLOTS_FREE_SPINS} free spins and {SLOTS_PAID_SPINS} bonus spins "
+        f"for today. They come back in {_format_wait(secs_to_reset)}!"
+    )}
 
-    # Everything from here to the reply is instant memory work -- no awaits --
-    # so two quick spins can never both sneak under a limit.
-    POINTS.last_spin[uid] = now
+
+def _perform_spin(uid: int, *, paid: bool, cost: int, day: str) -> discord.Embed:
+    """The actual spin. Instant memory work -- no awaits -- so two quick spins
+    can never both sneak under a limit."""
+    POINTS.last_spin[uid] = time.time()
     since_win = POINTS.pity.get(uid, 0)
     reels, payout, pity_hit = _roll_slots(since_win)
     POINTS.pity[uid] = 0 if payout else since_win + 1
@@ -2957,6 +2939,97 @@ async def slots_slash(interaction: discord.Interaction):
     if SLOTS_PITY_AT and not payout and until_pity <= 5:
         footer += f" · 🍀 Win guaranteed within {until_pity} spin{'s' if until_pity != 1 else ''}"
     embed.set_footer(text=footer)
+    return embed
+
+
+class BonusSpinConfirmView(discord.ui.View):
+    """Private 'are you sure?' shown before a bonus spin costs points.
+    Lives in memory only (30s) -- if it expires, nothing is charged."""
+
+    def __init__(self, owner_id: int, balance: int, bonus_left: int) -> None:
+        super().__init__(timeout=30)
+        self.owner_id = owner_id
+        self.used = False
+        self.summary = (
+            f"💰 **Bonus spin** — costs **{SLOTS_SPIN_COST} points**.\n"
+            f"You have **{balance:,}** pts · **{bonus_left}/{SLOTS_PAID_SPINS}** bonus spins left today.\n"
+            f"Spin for {SLOTS_SPIN_COST} points?"
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This isn't your spin 🐾", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label=f"Spin ({SLOTS_SPIN_COST} pts)", emoji="🎰", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.used:
+            await interaction.response.send_message("Already handled!", ephemeral=True)
+            return
+        self.used = True
+        self.stop()
+        if not POINTS.ready:
+            await interaction.response.edit_message(content=_POINTS_UNAVAILABLE, view=None)
+            return
+        # Re-check everything: things may have changed while the prompt was open.
+        status, info = _spin_precheck(self.owner_id)
+        if status != "ok":
+            await interaction.response.edit_message(content=info["msg"], view=None)
+            return
+        embed = _perform_spin(self.owner_id, paid=info["paid"], cost=info["cost"], day=info["day"])
+        await interaction.response.edit_message(content="🎰 Spun!", view=None)
+        try:
+            await interaction.followup.send(embed=embed)
+        except discord.HTTPException:
+            logger.warning("Couldn't post the confirmed spin result (points were still applied).")
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.used = True
+        self.stop()
+        await interaction.response.edit_message(
+            content="Cancelled — no points spent. 🐾", view=None
+        )
+
+    async def on_timeout(self) -> None:
+        self.used = True  # nothing charged; the buttons just go dead
+
+
+@bot.tree.command(name="slots", description="Spin the slot machine and win points.")
+async def slots_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message(
+            "This bot is not configured for this server.", ephemeral=True
+        )
+        return
+
+    if not _channel_allowed(interaction, SLOTS_CHANNEL_IDS):
+        channels = ", ".join(f"<#{cid}>" for cid in sorted(SLOTS_CHANNEL_IDS))
+        await interaction.response.send_message(
+            f"🎰 You can only use `/slots` in {channels} -- hop over there and spin!",
+            ephemeral=True,
+        )
+        return
+
+    if not POINTS.ready:
+        await interaction.response.send_message(_POINTS_UNAVAILABLE, ephemeral=True)
+        return
+
+    uid = interaction.user.id
+    status, info = _spin_precheck(uid)
+    if status != "ok":
+        await interaction.response.send_message(info["msg"], ephemeral=True)
+        return
+
+    if info["paid"]:
+        # Costs points -> ask first. Nothing is charged until they press Spin.
+        bonus_left = SLOTS_PAID_SPINS - POINTS.used(uid, info["day"])[1]
+        view = BonusSpinConfirmView(uid, POINTS.points(uid), bonus_left)
+        await interaction.response.send_message(view.summary, view=view, ephemeral=True)
+        return
+
+    embed = _perform_spin(uid, paid=False, cost=0, day=info["day"])
     await interaction.response.send_message(embed=embed)
 
 
@@ -3007,7 +3080,7 @@ async def points_slash(interaction: discord.Interaction, user: discord.Member | 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="leaderboard", description="See the top 10 point earners.")
+@bot.tree.command(name="leaderboard", description="See the top earners and the richest players.")
 async def leaderboard_slash(interaction: discord.Interaction):
     if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
         await interaction.response.send_message(
@@ -3020,28 +3093,41 @@ async def leaderboard_slash(interaction: discord.Interaction):
 
     board = POINTS.qualified()
     embed = discord.Embed(title="🏆 Milo Leaderboard", color=discord.Color.gold())
+    medals = ["🥇", "🥈", "🥉"]
     if board:
-        medals = ["🥇", "🥈", "🥉"]
         lines = [
             f"{medals[i] if i < 3 else f'`#{i + 1}`'} <@{uid}> — **{earned:,}** pts"
             for i, (uid, earned) in enumerate(board[:10])
         ]
-        embed.description = "\n".join(lines)
-        embed.set_footer(
-            text=f"Ranked by total points earned · {len(board)} on the board · "
-                 f"earn {LEADERBOARD_MIN_POINTS:,} to join"
+        embed.description = "**📈 Top earners (all-time)**\n" + "\n".join(lines)
+        footer = (
+            f"All-time ranked by total earned · {len(board)} on the board · "
+            f"earn {LEADERBOARD_MIN_POINTS:,} to join"
         )
     else:
         near = POINTS.closest()
         text = (
-            f"Nobody's on the board yet! **Earn your first {LEADERBOARD_MIN_POINTS:,} points "
-            f"to reach the leaderboard.** Win them in `/slots`! 🎰"
+            f"**📈 Top earners (all-time)**\nNobody's on this board yet! **Earn your first "
+            f"{LEADERBOARD_MIN_POINTS:,} points to reach it.** Win them in `/slots`! 🎰"
         )
         if near:
             text += "\n\n**Closest so far:**\n" + "\n".join(
                 f"<@{uid}> — {earned:,}/{LEADERBOARD_MIN_POINTS:,}" for uid, earned in near
             )
         embed.description = text
+        footer = "All-time ranked by total earned"
+
+    rich = POINTS.richest(5)
+    if rich:
+        rich_lines = [
+            f"{medals[i] if i < 3 else f'`#{i + 1}`'} <@{uid}> — **{bal:,}** pts"
+            for i, (uid, bal) in enumerate(rich)
+        ]
+        rich_text = "\n".join(rich_lines)
+    else:
+        rich_text = "Nobody's holding any points right now."
+    embed.add_field(name="💰 Richest right now (current balance)", value=rich_text, inline=False)
+    embed.set_footer(text=footer + " · Balance board has no minimum")
     await interaction.response.send_message(embed=embed)
 
 
@@ -3521,7 +3607,8 @@ async def help_slash(interaction: discord.Interaction):
             f"{SLOTS_PAID_SPINS} bonus spins at {SLOTS_SPIN_COST} points each\n"
             f"Match all 3 to win: {payout_line}\n"
             "`/points` — your balance, rank and spins left\n"
-            f"`/leaderboard` — the top 10 (earn {LEADERBOARD_MIN_POINTS:,} points to get on it)"
+            f"`/leaderboard` — top 10 all-time earners (earn {LEADERBOARD_MIN_POINTS:,} to join) + top 5 richest right now\n"
+            f"Bonus spins ask for confirmation before spending points"
         ),
         inline=False,
     )

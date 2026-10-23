@@ -221,9 +221,9 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 
 | Command | Description |
 |---|---|
-| `/slots` | Spin a 3-reel slot machine for points. **25 free spins a day**, then up to **10 bonus spins at 5 points each**. Match all three to win: 7️⃣ 100 · ⭐ 50 · 🍇 25 · 🍉 15 · 🍋 10 · 🍒 5. 5-second cooldown. A pity rule guarantees a small win on the 20th spin without one. Can be limited to certain channels with `SLOTS_CHANNEL_IDS`. |
+| `/slots` | Spin a 3-reel slot machine for points. **25 free spins a day**, then up to **10 bonus spins at 5 points each**. Match all three to win: 7️⃣ 100 · ⭐ 50 · 🍇 25 · 🍉 15 · 🍋 10 · 🍒 5. 5-second cooldown. A pity rule guarantees a small win on the 20th spin without one. Can be limited to certain channels with `SLOTS_CHANNEL_IDS`. Bonus spins (the ones that cost points) first show a private **Spin / Cancel** confirmation (30s) — nothing is charged until you press Spin. |
 | `/points user:<member>` | Your balance, total points earned, leaderboard rank (or progress toward it), and spins left today. Private to you. Add a member to peek at theirs (spins hidden). |
-| `/leaderboard` | The top 10 by **total points earned**. You need 1,000 earned (`LEADERBOARD_MIN_POINTS`) to appear; until anyone does, it shows who's closest. |
+| `/leaderboard` | Two boards: the top 10 by **total points earned** (all-time; you need 1,000 earned via `LEADERBOARD_MIN_POINTS` to appear, until then it shows who's closest) and, below it, the top 5 **richest right now** by current balance (no minimum). Both come from memory — 0 Upstash commands. |
 
 ### Party & social
 
