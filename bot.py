@@ -186,6 +186,38 @@ if _raw_self_roles:
         )
         SELF_ROLES = SELF_ROLES[:25]
 
+# Optional: the games /join can look for players in, as
+# "ROLE_ID|Name|Emoji|Call to action,ROLE_ID|Name|Emoji|Call to action,...".
+# Only the role ID and name are required. Emoji (shown before the ping) and the
+# call-to-action line (default "Join now!") are optional. Avoid commas in the
+# call to action. If JOIN_GAMES isn't set, the original two games are used so
+# nothing changes until you set it.
+_raw_join_games = os.getenv("JOIN_GAMES", "").strip()
+JOIN_GAMES: list[tuple[int, str, str | None, str]] = []
+if _raw_join_games:
+    for _entry in _raw_join_games.split(","):
+        _entry = _entry.strip()
+        if not _entry:
+            continue
+        _parts = [_p.strip() for _p in _entry.split("|")]
+        if len(_parts) < 2 or not _parts[0].isdigit() or not _parts[1]:
+            logger.warning("Skipping malformed JOIN_GAMES entry: %r", _entry)
+            continue
+        JOIN_GAMES.append((
+            int(_parts[0]),
+            _parts[1][:100],
+            _parts[2] if len(_parts) > 2 and _parts[2] else None,
+            _parts[3] if len(_parts) > 3 and _parts[3] else "Join now!",
+        ))
+    if len(JOIN_GAMES) > 25:
+        logger.warning("JOIN_GAMES has %d entries; only the first 25 fit in a Discord dropdown.", len(JOIN_GAMES))
+        JOIN_GAMES = JOIN_GAMES[:25]
+if not JOIN_GAMES:
+    JOIN_GAMES = [
+        (1532265584069185597, "VBL", "🏐", "Join the lobby now!"),
+        (1536962762952146944, "Minecraft", None, "Join the Server now!"),
+    ]
+
 PORT = int(os.getenv("PORT", "10000"))
 
 if not DISCORD_TOKEN:
@@ -193,10 +225,6 @@ if not DISCORD_TOKEN:
         "DISCORD_TOKEN environment variable is required. "
         "Set it in your .env file (local) or in Render's Environment settings."
     )
-
-# Role IDs are fixed by the spec and must never be replaced with role names.
-VBL_ROLE_MENTION = "<@&1532265584069185597>"
-MINECRAFT_ROLE_MENTION = "<@&1536962762952146944>"
 
 # Prefix used to identify our "Interested" button clicks inside custom_id.
 JOIN_BUTTON_PREFIX = "join_interested:"
@@ -519,10 +547,7 @@ async def aboutme_slash(interaction: discord.Interaction):
     message="Optional extra message to include (e.g. 'Need 2 more players')",
 )
 @app_commands.choices(
-    game=[
-        app_commands.Choice(name="VBL", value="vbl"),
-        app_commands.Choice(name="Minecraft", value="minecraft"),
-    ]
+    game=[app_commands.Choice(name=_g[1], value=str(_i)) for _i, _g in enumerate(JOIN_GAMES)]
 )
 async def join_slash(
     interaction: discord.Interaction,
@@ -553,18 +578,19 @@ async def join_slash(
 
     author_mention = interaction.user.mention
 
-    if game.value == "vbl":
-        content = (
-            f"🏐 **{author_mention}** is looking for players!\n"
-            f"{VBL_ROLE_MENTION}\n"
-            f"Join the lobby now!"
+    try:
+        role_id, _game_name, game_emoji, call_to_action = JOIN_GAMES[int(game.value)]
+    except (ValueError, IndexError):
+        await interaction.response.send_message(
+            "That game isn't on the list anymore — try `/join` again.", ephemeral=True
         )
-    else:  # minecraft
-        content = (
-            f"**{author_mention}** is looking for players!\n"
-            f"{MINECRAFT_ROLE_MENTION}\n"
-            f"Join the Server now!"
-        )
+        return
+
+    content = (
+        f"{game_emoji + ' ' if game_emoji else ''}**{author_mention}** is looking for players!\n"
+        f"<@&{role_id}>\n"
+        f"{call_to_action}"
+    )
 
     if custom_message:
         content += f"\n{custom_message}"
@@ -2672,6 +2698,12 @@ class PointsManager:
             self.earned[uid] = self.earned.get(uid, 0) + payout
             self._p_earn[uid] = self._p_earn.get(uid, 0) + payout
 
+    def add_earned(self, uid: int, n: int) -> None:
+        """Count winnings towards the all-time leaderboard (balance is untouched)."""
+        if n > 0:
+            self.earned[uid] = self.earned.get(uid, 0) + n
+            self._p_earn[uid] = self._p_earn.get(uid, 0) + n
+
     def adjust_balance(self, uid: int, delta: int) -> None:
         """Manager change (?give / ?set / ?undo): balance only, never 'earned'."""
         if delta:
@@ -3626,7 +3658,7 @@ async def help_slash(interaction: discord.Interaction):
     embed.add_field(
         name="🎮 Group & Server",
         value=(
-            "`/join game:VBL` / `game:Minecraft` — look for players "
+            "`/join game:" + " / game:".join(_g[1] for _g in JOIN_GAMES) + "` — look for players "
             "(add `message:<text>` for a custom note)\n"
             "`/serverinfo` — info about this server\n"
             "`/userinfo user:<member>` — info about a member\n"
@@ -3673,7 +3705,7 @@ async def help_slash(interaction: discord.Interaction):
             "`/points` — your balance, rank and spins left\n"
             f"`/leaderboard` — top 10 all-time earners (earn {LEADERBOARD_MIN_POINTS:,} to join) + top 5 richest right now\n"
             f"Bonus spins ask for confirmation before spending points\n"
-            "🎲 Managers sometimes run **Gamblin** nights — watch for the @everyone ping!"
+            "🎲 Managers sometimes run **Gamblin** nights (slots & blackjack) — watch for the @everyone ping!"
         ),
         inline=False,
     )
@@ -3987,6 +4019,17 @@ def _g_avail(p: GPlayer) -> int:
 
 
 class GamblinSession:
+    NAME = "Gamblin"
+    EMOJI = "🎰"
+    JOIN_ID = "gmb:join"
+
+    @property
+    def total_rounds(self) -> int:
+        return GAMBLIN_ROUNDS
+
+    def _on_end(self) -> None:
+        """Hook: runs once when a session ends (normally or early)."""
+
     def __init__(self, channel, started_by: int) -> None:
         self.channel = channel
         self.started_by = started_by
@@ -4036,11 +4079,13 @@ class GamblinSession:
         try:
             await self._lobby()
             if not self.players:
-                await self._send(content="🎰 Nobody joined, so Gamblin is cancelled. Everything's back to normal! 🐾")
+                await self._send(content=f"{self.EMOJI} Nobody joined, so {self.NAME} is cancelled. Everything's back to normal! 🐾")
             else:
-                for r in range(1, GAMBLIN_ROUNDS + 1):
+                for r in range(1, self.total_rounds + 1):
                     await self._play_round(r)
-                    if r < GAMBLIN_ROUNDS:
+                    if getattr(self, "stop_early", False):
+                        break
+                    if r < self.total_rounds:
                         await asyncio.sleep(8)
                 await self._finish()
         except asyncio.CancelledError:
@@ -4049,15 +4094,15 @@ class GamblinSession:
             self.window_open = False
             logger.info("Gamblin was stopped early.")
             note = (
-                "🎰 Milo is restarting, so Gamblin ended early. Bets that hadn't landed yet were never charged."
+                f"{self.EMOJI} Milo is restarting, so {self.NAME} ended early. Bets that hadn't landed yet were never charged."
                 if self.shutting_down else
-                "🎰 Gamblin was ended early by a manager. Bets that hadn't landed yet were never charged."
+                f"{self.EMOJI} {self.NAME} was ended early by a manager. Bets that hadn't landed yet were never charged."
             )
             await self._send(content=note)
         except Exception:
             logger.exception("Gamblin crashed -- ending the session safely")
             self.aborted = True
-            await self._send(content="🎰 Something broke, so Gamblin ended early. Unresolved bets were never charged.")
+            await self._send(content=f"{self.EMOJI} Something broke, so {self.NAME} ended early. Unresolved bets were never charged.")
         finally:
             for p in self.players.values():
                 p.pending = 0
@@ -4065,12 +4110,16 @@ class GamblinSession:
             self.window_open = False
             if self.msg is not None:
                 await self._edit(self.msg, view=None)
+            try:
+                self._on_end()
+            except Exception:
+                logger.exception("%s end-of-session hook failed", self.NAME)
             if GAMBLIN is self:
                 GAMBLIN = None
         if self.players:
             lines = [f"<@{p.uid}> {p.net:+,}" for p in sorted(self.players.values(), key=lambda q: -q.net)]
             await log_event(
-                f"🎰 Gamblin {'ended early' if self.aborted else 'finished'} — {len(self.players)} players:\n" + "\n".join(lines)
+                f"{self.EMOJI} {self.NAME} {'ended early' if self.aborted else 'finished'} — {len(self.players)} players:\n" + "\n".join(lines)
             )
         if not self.shutting_down:
             ok, people, detail = await POINTS.flush("gamblin")
@@ -4079,9 +4128,8 @@ class GamblinSession:
             else:
                 logger.warning("Gamblin: save failed (%s) -- autosave will retry.", detail)
 
-    async def _lobby(self) -> None:
-        end_ts = int(time.time()) + GAMBLIN_LOBBY_SECONDS
-        embed = discord.Embed(
+    def _lobby_embed(self, end_ts: int) -> discord.Embed:
+        return discord.Embed(
             title="🎰 GAMBLIN is starting!",
             description=(
                 "**[ ❔ | ❔ | ❔ ]**\n"
@@ -4092,8 +4140,12 @@ class GamblinSession:
             ),
             color=discord.Color.gold(),
         )
+
+    async def _lobby(self) -> None:
+        end_ts = int(time.time()) + GAMBLIN_LOBBY_SECONDS
+        embed = self._lobby_embed(end_ts)
         self.lobby_msg = await self._send(
-            content="@everyone", embed=embed, view=_gview(_gb("Join Gamblin", "gmb:join", "green")),
+            content="@everyone", embed=embed, view=_gview(_gb(f"Join {self.NAME}", self.JOIN_ID, "green")),
             allowed_mentions=discord.AllowedMentions(everyone=True),
         )
         if self.lobby_msg is None:
@@ -4341,7 +4393,7 @@ class GamblinStakeModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         g = GAMBLIN
-        p = g.players.get(interaction.user.id) if g else None
+        p = g.players.get(interaction.user.id) if g and not isinstance(g, BlackjackSession) else None
         if g is None or p is None:
             await interaction.response.send_message("🎰 That Gamblin session is over.", ephemeral=True)
             return
@@ -4368,7 +4420,7 @@ async def handle_gamblin_click(interaction: discord.Interaction, custom_id: str)
         await say("This bot is not configured for this server.")
         return
     g = GAMBLIN
-    if g is None:
+    if g is None or isinstance(g, BlackjackSession):
         await say("🎰 That Gamblin session is over — catch the next one! 🐾")
         return
     parts = custom_id.split(":")
@@ -4457,7 +4509,7 @@ async def handle_gamblin_click(interaction: discord.Interaction, custom_id: str)
 
 
 # ---- hidden Manager-only command: ?gamblin / ?gamblin stop ----------------------------
-async def _handle_gamblin_command(message: discord.Message) -> None:
+async def _handle_gamblin_command(message: discord.Message, bj: bool = False) -> None:
     global GAMBLIN
     if not MANAGER_ROLE_ID:
         return
@@ -4501,12 +4553,12 @@ async def _handle_gamblin_command(message: discord.Message) -> None:
         await reply("❌ I can't find the Gamblin channel — check `GAMBLIN_CHANNEL_ID` and my permissions there.")
         return
 
-    GAMBLIN = GamblinSession(channel, message.author.id)
+    GAMBLIN = (BlackjackSession if bj else GamblinSession)(channel, message.author.id)
     GAMBLIN.task = asyncio.create_task(GAMBLIN.run())
     _background_tasks.add(GAMBLIN.task)
     GAMBLIN.task.add_done_callback(_background_tasks.discard)
-    await reply(f"🎰 Gamblin is starting in {channel.mention}!")
-    await log_event(f"🎰 Gamblin started by <@{message.author.id}> in {channel.mention}.")
+    await reply(f"{GAMBLIN.EMOJI} {GAMBLIN.NAME} is starting in {channel.mention}!")
+    await log_event(f"{GAMBLIN.EMOJI} {GAMBLIN.NAME} started by <@{message.author.id}> in {channel.mention}.")
 
 
 async def _gamblin_shutdown() -> None:
@@ -4520,6 +4572,490 @@ async def _gamblin_shutdown() -> None:
         await asyncio.wait_for(asyncio.shield(g.task), timeout=5)
     except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
         pass
+
+
+
+# ---------------------------------------------------------------------------
+# 🃏 BLACKJACK GAMBLIN -- ?gamblinbj  (same idea as ?gamblin, different game)
+#
+#   ?gamblinbj        (Manager only) -> lobby -> N rounds vs the dealer -> standings
+#   ?gamblinbj stop   (Manager only) -> ends it early (nothing unresolved is charged)
+#
+# Button-only, runs in GAMBLIN_CHANNEL_ID, and halts exactly the same things as
+# ?gamblin (/slots, /ask + think buttons, /grouptrivia, autosave). Only one
+# Gamblin of either kind can run at a time.
+#
+# Rules: 6 decks, fresh shoe every round. Dealer stands on all 17s. Blackjack pays
+# 3:2 (rounded down). Win = 1:1, push = stake back. You can Hit, Stand or Double
+# down (first two cards only). No split / insurance / surrender. If the dealer has
+# blackjack the round ends at once (you can't double into it).
+#
+# Leaderboard: a player's POSITIVE session profit is added to their all-time
+# "total earned" when the session ends (so winning counts, but you can't farm the
+# board by winning and losing over and over within one session).
+# ---------------------------------------------------------------------------
+GAMBLIN_BJ_ROUNDS = _env_int("GAMBLIN_BJ_ROUNDS", 5)
+GAMBLIN_BJ_BET_SECONDS = _env_int("GAMBLIN_BJ_BET_SECONDS", 30)
+GAMBLIN_BJ_TURN_SECONDS = _env_int("GAMBLIN_BJ_TURN_SECONDS", 40)
+BJ_PREFIX = "bj:"
+_BJ_RANKS = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"]
+_BJ_SUITS = ["♠", "♥", "♦", "♣"]
+_BJ_FACE = {"J", "Q", "K"}
+
+
+def _bj_shoe() -> list[tuple[str, str]]:
+    cards = [(r, s) for _ in range(6) for r in _BJ_RANKS for s in _BJ_SUITS]
+    random.shuffle(cards)
+    return cards
+
+
+def _bj_total(cards) -> int:
+    total = sum(11 if r == "A" else 10 if r in _BJ_FACE or r == "10" else int(r) for r, _ in cards)
+    aces = sum(1 for r, _ in cards if r == "A")
+    while total > 21 and aces:
+        total -= 10
+        aces -= 1
+    return total
+
+
+def _bj_is_natural(cards) -> bool:
+    return len(cards) == 2 and _bj_total(cards) == 21
+
+
+def _bj_fmt(cards, hide_second: bool = False) -> str:
+    shown = [f"`{r}{s}`" for r, s in cards]
+    if hide_second and len(shown) >= 2:
+        shown = [shown[0], "`🂠`"]
+    return " ".join(shown) if shown else "—"
+
+
+@dataclass
+class BJPlayer(GPlayer):
+    bet: int = 0                    # total staked this round (doubles if they double down)
+    cards: list = field(default_factory=list)
+    status: str = ""                # "" = still playing; "stand" / "bust" / "bj"
+    doubled: bool = False
+
+    def reset_round(self) -> None:
+        super().reset_round()
+        self.bet, self.cards, self.status, self.doubled = 0, [], "", False
+
+
+class BlackjackSession(GamblinSession):
+    NAME = "Blackjack"
+    EMOJI = "🃏"
+    JOIN_ID = "bj:join"
+
+    def __init__(self, channel, started_by: int) -> None:
+        super().__init__(channel, started_by)
+        self.bj = ""                 # "" -> "bet" -> "deal" -> "play" -> "dealer" -> "done"
+        self.dealer: list = []
+        self.shoe: list = []
+        self.dirty = False
+        self.empty_rounds = 0
+        self.stop_early = False
+        self._credited = False
+
+    @property
+    def total_rounds(self) -> int:
+        return GAMBLIN_BJ_ROUNDS
+
+    def _lobby_embed(self, end_ts: int) -> discord.Embed:
+        return discord.Embed(
+            title="🃏 BLACKJACK is starting!",
+            description=(
+                "**[ `A♠` | `K♥` ]**\n"
+                f"Press **Join** to play with your Milo points. Starts <t:{end_ts}:R>.\n\n"
+                f"• {GAMBLIN_BJ_ROUNDS} rounds vs the dealer · bets {GAMBLIN_MIN_BET}–{GAMBLIN_MAX_BET} pts\n"
+                "• **Hit / Stand / Double** — blackjack pays **3:2**, dealer stands on 17\n"
+                "• Your winnings count towards the **leaderboard**\n"
+                "• Everything is buttons — no typing needed\n"
+                "• `/slots` and `/ask` are paused until it's over"
+            ),
+            color=discord.Color.dark_green(),
+        )
+
+    # ---- drawing the table ----------------------------------------------------
+    def _badge(self, p: BJPlayer) -> str:
+        return {"": "🤔 thinking…", "stand": "✋ stand", "bust": "💥 bust", "bj": "🂡 BLACKJACK"}[p.status]
+
+    def _table_embed(self, status: str, *, reveal: bool = False, results: dict | None = None) -> discord.Embed:
+        e = discord.Embed(
+            title=f"🃏 Blackjack — Round {self.round}/{GAMBLIN_BJ_ROUNDS}", color=discord.Color.dark_green()
+        )
+        lines = [status, ""]
+        if self.dealer:
+            if reveal:
+                lines.append(f"🎩 **Dealer:** {_bj_fmt(self.dealer)} = **{_bj_total(self.dealer)}**")
+            else:
+                lines.append(f"🎩 **Dealer:** {_bj_fmt(self.dealer, hide_second=True)}")
+            lines.append("")
+        for p in self.players.values():
+            if not p.bet:
+                continue
+            tag = f" ⏫" if p.doubled else ""
+            line = f"<@{p.uid}> {_bj_fmt(p.cards)} = **{_bj_total(p.cards)}** · bet {p.bet:,}{tag} · {self._badge(p)}"
+            if results and p.uid in results:
+                line += f"  →  {results[p.uid]}"
+            lines.append(line)
+        e.description = "\n".join(lines)[:4000]
+        e.set_footer(text=f"{len(self.players)} players · bets {GAMBLIN_MIN_BET}–{GAMBLIN_MAX_BET} pts · blackjack pays 3:2")
+        return e
+
+    # ---- one round --------------------------------------------------------------
+    async def _play_round(self, r: int) -> None:
+        self.round = r
+        self.phase = "betting"
+        self.bj = "bet"
+        self.dealer, self.shoe, self.dirty = [], _bj_shoe(), False
+        for p in self.players.values():
+            p.reset_round()
+
+        secs = GAMBLIN_BJ_BET_SECONDS
+        self.deadline = time.time() + secs
+        embed = discord.Embed(
+            title=f"🃏 Blackjack — Round {r}/{GAMBLIN_BJ_ROUNDS}",
+            description=(
+                f"💰 **Place your bets!** Closing <t:{int(self.deadline)}:R>\n"
+                f"Press **Place bet** — bets {GAMBLIN_MIN_BET}–{GAMBLIN_MAX_BET} pts. "
+                "New players can sit down any round."
+            ),
+            color=discord.Color.dark_green(),
+        )
+        self.msg = await self._send(embed=embed, view=_gview(_gb("💰 Place bet", "bj:bet", "green")))
+        if self.msg is None:
+            raise RuntimeError("couldn't post the round message")
+        self.window_open = True
+        await asyncio.sleep(secs)
+        self.window_open = False                    # sync from here: no late bets
+
+        bettors = [p for p in self.players.values() if p.bet > 0]
+        if not bettors:
+            self.empty_rounds += 1
+            self.bj = "done"
+            note = "Nobody bet this round."
+            if self.empty_rounds >= 2:
+                self.stop_early = True
+                note += " Two quiet rounds in a row, so the table is closing."
+            await self._edit(self.msg, embed=self._table_embed(note), view=None)
+            return
+        self.empty_rounds = 0
+
+        # deal
+        self.bj = "deal"
+        for p in bettors:
+            p.cards = [self.shoe.pop(), self.shoe.pop()]
+            if _bj_is_natural(p.cards):
+                p.status = "bj"
+        self.dealer = [self.shoe.pop(), self.shoe.pop()]
+        dealer_bj = _bj_is_natural(self.dealer)
+
+        # player turns
+        if not dealer_bj and any(not p.status for p in bettors):
+            self.bj = "play"
+            self.deadline = time.time() + GAMBLIN_BJ_TURN_SECONDS
+            play_view = _gview(_gb("🃏 My hand", "bj:hand", "blue"))
+            status = f"🃏 **Your move!** Tap **My hand** to Hit / Stand / Double. Auto-stand <t:{int(self.deadline)}:R>"
+            await self._edit(self.msg, embed=self._table_embed(status), view=play_view)
+            last = time.time()
+            while time.time() < self.deadline and any(not p.status for p in bettors):
+                await asyncio.sleep(0.5)
+                if self.dirty and time.time() - last >= 3:
+                    self.dirty, last = False, time.time()
+                    await self._edit(self.msg, embed=self._table_embed(status), view=play_view)
+        self.bj = "dealer"                           # sync: no more actions
+        for p in bettors:
+            if not p.status:
+                p.status = "stand"
+
+        # dealer
+        await self._edit(self.msg, embed=self._table_embed("🎩 **Dealer reveals…**", reveal=True), view=None)
+        await asyncio.sleep(1.5)
+        if not dealer_bj and any(p.status == "stand" for p in bettors):
+            while _bj_total(self.dealer) < 17:
+                self.dealer.append(self.shoe.pop())
+                await self._edit(self.msg, embed=self._table_embed("🎩 **Dealer draws…**", reveal=True), view=None)
+                await asyncio.sleep(1.5)
+
+        # settle
+        dt = _bj_total(self.dealer)
+        results: dict[int, str] = {}
+        for p in bettors:
+            pt, bet = _bj_total(p.cards), p.bet
+            if p.status == "bust":
+                payout = 0
+            elif p.status == "bj" and not dealer_bj:
+                payout = bet + bet * 3 // 2
+            elif dealer_bj:
+                payout = bet if p.status == "bj" else 0
+            elif dt > 21 or pt > dt:
+                payout = bet * 2
+            elif pt == dt:
+                payout = bet
+            else:
+                payout = 0
+            profit = self._settle(p, bet, payout)
+            results[p.uid] = f"✅ **+{profit:,}**" if profit > 0 else ("🤝 push" if profit == 0 else f"❌ **{profit:,}**")
+        self.bj = "done"
+        verdict = "🂡 **Dealer has blackjack!**" if dealer_bj else (f"🎩 Dealer busts with {dt}!" if dt > 21 else f"🎩 Dealer stands on {dt}.")
+        await self._edit(self.msg, embed=self._table_embed(f"{verdict}\n**Round over!**", reveal=True, results=results), view=None)
+
+    async def _finish(self) -> None:
+        self.phase = "ending"
+        ranked = sorted(self.players.values(), key=lambda q: (-q.net, q.uid))
+        medals = ["🥇", "🥈", "🥉"]
+        lines = [
+            f"{medals[i] if i < 3 else f'`#{i + 1}`'} <@{p.uid}> — **{p.net:+,}** (balance {POINTS.points(p.uid):,})"
+            + (f" · 🏆 +{p.net:,} to leaderboard" if p.net > 0 else "")
+            for i, p in enumerate(ranked)
+        ]
+        embed = discord.Embed(
+            title="🃏 Blackjack is over!",
+            description="\n".join(lines)[:4000] + "\n\n💾 Saving everyone's points… `/slots` and `/ask` are back!",
+            color=discord.Color.dark_green(),
+        )
+        await self._send(embed=embed)
+
+    def _on_end(self) -> None:
+        """Runs once when the session ends (normally OR stopped early): positive
+        session profit counts towards the all-time leaderboard."""
+        if self._credited:
+            return
+        self._credited = True
+        for p in self.players.values():
+            if p.net > 0:
+                POINTS.add_earned(p.uid, p.net)
+
+
+# ---- button handling (raw on_interaction -> here) -------------------------------------
+async def _bj_stake_panel(interaction, p: BJPlayer) -> None:
+    avail = _g_avail(p)
+    cap = min(avail, GAMBLIN_MAX_BET)
+    if cap < GAMBLIN_MIN_BET:
+        await _gpanel(interaction, f"You need at least {GAMBLIN_MIN_BET} free points to bet (you have {avail:,}).")
+        return
+    seen: set[int] = set()
+    buttons = []
+    for pct in (5, 10, 25):
+        amt = min(cap, max(GAMBLIN_MIN_BET, avail * pct // 100))
+        if amt not in seen:
+            seen.add(amt)
+            buttons.append(_gb(f"{pct}% · {amt}", f"bj:conf:{amt}", "grey"))
+    if cap not in seen:
+        label = "All-in" if cap == avail else "Max bet"
+        buttons.append(_gb(f"{label} · {cap}", f"bj:conf:{cap}", "red"))
+    buttons.append(_gb("✏️ Custom", "bj:cust", "blue"))
+    text = (
+        f"🃏 **How much do you want to bet this round?**\n"
+        f"You have **{avail:,}** pts free (max bet {GAMBLIN_MAX_BET}). Blackjack pays 3:2, win pays 1:1."
+    )
+    await _gpanel(interaction, text, _gview(*buttons))
+
+
+async def _bj_confirm_panel(interaction, amt: int) -> None:
+    text = f"Sit down with **{amt:,}** pts?\n⚠️ Once locked, it can't be changed (you can still Double later if you have the points)."
+    await _gpanel(interaction, text, _gview(
+        _gb(f"🔒 Lock it in ({amt})", f"bj:lock:{amt}", "green"),
+        _gb("← Back", "bj:bet", "grey"),
+    ))
+
+
+def _bj_bet_error(g: "BlackjackSession", p: BJPlayer) -> str | None:
+    if g.bj != "bet" or not g.window_open:
+        return "⏳ Bets are closed right now — wait for the next round."
+    if p.bet:
+        return f"🔒 You already bet {p.bet:,} this round."
+    return None
+
+
+async def _bj_hand_panel(interaction, g: "BlackjackSession", p: BJPlayer, note: str = "") -> None:
+    total = _bj_total(p.cards)
+    lines = []
+    if note:
+        lines += [note, ""]
+    lines.append(f"🎩 Dealer shows: {_bj_fmt(g.dealer, hide_second=True)}" if g.bj == "play" else f"🎩 Dealer: {_bj_fmt(g.dealer)}")
+    lines.append(f"🃏 Your hand: {_bj_fmt(p.cards)} = **{total}**")
+    lines.append(f"💰 Bet: {p.bet:,}" + (" (doubled)" if p.doubled else ""))
+    view = None
+    if p.status == "":
+        buttons = [_gb("🃏 Hit", "bj:hit", "green"), _gb("✋ Stand", "bj:stand", "grey")]
+        if len(p.cards) == 2 and not p.doubled and _g_avail(p) >= p.bet:
+            buttons.append(_gb(f"⏫ Double ({p.bet})", "bj:dbl", "red"))
+        view = _gview(*buttons)
+    else:
+        lines.append({"stand": "✋ You're standing — wait for the dealer.", "bust": "💥 Bust!", "bj": "🂡 Blackjack! Waiting for the dealer."}[p.status])
+    await _gpanel(interaction, "\n".join(lines), view)
+
+
+class BJStakeModal(discord.ui.Modal):
+    """Popup for typing your own blackjack bet."""
+
+    def __init__(self, cap: int) -> None:
+        super().__init__(title="Custom bet", timeout=300)
+        self.amount = discord.ui.TextInput(
+            label=f"Points ({GAMBLIN_MIN_BET}–{cap})", placeholder=str(cap), min_length=1, max_length=7,
+        )
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        g = GAMBLIN
+        p = g.players.get(interaction.user.id) if isinstance(g, BlackjackSession) else None
+        if p is None:
+            await interaction.response.send_message("🃏 That Blackjack table is closed.", ephemeral=True)
+            return
+        err = _bj_bet_error(g, p)
+        raw = str(self.amount.value).strip().replace(",", "")
+        if err is None and not raw.isdigit():
+            err = "Numbers only please 🐾"
+        if err is None:
+            err = _gstake_error(p, int(raw))
+        if err is not None:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        await _bj_confirm_panel(interaction, int(raw))
+
+
+async def handle_bj_click(interaction: discord.Interaction, custom_id: str) -> None:
+    async def say(text: str) -> None:
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+
+    if not is_allowed_guild(interaction.guild_id):
+        await say("This bot is not configured for this server.")
+        return
+    g = GAMBLIN
+    if not isinstance(g, BlackjackSession):
+        await say("🃏 That Blackjack table is closed — catch the next one! 🐾")
+        return
+    parts = custom_id.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    uid = interaction.user.id
+
+    def try_join() -> str | None:
+        """Add the clicker to the table. Returns an error text, or None on success."""
+        if uid in g.players:
+            return None
+        if len(g.players) >= GAMBLIN_MAX_PLAYERS:
+            return "🃏 The table is full!"
+        if POINTS.points(uid) < GAMBLIN_MIN_BET:
+            return f"You need at least {GAMBLIN_MIN_BET} points to play (you have {POINTS.points(uid)}). Win some in `/slots`!"
+        g.players[uid] = BJPlayer(uid)
+        return None
+
+    if action == "join":
+        if g.phase != "lobby":
+            await say("🃏 Already started — tap **Place bet** on the round message to sit down!")
+        elif uid in g.players:
+            await say("You're already in! 🃏")
+        else:
+            err = try_join()
+            if err:
+                await say(err)
+            else:
+                await interaction.response.send_message(
+                    f"🃏 <@{uid}> is participating! ({len(g.players)} in)",
+                    allowed_mentions=discord.AllowedMentions(users=True),
+                )
+        return
+
+    if action == "bet":
+        if g.bj != "bet" or not g.window_open:
+            await say("⏳ Bets are closed right now — wait for the next round.")
+            return
+        err = try_join()
+        if err:
+            await say(err)
+            return
+        p = g.players[uid]
+        err = _bj_bet_error(g, p)
+        if err:
+            await say(err)
+            return
+        await _bj_stake_panel(interaction, p)
+        return
+
+    p = g.players.get(uid)
+    if p is None:
+        await say("🃏 You're not at this table — tap **Place bet** during the betting window to sit down!")
+        return
+
+    if action in ("conf", "lock", "cust"):
+        err = _bj_bet_error(g, p)
+        if err:
+            await say(err)
+            return
+        if action == "cust":
+            cap = min(_g_avail(p), GAMBLIN_MAX_BET)
+            if cap < GAMBLIN_MIN_BET:
+                await say(f"You need at least {GAMBLIN_MIN_BET} free points to bet.")
+                return
+            await interaction.response.send_modal(BJStakeModal(cap))
+            return
+        if len(parts) != 3 or not parts[2].isdigit():
+            await say("That button looks broken — tap **Place bet** again.")
+            return
+        amt = int(parts[2])
+        err = _gstake_error(p, amt)
+        if err:
+            await say(err)
+            return
+        if action == "conf":
+            await _bj_confirm_panel(interaction, amt)
+            return
+        p.bet = amt                                   # lock: instant memory work, no awaits
+        p.pending += amt
+        await _gpanel(interaction, f"🔒 **Locked:** {amt:,} pts. Cards are dealt when betting closes — good luck! 🍀")
+        return
+
+    if action == "hand":
+        if not p.bet:
+            await say("🃏 You didn't bet this round — sit down next round!")
+            return
+        if g.bj not in ("play", "dealer", "done"):
+            await say("⏳ Cards haven't been dealt yet.")
+            return
+        await _bj_hand_panel(interaction, g, p)
+        return
+
+    if action in ("hit", "stand", "dbl"):
+        if g.bj != "play" or not p.bet or p.status:
+            await say("⏳ That hand is already finished.")
+            return
+        note = ""
+        if action == "stand":
+            p.status = "stand"
+            note = "✋ You stand."
+        elif action == "hit":
+            p.cards.append(g.shoe.pop())
+            total = _bj_total(p.cards)
+            if total > 21:
+                p.status, note = "bust", f"💥 You drew {_bj_fmt(p.cards[-1:])} — bust!"
+            elif total == 21:
+                p.status, note = "stand", "🎯 21! You stand automatically."
+            else:
+                note = f"You drew {_bj_fmt(p.cards[-1:])}."
+        else:  # double down
+            if len(p.cards) != 2 or p.doubled:
+                await say("⏫ You can only double on your first two cards.")
+                return
+            if _g_avail(p) < p.bet:
+                await say(f"⏫ You need {p.bet:,} more free points to double.")
+                return
+            extra = p.bet
+            p.pending += extra
+            p.bet += extra
+            p.doubled = True
+            p.cards.append(g.shoe.pop())
+            total = _bj_total(p.cards)
+            p.status = "bust" if total > 21 else "stand"
+            note = f"⏫ Doubled! You drew {_bj_fmt(p.cards[-1:])}" + (" — bust!" if total > 21 else ".")
+        g.dirty = True
+        await _bj_hand_panel(interaction, g, p, note)
+        return
+
+    await say("That button looks broken — tap **My hand** again.")
 
 
 
@@ -4839,8 +5375,8 @@ async def on_message(message: discord.Message):
         return
 
     _first_word = message.content.strip().lower().split(None, 1)[0] if message.content.strip() else ""
-    if _first_word == "?gamblin":
-        await _handle_gamblin_command(message)
+    if _first_word in ("?gamblin", "?gamblinbj"):
+        await _handle_gamblin_command(message, bj=(_first_word == "?gamblinbj"))
         return
     if _first_word in _MGR_WORDS:
         if await _handle_manager_command(message, _first_word) is not False:
@@ -4977,6 +5513,8 @@ async def on_interaction(interaction: discord.Interaction):
             await _handle_think_click(interaction, custom_id)
         elif custom_id.startswith(GAMBLIN_PREFIX):
             await handle_gamblin_click(interaction, custom_id)
+        elif custom_id.startswith(BJ_PREFIX):
+            await handle_bj_click(interaction, custom_id)
         # else: not a button we recognize -- ignore silently.
 
     except Exception:

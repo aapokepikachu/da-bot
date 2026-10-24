@@ -8,7 +8,7 @@ Features:
 - A persistent **✔️ Interested** button on `/join` messages — survives bot restarts, **no database required**
 - A cat-themed welcome message when new members join
 - Self-assign roles (button-based, no database), posted via the hidden `?rolemenu` command
-- Hidden text commands — `?send` (Manager role **or** Milo role), `?rolemenu`, `?updateDB`, `?gamblin` and the Manager toolbox (`?give`, `?set`, `?undo`, `?check`, `?balances`, `?resetspins`, `?snapshot`, `?mhelp`). All Manager role only, silent to everyone else; see Sections 16 and 17. — the **only** `?`-prefixed commands in the whole bot. None shows up in Discord's `/` picker and none is listed in `/help`; they're documented here in the README only.
+- Hidden text commands — `?send` (Manager role **or** Milo role), `?rolemenu`, `?updateDB`, `?gamblin`, `?gamblinbj` and the Manager toolbox (`?give`, `?set`, `?undo`, `?check`, `?balances`, `?resetspins`, `?snapshot`, `?mhelp`). All Manager role only, silent to everyone else; see Sections 16 and 17. — the **only** `?`-prefixed commands in the whole bot. None shows up in Discord's `/` picker and none is listed in `/help`; they're documented here in the README only.
 - Several commands call free, keyless public APIs (cat facts/photos, quotes, dictionary, weather, translation, reaction gifs) — every call has a graceful fallback message if the API is briefly down or slow
 - Runs as a **Render Free Web Service** (Discord Gateway + a tiny HTTP health server in one process)
 - Secrets stay in environment variables, never in code
@@ -116,11 +116,11 @@ When someone runs `/join`, the bot attaches an **✔️ Interested** button (gre
 
 ---
 
-## 6. If the VBL/Minecraft role isn't notifying anyone
+## 6. If a /join game role isn't notifying anyone
 
 The bot's code already sends the role mention with `allowed_mentions=discord.AllowedMentions(roles=True, ...)`, so it isn't being suppressed on the code side. If the role still shows up as a mention but doesn't actually ping/notify members, it's almost always one of these **server-side settings**, not a code problem:
 
-1. **The role isn't mentionable.** Go to **Server Settings → Roles → (the VBL or Minecraft role)**, and toggle **"Allow anyone to @mention this role"** ON.
+1. **The role isn't mentionable.** Go to **Server Settings → Roles → (the role you set for that game in `JOIN_GAMES`)**, and toggle **"Allow anyone to @mention this role"** ON.
 2. **Or, give Milo's own role the permission to bypass that.** Go to **Server Settings → Roles → Milo's role**, and enable **"Mention @everyone, @here, and All Roles"**.
 
 Either fixes it — you don't need both. Option 2 is usually cleaner since it doesn't open the role up to being pinged by everyone else too.
@@ -183,8 +183,7 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 
 | Command | Description |
 |---|---|
-| `/join game:VBL` | Posts a VBL looking-for-players message with an Interested button, and notifies the VBL role. |
-| `/join game:Minecraft` | Same, for Minecraft. |
+| `/join game:<name>` | Posts a looking-for-players message with a green ✔️ Interested button and pings that game's role. The games, their roles and their wording come from the `JOIN_GAMES` env var (Section 18). Out of the box it's **VBL** and **Minecraft**, exactly as before. Add `message:<text>` for a custom note. |
 | `/join game:<choice> message:your text` | Same as above, with an optional custom message appended. Rate-limited to once per 30s per user. |
 | `/serverinfo` | Shows info about the current server. |
 | `/userinfo user:<member>` | Shows info about a member (defaults to yourself). |
@@ -271,7 +270,8 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `?send <message>` | **Hidden.** Manager role or Milo role. Posts `<message>` as Milo. Not in `/help`, not a slash command. |
 | `?rolemenu` | **Hidden.** Manager-role-only. Posts the self-assign roles menu. Not in `/help`, not a slash command. |
 | `?updateDB` | **Hidden.** Manager-role-only. Saves all points to Upstash now and confirms. Not in `/help`, not a slash command. |
-| `?gamblin` / `?gamblin stop` | **Hidden.** Manager-role-only. Starts / ends a Gamblin betting event in `GAMBLIN_CHANNEL_ID` (Section 16). |
+| `?gamblin` / `?gamblin stop` | **Hidden.** Manager-role-only. Starts / ends a slot-machine Gamblin event in `GAMBLIN_CHANNEL_ID` (Section 16). |
+| `?gamblinbj` / `?gamblinbj stop` | **Hidden.** Manager-role-only. Starts / ends a Blackjack Gamblin event in the same channel (Section 19). |
 
 ---
 
@@ -287,6 +287,8 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `SLOTS_CHANNEL_IDS` | Optional | Channel ID(s) where `/slots` is allowed, comma-separated. Anywhere else `/slots` points people to the right channel and spends nothing. Threads inside an allowed channel count. Blank = every channel. |
 | `SLOTS_FREE_SPINS` / `SLOTS_PAID_SPINS` / `SLOTS_SPIN_COST` | Optional | Free spins per person per day (default `25`), bonus spins per day (`10`), and points per bonus spin (`5`). |
 | `LOG_CHANNEL_ID` | Optional | A private staff channel where Milo logs manager actions, Gamblin results, save problems, online/offline notices, and everyone's points at the nightly reset. See Section 17. |
+| `JOIN_GAMES` | Optional | The games `/join` offers: `ROLE_ID\|Name\|Emoji\|Call to action,...` (emoji and call-to-action optional). Unset = VBL + Minecraft as before. See Section 18. |
+| `GAMBLIN_BJ_ROUNDS` / `GAMBLIN_BJ_BET_SECONDS` / `GAMBLIN_BJ_TURN_SECONDS` | Optional | Blackjack: rounds (default `5`), betting window (`30`), and time to play your hand (`40`). Uses the same channel, bet limits and table size as Gamblin. |
 | `GAMBLIN_CHANNEL_ID` | Needed for Gamblin | The channel Gamblin runs in. Without it `?gamblin` just tells the manager to set it. See Section 16. |
 | `GAMBLIN_LOBBY_SECONDS` / `GAMBLIN_ROUNDS` | Optional | Join window (default `90`) and rounds per event (default `3`). |
 | `GAMBLIN_BET_SECONDS` / `GAMBLIN_REEL_SECONDS` | Optional | Betting window before reel 1 (default `40`) and before reels 2 and 3 (default `25`). |
@@ -316,9 +318,9 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 ## 11. Testing checklist
 
 - [ ] `/aboutme` replies with an embed: Milo's intro, a bullet list of what it does, and a clickable "AAPoke" link.
-- [ ] `/join game:VBL` posts the VBL message with the correct role mention (and members of that role actually get notified) plus a green ✔️ Interested button.
+- [ ] `/join game:<a game>` posts the message with the correct role mention (and members of that role actually get notified) plus a green ✔️ Interested button.
 - [ ] `/join game:VBL message:Need 2 more players` appends the custom message on its own line.
-- [ ] `/join game:Minecraft` posts the Minecraft message with the correct role mention and notification.
+- [ ] `/join game:<another game>` posts that game's message with the correct role mention and notification.
 - [ ] Using `/join` twice within 30 seconds gives a "please wait" reply the second time.
 - [ ] `/hi` gives a cat-themed reply with the Milo emoji.
 - [ ] `/8ball question:Will it rain tomorrow?` gives a random classic 8-ball answer.
@@ -603,7 +605,7 @@ The Gamblin reels are weighted: 🍒 24% · 🍋 21% · 🍉 18% · 🍇 16% · 
 
 ### Points and saving
 - A stake is only *held* until its reel stops (it still shows in your balance, but you can't bet it twice). Then your real balance changes in memory.
-- Gamblin only moves **balances**. It never adds to "total earned", so the all-time leaderboard stays slots-only; gambling shows up in the **Richest right now** board.
+- The slot-machine Gamblin only moves **balances**. It never adds to "total earned", so the all-time leaderboard stays slots-only; it shows up in the **Richest right now** board. (Blackjack is different, see Section 19.)
 - When the event ends, Milo does **one batched save** to Upstash: about **1 command per player whose balance changed** (10 players ≈ 10 commands, a few % of 1 day's normal use). Nothing is written during the event.
 - If Milo crashes mid-event, Upstash still holds the pre-event balances, so at worst the event's results are lost, never half-applied. On a normal shutdown (SIGTERM) Milo stops Gamblin, never charges unresolved bets, and saves what already landed.
 
@@ -639,3 +641,46 @@ Make a private staff channel, give Milo **Send Messages + Embed Links** there, a
 - ⚠️ if saving to Upstash fails twice in a row (and ✅ when it works again)
 
 Cost: the log channel uses **0 Upstash commands** — it's all from memory.
+
+
+## 18. Choosing the /join games (`JOIN_GAMES`)
+
+`/join` used to be hard-wired to VBL and Minecraft. Now it reads the list from one env var, the same style as `SELF_ROLES`:
+
+```
+JOIN_GAMES=ROLE_ID|Name|Emoji|Call to action,ROLE_ID|Name|Emoji|Call to action
+```
+
+- **ROLE_ID** and **Name** are required. The name is what members see in the `/join` dropdown (and in `/help`).
+- **Emoji** (optional) appears before the ping, e.g. `🏐`. Custom emoji like `<:gg:123456789012345678>` work.
+- **Call to action** (optional) is the last line, default `Join now!`. Don't put commas in it.
+- Up to 25 games. Example: `JOIN_GAMES=1532265584069185597|VBL|🏐|Join the lobby now!,1536962762952146944|Minecraft||Join the Server now!,123456789012345678|Valorant|🎯|Queue up!`
+- **Leave it unset and nothing changes**: you still get VBL and Minecraft with the exact same messages.
+
+Only the list changed. The ping rules are the same as before (roles and users can be pinged, never `@everyone`), the 30-second cooldown is the same, and the ✔️ Interested button works the same way. After changing `JOIN_GAMES`, redeploy so Discord's dropdown refreshes. Each role still needs "Allow anyone to @mention this role" on (Section 6).
+
+
+## 19. Blackjack Gamblin (`?gamblinbj`)
+
+A Manager types **`?gamblinbj`** (or `?gamblinbj stop`). It runs in `GAMBLIN_CHANNEL_ID`, button-only, with the same channel setup as Section 16. It pauses exactly what `?gamblin` pauses (`/slots`, `/ask` + think buttons, `/grouptrivia`, autosave), and everything resumes when it ends or is stopped. Only one Gamblin of either kind runs at a time.
+
+### How a game runs
+1. **Lobby:** `@everyone` ping, Join button, countdown (same as Gamblin).
+2. **Rounds** (`GAMBLIN_BJ_ROUNDS`, default 5), each against the dealer:
+   - **Betting window** (30s): press **💰 Place bet**, pick a stake privately (5% / 10% / 25% / All-in or Max / ✏️ Custom popup), confirm, 🔒 lock. Late joiners can sit down any round.
+   - **Deal:** everyone's cards are public on the table message; the dealer shows one card.
+   - **Your move** (40s): press **🃏 My hand** for a private panel with **Hit**, **Stand** and **Double** (first two cards only). Idle players auto-stand. The round moves on as soon as everyone has finished.
+   - **Dealer** reveals and draws to 17, then every bet is settled and shown on the table.
+3. After the last round (or if nobody bets for two rounds in a row) you get the final standings.
+
+### Rules and payouts
+6 decks, fresh shoe every round. Dealer **stands on all 17s**. Win pays **1:1**, **blackjack pays 3:2** (rounded down), push returns your stake, bust loses. If the dealer has blackjack the round ends immediately (you can't double into it; your own blackjack pushes). **No split, insurance or surrender.** Bets use the same `GAMBLIN_MIN_BET` / `GAMBLIN_MAX_BET` as Gamblin. Doubling can go over the max bet (it just doubles your stake).
+
+### Leaderboard
+Your **positive session profit is added to your all-time "total earned"** when the session ends (even if it's stopped early). Losses never reduce "total earned", and a losing session adds nothing. It's counted per session on purpose, so winning and losing back and forth can't inflate the board.
+
+### Points and saving
+Same as Gamblin: stakes are held (not deducted) until the hand settles, nothing is written to Upstash during the game, and one batched save happens at the end (about 1 command per player whose balance or earned changed). A crash mid-game means Upstash still has the pre-game numbers. A redeploy stops the table cleanly and never charges unsettled hands.
+
+### Limits
+Sessions live in memory (a restart ends it). Points are virtual only.
