@@ -8,7 +8,7 @@ Features:
 - A persistent **✔️ Interested** button on `/join` messages — survives bot restarts, **no database required**
 - A cat-themed welcome message when new members join
 - Self-assign roles (button-based, no database), posted via the hidden `?rolemenu` command
-- Hidden text commands — `?send` (Manager role **or** Milo role), `?rolemenu`, `?updateDB`, `?gamblin`, `?gamblinbj` and the Manager toolbox (`?give`, `?set`, `?undo`, `?check`, `?balances`, `?resetspins`, `?snapshot`, `?mhelp`). All Manager role only, silent to everyone else; see Sections 16 and 17. — the **only** `?`-prefixed commands in the whole bot. None shows up in Discord's `/` picker and none is listed in `/help`; they're documented here in the README only.
+- Hidden text commands — `?send` (Manager role **or** Milo role), `?rolemenu`, `?updateDB`, `?gamblin` (slots, blackjack, duck race, roulette) and the Manager toolbox (`?give`, `?set`, `?undo`, `?check`, `?balances`, `?resetspins`, `?resetleaderboard`, `?snapshot`, `?mhelp`). All Manager role only, silent to everyone else; see Sections 16 and 17. — the **only** `?`-prefixed commands in the whole bot. None shows up in Discord's `/` picker and none is listed in `/help`; they're documented here in the README only.
 - Several commands call free, keyless public APIs (cat facts/photos, quotes, dictionary, weather, translation, reaction gifs) — every call has a graceful fallback message if the API is briefly down or slow
 - Runs as a **Render Free Web Service** (Discord Gateway + a tiny HTTP health server in one process)
 - Secrets stay in environment variables, never in code
@@ -270,8 +270,8 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `?send <message>` | **Hidden.** Manager role or Milo role. Posts `<message>` as Milo. Not in `/help`, not a slash command. |
 | `?rolemenu` | **Hidden.** Manager-role-only. Posts the self-assign roles menu. Not in `/help`, not a slash command. |
 | `?updateDB` | **Hidden.** Manager-role-only. Saves all points to Upstash now and confirms. Not in `/help`, not a slash command. |
-| `?gamblin` / `?gamblin stop` | **Hidden.** Manager-role-only. Starts / ends a slot-machine Gamblin event in `GAMBLIN_CHANNEL_ID` (Section 16). |
-| `?gamblinbj` / `?gamblinbj stop` | **Hidden.** Manager-role-only. Starts / ends a Blackjack Gamblin event in the same channel (Section 19). |
+| `?gamblin` / `?gamblin stop` | **Hidden.** Manager-role-only. Shows a button picker (Slots / Blackjack / Duck Race / Roulette), pings everyone and starts the one you choose in `GAMBLIN_CHANNEL_ID`. `?gamblin stop` ends whichever game is running (Section 16). |
+| `?resetleaderboard` | **Hidden.** Manager-role-only. Sets the all-time leaderboard to everyone's current points, after a confirm button (Section 17). |
 
 ---
 
@@ -288,6 +288,8 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `SLOTS_FREE_SPINS` / `SLOTS_PAID_SPINS` / `SLOTS_SPIN_COST` | Optional | Free spins per person per day (default `25`), bonus spins per day (`10`), and points per bonus spin (`5`). |
 | `LOG_CHANNEL_ID` | Optional | A private staff channel where Milo logs manager actions, Gamblin results, save problems, online/offline notices, and everyone's points at the nightly reset. See Section 17. |
 | `JOIN_GAMES` | Optional | The games `/join` offers: `ROLE_ID\|Name\|Emoji\|Call to action,...` (emoji and call-to-action optional). Unset = VBL + Minecraft as before. See Section 18. |
+| `GAMBLIN_DUCK_ROUNDS` / `GAMBLIN_DUCK_BET_SECONDS` | Optional | Duck Race: races (default `3`) and betting window (`30`). |
+| `GAMBLIN_RL_ROUNDS` / `GAMBLIN_RL_BET_SECONDS` | Optional | Roulette: spins (default `4`) and betting window (`40`). |
 | `GAMBLIN_BJ_ROUNDS` / `GAMBLIN_BJ_BET_SECONDS` / `GAMBLIN_BJ_TURN_SECONDS` | Optional | Blackjack: rounds (default `5`), betting window (`30`), and time to play your hand (`40`). Uses the same channel, bet limits and table size as Gamblin. |
 | `GAMBLIN_CHANNEL_ID` | Needed for Gamblin | The channel Gamblin runs in. Without it `?gamblin` just tells the manager to set it. See Section 16. |
 | `GAMBLIN_LOBBY_SECONDS` / `GAMBLIN_ROUNDS` | Optional | Join window (default `90`) and rounds per event (default `3`). |
@@ -583,7 +585,11 @@ A successful 🧠/🔮 press costs about 4.4 commands. Each active member costs 
 
 ## 16. Gamblin (button-only betting event)
 
-A Manager types **`?gamblin`** (from anywhere). Milo runs the whole event in `GAMBLIN_CHANNEL_ID`. **`?gamblin stop`** ends it early. Both are silent to everyone without the Manager role.
+A Manager types **`?gamblin`** (from anywhere). Milo shows a short-lived button picker: **🎰 Slots · 🃏 Blackjack · 🦆 Duck Race · 🎡 Roulette**. Only the manager who typed it can press. Pick one and Milo pings @everyone and starts it in `GAMBLIN_CHANNEL_ID`. **`?gamblin stop`** ends whichever game is running. Shortcuts skip the picker: `?gamblin slots`, `?gamblin bj`, `?gamblin duck`, `?gamblin roulette`. All of it is silent to everyone without the Manager role. (`?gamblinbj` no longer exists; it's now just `?gamblin bj`.)
+
+All four games share the same rules of the house: button-only betting in private panels, stakes held until each result lands, `/slots` + `/ask` + `/grouptrivia` + autosave paused while a game runs (back automatically when it ends or is stopped), one game at a time, and one batched save to Upstash at the end. Sections 16 (Slots), 19 (Blackjack), 20 (Duck Race) and 21 (Roulette) describe each game.
+
+**Leaderboard (all four games):** a player's *positive* session profit is added to their all-time "total earned" when the game ends (even if it's stopped early). Losses never reduce it, and a losing session adds nothing. It's counted per session so winning and losing back and forth can't inflate the board.
 
 ### Channel setup (so nobody can type)
 In the Gamblin channel: deny **Send Messages** (and Create Threads) for `@everyone`, keep **View Channel**, **Read Message History** and **Use Application Commands**. Give **Milo** Send Messages, Embed Links, Manage Messages and **Mention Everyone** (needed for the `@everyone` ping). Buttons and the custom-bet popup still work for members; they just can't chat.
@@ -605,7 +611,7 @@ The Gamblin reels are weighted: 🍒 24% · 🍋 21% · 🍉 18% · 🍇 16% · 
 
 ### Points and saving
 - A stake is only *held* until its reel stops (it still shows in your balance, but you can't bet it twice). Then your real balance changes in memory.
-- The slot-machine Gamblin only moves **balances**. It never adds to "total earned", so the all-time leaderboard stays slots-only; it shows up in the **Richest right now** board. (Blackjack is different, see Section 19.)
+- Balances move as each bet lands. Your positive session profit also counts towards the all-time leaderboard (see the Leaderboard note in the intro of this section); everything shows on **Richest right now**.
 - When the event ends, Milo does **one batched save** to Upstash: about **1 command per player whose balance changed** (10 players ≈ 10 commands, a few % of 1 day's normal use). Nothing is written during the event.
 - If Milo crashes mid-event, Upstash still holds the pre-event balances, so at worst the event's results are lost, never half-applied. On a normal shutdown (SIGTERM) Milo stops Gamblin, never charges unresolved bets, and saves what already landed.
 
@@ -626,6 +632,7 @@ All of these are **hidden** `?` commands: Manager role only, silent to everyone 
 | `?undo` | Reverses the most recent `?give` / `?set`. Run it again to step back further. Remembers the last 25 changes since Milo started. |
 | `?check @user` | Balance, total earned, leaderboard rank, spins used today, and whether they have unsaved changes. |
 | `?balances` | Everyone's current points, richest first. Shows in the channel and disappears after 2 minutes. |
+| `?resetleaderboard` | Sets everyone's all-time **total earned** to their **current points** (balances don't change). Milo shows what will happen (how many people change, who will be on the board afterwards, the current top 5) with **Yes, reset it / Cancel** buttons that only you can press. After you confirm it saves to the database immediately and writes the old top 10 to the log channel. It can't be undone, and it's blocked while a Gamblin game is running. `?resetleaderbord` (typo) works too. |
 | `?resetspins @user` | Gives someone today's free + bonus spins back (and clears their cooldown/pity). For when something glitched. |
 | `?snapshot` | Posts everyone's points to the log channel right now. |
 | `?updateDB` · `?gamblin` · `?rolemenu` · `?send` | Existing commands, unchanged. |
@@ -660,9 +667,9 @@ JOIN_GAMES=ROLE_ID|Name|Emoji|Call to action,ROLE_ID|Name|Emoji|Call to action
 Only the list changed. The ping rules are the same as before (roles and users can be pinged, never `@everyone`), the 30-second cooldown is the same, and the ✔️ Interested button works the same way. After changing `JOIN_GAMES`, redeploy so Discord's dropdown refreshes. Each role still needs "Allow anyone to @mention this role" on (Section 6).
 
 
-## 19. Blackjack Gamblin (`?gamblinbj`)
+## 19. Blackjack Gamblin 🃏
 
-A Manager types **`?gamblinbj`** (or `?gamblinbj stop`). It runs in `GAMBLIN_CHANNEL_ID`, button-only, with the same channel setup as Section 16. It pauses exactly what `?gamblin` pauses (`/slots`, `/ask` + think buttons, `/grouptrivia`, autosave), and everything resumes when it ends or is stopped. Only one Gamblin of either kind runs at a time.
+Start it with **`?gamblin`** and pick **🃏 Blackjack** (or type `?gamblin bj`). `?gamblin stop` ends it. It runs in `GAMBLIN_CHANNEL_ID`, button-only, with the same channel setup as Section 16, and pauses exactly what every Gamblin game pauses. Only one game runs at a time.
 
 ### How a game runs
 1. **Lobby:** `@everyone` ping, Join button, countdown (same as Gamblin).
@@ -677,10 +684,47 @@ A Manager types **`?gamblinbj`** (or `?gamblinbj stop`). It runs in `GAMBLIN_CHA
 6 decks, fresh shoe every round. Dealer **stands on all 17s**. Win pays **1:1**, **blackjack pays 3:2** (rounded down), push returns your stake, bust loses. If the dealer has blackjack the round ends immediately (you can't double into it; your own blackjack pushes). **No split, insurance or surrender.** Bets use the same `GAMBLIN_MIN_BET` / `GAMBLIN_MAX_BET` as Gamblin. Doubling can go over the max bet (it just doubles your stake).
 
 ### Leaderboard
-Your **positive session profit is added to your all-time "total earned"** when the session ends (even if it's stopped early). Losses never reduce "total earned", and a losing session adds nothing. It's counted per session on purpose, so winning and losing back and forth can't inflate the board.
+Your **positive session profit is added to your all-time "total earned"** when the game ends (even if it's stopped early). Same rule as every Gamblin game (see Section 16).
 
 ### Points and saving
 Same as Gamblin: stakes are held (not deducted) until the hand settles, nothing is written to Upstash during the game, and one batched save happens at the end (about 1 command per player whose balance or earned changed). A crash mid-game means Upstash still has the pre-game numbers. A redeploy stops the table cleanly and never charges unsettled hands.
 
 ### Limits
 Sessions live in memory (a restart ends it). Points are virtual only.
+
+
+## 20. Duck Race 🦆
+
+Pick **🦆 Duck Race** in `?gamblin`. **3 races** by default (`GAMBLIN_DUCK_ROUNDS`).
+
+**Each race:**
+1. **Betting (30s):** Milo posts the line-up of six ducks 🟥 Quackers · 🟦 Sir Waddles · 🟩 Puddles · 🟨 Drake · 🟪 Beaky · 🟧 Feathers with each one's payout and win chance. The odds are **shuffled between ducks every race**, so yesterday's favourite isn't always today's. Press **💰 Place bet**, pick a duck, pick a stake (5% / 10% / 25% / All-in or Max / ✏️ Custom popup), confirm, 🔒 lock. **One bet per race.** Newcomers can join any race.
+2. **The race:** the message animates with ducks waddling across the track to the 🏁 (about 15 seconds).
+3. **Results:** podium, then every bet with its win or loss.
+
+**The odds:** win chances are 28% / 22% / 18% / 14% / 10% / 8% (shuffled across the ducks). Payout is about `0.92 ÷ chance`, shown in the line-up (roughly x3.2 up to x11.5). The race is drawn so each duck's chance of winning is *exactly* the stated chance (I tested it with 60,000 simulated races). If nobody bets for two races in a row, the track closes early.
+
+**Settings:** `GAMBLIN_DUCK_ROUNDS`, `GAMBLIN_DUCK_BET_SECONDS`, plus the shared `GAMBLIN_MIN_BET` / `GAMBLIN_MAX_BET` / `GAMBLIN_MAX_PLAYERS`.
+
+
+## 21. Roulette 🎡
+
+Pick **🎡 Roulette** in `?gamblin`. **4 spins** by default (`GAMBLIN_RL_ROUNDS`). It's a real **European wheel**: numbers 0–36, one green 0.
+
+**Each spin:**
+1. **Betting (40s):** press **💰 Place bets**. You can place **up to 5 bets per spin**, one after another (the panel has an **➕ Add another bet** button).
+2. **Bet types and payouts:**
+
+| Bet | Wins on | Pays |
+|---|---|---|
+| 🔴 Red / ⚫ Black | red / black numbers | **x2** |
+| Odd / Even | odd / even numbers | **x2** |
+| 1–18 / 19–36 | low / high | **x2** |
+| 1st / 2nd / 3rd dozen | 1–12 / 13–24 / 25–36 | **x3** |
+| 🎯 Number | one exact number 0–36 (you type it in a popup) | **x36** |
+
+3. **Spin:** the wheel animates, the ball lands, and every bet is settled and shown. The last 10 numbers are shown on the table.
+
+**The odds are the real ones**, not tuned: every bet returns 36/37 = **97.3%** in the long run (the house edge is the green 0, and 0 loses all red/black/odd/even/low/high/dozen bets). I checked all 37 numbers for every bet type.
+
+**Settings:** `GAMBLIN_RL_ROUNDS`, `GAMBLIN_RL_BET_SECONDS`, plus the shared bet limits. The most you can have staked in one spin is limited by your free points (each bet is capped by `GAMBLIN_MAX_BET`, up to 5 bets).

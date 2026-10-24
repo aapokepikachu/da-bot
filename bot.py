@@ -2698,6 +2698,20 @@ class PointsManager:
             self.earned[uid] = self.earned.get(uid, 0) + payout
             self._p_earn[uid] = self._p_earn.get(uid, 0) + payout
 
+    def reset_earned_to_balance(self) -> int:
+        """?resetleaderboard: everyone's all-time 'earned' becomes their current
+        balance. Saved as ordinary deltas (ZINCRBY handles negatives). Returns how
+        many people changed."""
+        changed = 0
+        for uid in set(self.earned) | set(self.balance):
+            target = max(0, self.balance.get(uid, 0))
+            d = target - self.earned.get(uid, 0)
+            if d:
+                self.earned[uid] = target
+                self._p_earn[uid] = self._p_earn.get(uid, 0) + d
+                changed += 1
+        return changed
+
     def add_earned(self, uid: int, n: int) -> None:
         """Count winnings towards the all-time leaderboard (balance is untouched)."""
         if n > 0:
@@ -3705,7 +3719,7 @@ async def help_slash(interaction: discord.Interaction):
             "`/points` — your balance, rank and spins left\n"
             f"`/leaderboard` — top 10 all-time earners (earn {LEADERBOARD_MIN_POINTS:,} to join) + top 5 richest right now\n"
             f"Bonus spins ask for confirmation before spending points\n"
-            "🎲 Managers sometimes run **Gamblin** nights (slots & blackjack) — watch for the @everyone ping!"
+            "🎲 Managers sometimes run **Gamblin** nights (slots, blackjack, duck race & roulette) — watch for the @everyone ping!"
         ),
         inline=False,
     )
@@ -4028,7 +4042,14 @@ class GamblinSession:
         return GAMBLIN_ROUNDS
 
     def _on_end(self) -> None:
-        """Hook: runs once when a session ends (normally or early)."""
+        """Runs once when a session ends (normally OR stopped early): a player's
+        POSITIVE session profit counts towards the all-time leaderboard."""
+        if getattr(self, "_credited", False):
+            return
+        self._credited = True
+        for p in self.players.values():
+            if p.net > 0:
+                POINTS.add_earned(p.uid, p.net)
 
     def __init__(self, channel, started_by: int) -> None:
         self.channel = channel
@@ -4135,6 +4156,7 @@ class GamblinSession:
                 "**[ ❔ | ❔ | ❔ ]**\n"
                 f"Press **Join** to play with your Milo points. Starts <t:{end_ts}:R>.\n\n"
                 f"• {GAMBLIN_ROUNDS} rounds · bets {GAMBLIN_MIN_BET}–{GAMBLIN_MAX_BET} pts\n"
+                "• Your winnings count towards the **leaderboard**\n"
                 "• Everything is buttons — no typing needed\n"
                 "• `/slots` and `/ask` are paused until it's over"
             ),
@@ -4272,6 +4294,7 @@ class GamblinSession:
         medals = ["🥇", "🥈", "🥉"]
         lines = [
             f"{medals[i] if i < 3 else f'`#{i + 1}`'} <@{p.uid}> — **{p.net:+,}** (balance {POINTS.points(p.uid):,})"
+            + (f" · 🏆 +{p.net:,} to leaderboard" if p.net > 0 else "")
             for i, p in enumerate(ranked)
         ]
         embed = discord.Embed(
@@ -4393,7 +4416,7 @@ class GamblinStakeModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         g = GAMBLIN
-        p = g.players.get(interaction.user.id) if g and not isinstance(g, BlackjackSession) else None
+        p = g.players.get(interaction.user.id) if g is not None and type(g) is GamblinSession else None
         if g is None or p is None:
             await interaction.response.send_message("🎰 That Gamblin session is over.", ephemeral=True)
             return
@@ -4420,7 +4443,7 @@ async def handle_gamblin_click(interaction: discord.Interaction, custom_id: str)
         await say("This bot is not configured for this server.")
         return
     g = GAMBLIN
-    if g is None or isinstance(g, BlackjackSession):
+    if g is None or type(g) is not GamblinSession:
         await say("🎰 That Gamblin session is over — catch the next one! 🐾")
         return
     parts = custom_id.split(":")
@@ -4508,59 +4531,6 @@ async def handle_gamblin_click(interaction: discord.Interaction, custom_id: str)
     await say("That button looks broken — open a fresh bet from the main message.")
 
 
-# ---- hidden Manager-only command: ?gamblin / ?gamblin stop ----------------------------
-async def _handle_gamblin_command(message: discord.Message, bj: bool = False) -> None:
-    global GAMBLIN
-    if not MANAGER_ROLE_ID:
-        return
-    if message.guild is None or not isinstance(message.author, discord.Member):
-        return
-    if MANAGER_ROLE_ID not in {role.id for role in message.author.roles}:
-        return  # not authorised -- stay silent, like ?send / ?rolemenu / ?updateDB
-    try:
-        await message.delete()
-    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
-        pass
-
-    async def reply(text: str) -> None:
-        await message.channel.send(text, delete_after=30)
-
-    words = message.content.strip().lower().split()
-    if len(words) > 1 and words[1] in ("stop", "end", "cancel"):
-        if GAMBLIN is None:
-            await reply("🎰 Gamblin isn't running.")
-        else:
-            GAMBLIN.task.cancel()
-            await reply("🎰 Ending Gamblin… unresolved bets won't be charged.")
-        return
-
-    if GAMBLIN is not None:
-        await reply("🎰 Gamblin is already running. Use `?gamblin stop` to end it.")
-        return
-    if not GAMBLIN_CHANNEL_ID:
-        await reply("⚠️ Set `GAMBLIN_CHANNEL_ID` first so I know where to run Gamblin.")
-        return
-    if not POINTS.ready:
-        await reply("❌ Points haven't loaded from the database yet. Try again in a minute.")
-        return
-    channel = bot.get_channel(GAMBLIN_CHANNEL_ID)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(GAMBLIN_CHANNEL_ID)
-        except discord.HTTPException:
-            channel = None
-    if not isinstance(channel, discord.TextChannel):
-        await reply("❌ I can't find the Gamblin channel — check `GAMBLIN_CHANNEL_ID` and my permissions there.")
-        return
-
-    GAMBLIN = (BlackjackSession if bj else GamblinSession)(channel, message.author.id)
-    GAMBLIN.task = asyncio.create_task(GAMBLIN.run())
-    _background_tasks.add(GAMBLIN.task)
-    GAMBLIN.task.add_done_callback(_background_tasks.discard)
-    await reply(f"{GAMBLIN.EMOJI} {GAMBLIN.NAME} is starting in {channel.mention}!")
-    await log_event(f"{GAMBLIN.EMOJI} {GAMBLIN.NAME} started by <@{message.author.id}> in {channel.mention}.")
-
-
 async def _gamblin_shutdown() -> None:
     """Called from close(): stop a live session cleanly before the final save."""
     g = GAMBLIN
@@ -4576,13 +4546,10 @@ async def _gamblin_shutdown() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 🃏 BLACKJACK GAMBLIN -- ?gamblinbj  (same idea as ?gamblin, different game)
-#
-#   ?gamblinbj        (Manager only) -> lobby -> N rounds vs the dealer -> standings
-#   ?gamblinbj stop   (Manager only) -> ends it early (nothing unresolved is charged)
+# 🃏 BLACKJACK GAMBLIN -- started from ?gamblin (pick "Blackjack", or ?gamblin bj)
 #
 # Button-only, runs in GAMBLIN_CHANNEL_ID, and halts exactly the same things as
-# ?gamblin (/slots, /ask + think buttons, /grouptrivia, autosave). Only one
+# every other Gamblin game (/slots, /ask + think buttons, /grouptrivia, autosave). Only one
 # Gamblin of either kind can run at a time.
 #
 # Rules: 6 decks, fresh shoe every round. Dealer stands on all 17s. Blackjack pays
@@ -4815,16 +4782,6 @@ class BlackjackSession(GamblinSession):
             color=discord.Color.dark_green(),
         )
         await self._send(embed=embed)
-
-    def _on_end(self) -> None:
-        """Runs once when the session ends (normally OR stopped early): positive
-        session profit counts towards the all-time leaderboard."""
-        if self._credited:
-            return
-        self._credited = True
-        for p in self.players.values():
-            if p.net > 0:
-                POINTS.add_earned(p.uid, p.net)
 
 
 # ---- button handling (raw on_interaction -> here) -------------------------------------
@@ -5060,6 +5017,871 @@ async def handle_bj_click(interaction: discord.Interaction, custom_id: str) -> N
 
 
 # ---------------------------------------------------------------------------
+# 🦆 DUCK RACE + 🎡 ROULETTE + the single ?gamblin game picker
+#
+#   ?gamblin            (Manager only) -> pick a game with buttons -> lobby -> play
+#   ?gamblin duck       (shortcut: slots / bj / duck / roulette)
+#   ?gamblin stop       ends whatever is running (any game)
+#
+# All four games share the same engine: a lobby with an @everyone ping, rounds
+# with private betting panels, stakes held until each result lands, a pause on
+# /slots + /ask + /grouptrivia + autosave, and ONE batched save at the end.
+# ---------------------------------------------------------------------------
+GAMBLIN_DUCK_ROUNDS = _env_int("GAMBLIN_DUCK_ROUNDS", 3)
+GAMBLIN_DUCK_BET_SECONDS = _env_int("GAMBLIN_DUCK_BET_SECONDS", 30)
+GAMBLIN_RL_ROUNDS = _env_int("GAMBLIN_RL_ROUNDS", 4)
+GAMBLIN_RL_BET_SECONDS = _env_int("GAMBLIN_RL_BET_SECONDS", 40)
+RL_MAX_BETS = 5                      # most bets one player can place per spin
+DK_PREFIX = "dk:"
+RL_PREFIX = "rl:"
+
+
+async def _stake_panel(interaction, p: GPlayer, header: str, conf_id, cust_id: str, back_id: str | None = None) -> None:
+    """The shared 'how much?' panel: 5% / 10% / 25% / All-in-or-Max / Custom popup."""
+    avail = _g_avail(p)
+    cap = min(avail, GAMBLIN_MAX_BET)
+    if cap < GAMBLIN_MIN_BET:
+        await _gpanel(interaction, f"You need at least {GAMBLIN_MIN_BET} free points to bet (you have {avail:,}).")
+        return
+    seen: set[int] = set()
+    buttons = []
+    for pct in (5, 10, 25):
+        amt = min(cap, max(GAMBLIN_MIN_BET, avail * pct // 100))
+        if amt not in seen:
+            seen.add(amt)
+            buttons.append(_gb(f"{pct}% · {amt}", conf_id(amt), "grey"))
+    if cap not in seen:
+        label = "All-in" if cap == avail else "Max bet"
+        buttons.append(_gb(f"{label} · {cap}", conf_id(cap), "red"))
+    buttons.append(_gb("✏️ Custom", cust_id, "blue"))
+    if back_id:
+        buttons.append(_gb("← Back", back_id, "grey"))
+    await _gpanel(
+        interaction,
+        f"{header}\nYou have **{avail:,}** pts free (max bet {GAMBLIN_MAX_BET}). How much?",
+        _gview(*buttons),
+    )
+
+
+def _join_table(g: GamblinSession, uid: int, player_cls, emoji: str) -> str | None:
+    """Add a person to a running table. Returns an error text, or None on success."""
+    if uid in g.players:
+        return None
+    if len(g.players) >= GAMBLIN_MAX_PLAYERS:
+        return f"{emoji} The table is full!"
+    if POINTS.points(uid) < GAMBLIN_MIN_BET:
+        return f"You need at least {GAMBLIN_MIN_BET} points to play (you have {POINTS.points(uid)}). Win some in `/slots`!"
+    g.players[uid] = player_cls(uid)
+    return None
+
+
+# =========================================================================
+# 🦆 DUCK RACE
+# =========================================================================
+DUCKS = [("🟥", "Quackers"), ("🟦", "Sir Waddles"), ("🟩", "Puddles"),
+         ("🟨", "Drake"), ("🟪", "Beaky"), ("🟧", "Feathers")]
+DUCK_WEIGHTS = [28, 22, 18, 14, 10, 8]       # the win chances; shuffled between ducks every race
+DUCK_TRACK = 16
+
+
+@dataclass
+class DKPlayer(GPlayer):
+    bet: tuple | None = None                  # (duck index, stake)
+
+    def reset_round(self) -> None:
+        super().reset_round()
+        self.bet = None
+
+
+class DuckRaceSession(GamblinSession):
+    NAME = "Duck Race"
+    EMOJI = "🦆"
+    JOIN_ID = "dk:join"
+
+    def __init__(self, channel, started_by: int) -> None:
+        super().__init__(channel, started_by)
+        self.dk = ""                          # "" -> "bet" -> "race" -> "done"
+        self.probs: list[float] = []
+        self.mults: list[float] = []
+        self.empty_rounds = 0
+        self.stop_early = False
+
+    @property
+    def total_rounds(self) -> int:
+        return GAMBLIN_DUCK_ROUNDS
+
+    def _lobby_embed(self, end_ts: int) -> discord.Embed:
+        return discord.Embed(
+            title="🦆 DUCK RACE is starting!",
+            description=(
+                "**🟥🟦🟩🟨🟪🟧 — pick your duck!**\n"
+                f"Press **Join** to play with your Milo points. Starts <t:{end_ts}:R>.\n\n"
+                f"• {GAMBLIN_DUCK_ROUNDS} races · bets {GAMBLIN_MIN_BET}–{GAMBLIN_MAX_BET} pts\n"
+                "• 6 ducks with different odds — the long shots pay the most\n"
+                "• Your winnings count towards the **leaderboard**\n"
+                "• Everything is buttons — no typing needed\n"
+                "• `/slots` and `/ask` are paused until it's over"
+            ),
+            color=discord.Color.yellow(),
+        )
+
+    def _lineup(self) -> str:
+        return "\n".join(
+            f"{DUCKS[i][0]} **{DUCKS[i][1]}** — pays **{_fx(self.mults[i])}** · {self.probs[i] * 100:.0f}% to win"
+            for i in range(6)
+        )
+
+    def _race_embed(self, status: str, pos: list[int] | None = None) -> discord.Embed:
+        e = discord.Embed(title=f"🦆 Duck Race — Race {self.round}/{GAMBLIN_DUCK_ROUNDS}", color=discord.Color.yellow())
+        lines = [status, ""]
+        if pos is None:
+            lines.append(self._lineup())
+        else:
+            for i in range(6):
+                lines.append(f"{DUCKS[i][0]} {'·' * pos[i]}🦆{'·' * (DUCK_TRACK - pos[i])}🏁")
+        e.description = "\n".join(lines)
+        e.set_footer(text=f"{len(self.players)} players · bets {GAMBLIN_MIN_BET}–{GAMBLIN_MAX_BET} pts · one bet per race")
+        return e
+
+    def _finish_order(self) -> list[int]:
+        """Finishing order, drawn so that each duck's chance of WINNING is exactly its stated chance."""
+        remaining = list(range(6))
+        order: list[int] = []
+        while remaining:
+            pick = random.choices(remaining, weights=[self.probs[i] for i in remaining])[0]
+            order.append(pick)
+            remaining.remove(pick)
+        return order
+
+    async def _play_round(self, r: int) -> None:
+        self.round = r
+        self.phase = "betting"
+        self.dk = "bet"
+        weights = DUCK_WEIGHTS[:]
+        random.shuffle(weights)                           # a different line-up of odds every race
+        self.probs = [w / sum(weights) for w in weights]
+        self.mults = [_g_mult(p) for p in self.probs]
+        for p in self.players.values():
+            p.reset_round()
+
+        secs = GAMBLIN_DUCK_BET_SECONDS
+        self.deadline = time.time() + secs
+        self.msg = await self._send(
+            embed=self._race_embed(f"💰 **Place your bets!** Closing <t:{int(self.deadline)}:R>"),
+            view=_gview(_gb("💰 Place bet", "dk:bet", "green")),
+        )
+        if self.msg is None:
+            raise RuntimeError("couldn't post the race message")
+        self.window_open = True
+        await asyncio.sleep(secs)
+        self.window_open = False                          # sync from here: no late bets
+
+        bettors = [p for p in self.players.values() if p.bet]
+        if not bettors:
+            self.empty_rounds += 1
+            self.dk = "done"
+            note = "Nobody bet on this race."
+            if self.empty_rounds >= 2:
+                self.stop_early = True
+                note += " Two quiet races in a row, so the track is closing."
+            await self._edit(self.msg, embed=self._race_embed(note), view=None)
+            return
+        self.empty_rounds = 0
+
+        # the race
+        self.dk = "race"
+        order = self._finish_order()
+        winner = order[0]
+        ft = {d: 10 + rank + random.random() * 0.5 for rank, d in enumerate(order)}
+        pos = [0] * 6
+        for t in range(1, math.ceil(ft[winner]) + 2):
+            for d in range(6):
+                if t >= ft[d]:
+                    new = DUCK_TRACK
+                else:
+                    new = min(DUCK_TRACK - 1, max(0, int(DUCK_TRACK * t / ft[d] + random.uniform(-1, 1))))
+                pos[d] = max(pos[d], new)
+            await self._edit(self.msg, embed=self._race_embed("🏁 **And they're off!**", pos), view=None)
+            await asyncio.sleep(1.3)
+
+        # results
+        lines = []
+        for p in bettors:
+            duck, stake = p.bet
+            if duck == winner:
+                profit = self._settle(p, stake, math.floor(stake * self.mults[duck]))
+                lines.append(f"✅ <@{p.uid}> {DUCKS[duck][0]} bet **{stake:,}** → **+{profit:,}**")
+            else:
+                self._settle(p, stake, 0)
+                lines.append(f"❌ <@{p.uid}> {DUCKS[duck][0]} bet **{stake:,}** → −{stake:,}")
+        self.dk = "done"
+        medals = ["🥇", "🥈", "🥉"]
+        podium = "  ".join(f"{medals[i]} {DUCKS[order[i]][0]} {DUCKS[order[i]][1]}" for i in range(3))
+        e = self._race_embed(f"🏆 **{DUCKS[winner][0]} {DUCKS[winner][1]} wins!**\n{podium}", pos)
+        e.add_field(name="Results", value="\n".join(lines)[:1000], inline=False)
+        await self._edit(self.msg, embed=e, view=None)
+
+    async def _finish(self) -> None:
+        await _standings(self, "🦆 Duck Race is over!", discord.Color.yellow())
+
+
+async def _standings(g: GamblinSession, title: str, color) -> None:
+    g.phase = "ending"
+    ranked = sorted(g.players.values(), key=lambda q: (-q.net, q.uid))
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [
+        f"{medals[i] if i < 3 else f'`#{i + 1}`'} <@{p.uid}> — **{p.net:+,}** (balance {POINTS.points(p.uid):,})"
+        + (f" · 🏆 +{p.net:,} to leaderboard" if p.net > 0 else "")
+        for i, p in enumerate(ranked)
+    ]
+    embed = discord.Embed(
+        title=title,
+        description="\n".join(lines)[:4000] + "\n\n💾 Saving everyone's points… `/slots` and `/ask` are back!",
+        color=color,
+    )
+    await g._send(embed=embed)
+
+
+def _dk_bet_error(g: "DuckRaceSession", p: DKPlayer) -> str | None:
+    if g.dk != "bet" or not g.window_open:
+        return "⏳ Bets are closed right now — wait for the next race."
+    if p.bet:
+        d, stake = p.bet
+        return f"🔒 You already bet {stake:,} on {DUCKS[d][0]} {DUCKS[d][1]} this race."
+    return None
+
+
+async def _dk_confirm_panel(interaction, g: "DuckRaceSession", duck: int, amt: int) -> None:
+    m = g.mults[duck]
+    payout = math.floor(amt * m)
+    text = (
+        f"Bet **{amt:,}** on {DUCKS[duck][0]} **{DUCKS[duck][1]}** (pays {_fx(m)})?\n"
+        f"Win → **{payout:,}** back (+{payout - amt:,}) · Lose → −{amt:,}\n"
+        "⚠️ Once locked, it can't be changed."
+    )
+    await _gpanel(interaction, text, _gview(
+        _gb(f"🔒 Lock it in ({amt})", f"dk:lock:{duck}:{amt}", "green"),
+        _gb("← Back", f"dk:pick:{duck}", "grey"),
+    ))
+
+
+class DKStakeModal(discord.ui.Modal):
+    def __init__(self, duck: int, cap: int) -> None:
+        super().__init__(title="Custom bet", timeout=300)
+        self.duck = duck
+        self.amount = discord.ui.TextInput(
+            label=f"Points ({GAMBLIN_MIN_BET}–{cap})", placeholder=str(cap), min_length=1, max_length=7,
+        )
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        g = GAMBLIN
+        p = g.players.get(interaction.user.id) if isinstance(g, DuckRaceSession) else None
+        if p is None:
+            await interaction.response.send_message("🦆 That race is over.", ephemeral=True)
+            return
+        err = _dk_bet_error(g, p)
+        raw = str(self.amount.value).strip().replace(",", "")
+        if err is None and not raw.isdigit():
+            err = "Numbers only please 🐾"
+        if err is None:
+            err = _gstake_error(p, int(raw))
+        if err is not None:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        await _dk_confirm_panel(interaction, g, self.duck, int(raw))
+
+
+async def handle_dk_click(interaction: discord.Interaction, custom_id: str) -> None:
+    async def say(text: str) -> None:
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+
+    if not is_allowed_guild(interaction.guild_id):
+        await say("This bot is not configured for this server.")
+        return
+    g = GAMBLIN
+    if not isinstance(g, DuckRaceSession):
+        await say("🦆 That race is over — catch the next one! 🐾")
+        return
+    parts = custom_id.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    uid = interaction.user.id
+
+    if action == "join":
+        if g.phase != "lobby":
+            await say("🦆 The race already started — tap **Place bet** on the race message to join in!")
+        elif uid in g.players:
+            await say("You're already in! 🦆")
+        else:
+            err = _join_table(g, uid, DKPlayer, "🦆")
+            if err:
+                await say(err)
+            else:
+                await interaction.response.send_message(
+                    f"🦆 <@{uid}> is participating! ({len(g.players)} in)",
+                    allowed_mentions=discord.AllowedMentions(users=True),
+                )
+        return
+
+    if action == "bet":
+        if g.dk != "bet" or not g.window_open:
+            await say("⏳ Bets are closed right now — wait for the next race.")
+            return
+        err = _join_table(g, uid, DKPlayer, "🦆")
+        if err:
+            await say(err)
+            return
+        p = g.players[uid]
+        err = _dk_bet_error(g, p)
+        if err:
+            await say(err)
+            return
+        buttons = [_gb(f"{DUCKS[i][0]} {DUCKS[i][1]} {_fx(g.mults[i])}", f"dk:pick:{i}", "grey") for i in range(6)]
+        await _gpanel(interaction, "🦆 **Pick your duck** (one bet per race):\n" + g._lineup(), _gview(*buttons))
+        return
+
+    p = g.players.get(uid)
+    if p is None:
+        await say("🦆 You're not in this race — tap **Place bet** during the betting window!")
+        return
+    if action not in ("pick", "conf", "lock", "cust") or len(parts) < 3 or not parts[2].isdigit() or int(parts[2]) > 5:
+        await say("That button looks broken — tap **Place bet** again.")
+        return
+    duck = int(parts[2])
+    err = _dk_bet_error(g, p)
+    if err:
+        await say(err)
+        return
+
+    if action == "pick":
+        await _stake_panel(
+            interaction, p,
+            f"{DUCKS[duck][0]} **{DUCKS[duck][1]}** — pays **{_fx(g.mults[duck])}** · {g.probs[duck] * 100:.0f}% to win",
+            lambda amt: f"dk:conf:{duck}:{amt}", f"dk:cust:{duck}", "dk:bet",
+        )
+        return
+    if action == "cust":
+        cap = min(_g_avail(p), GAMBLIN_MAX_BET)
+        if cap < GAMBLIN_MIN_BET:
+            await say(f"You need at least {GAMBLIN_MIN_BET} free points to bet.")
+            return
+        await interaction.response.send_modal(DKStakeModal(duck, cap))
+        return
+    if len(parts) != 4 or not parts[3].isdigit():
+        await say("That button looks broken — tap **Place bet** again.")
+        return
+    amt = int(parts[3])
+    err = _gstake_error(p, amt)
+    if err:
+        await say(err)
+        return
+    if action == "conf":
+        await _dk_confirm_panel(interaction, g, duck, amt)
+        return
+    p.bet = (duck, amt)                                   # lock: instant memory work, no awaits
+    p.pending += amt
+    await _gpanel(interaction, f"🔒 **Locked:** {amt:,} pts on {DUCKS[duck][0]} **{DUCKS[duck][1]}** (pays {_fx(g.mults[duck])}). Good luck! 🍀")
+
+
+# =========================================================================
+# 🎡 ROULETTE  (European wheel: one green 0, numbers 0-36, real odds)
+# =========================================================================
+RL_RED = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
+
+
+def _rl_label(n: int) -> str:
+    return f"{n} {'🟢' if n == 0 else '🔴' if n in RL_RED else '⚫'}"
+
+
+# target key -> (label, wins(n), multiplier, how many of the 37 numbers win)
+RL_BETS: dict[str, tuple[str, object, int, int]] = {
+    "red": ("🔴 Red", lambda n: n in RL_RED, 2, 18),
+    "blk": ("⚫ Black", lambda n: n != 0 and n not in RL_RED, 2, 18),
+    "odd": ("Odd", lambda n: n != 0 and n % 2 == 1, 2, 18),
+    "even": ("Even", lambda n: n != 0 and n % 2 == 0, 2, 18),
+    "low": ("1–18", lambda n: 1 <= n <= 18, 2, 18),
+    "high": ("19–36", lambda n: 19 <= n <= 36, 2, 18),
+    "d1": ("1st dozen (1–12)", lambda n: 1 <= n <= 12, 3, 12),
+    "d2": ("2nd dozen (13–24)", lambda n: 13 <= n <= 24, 3, 12),
+    "d3": ("3rd dozen (25–36)", lambda n: 25 <= n <= 36, 3, 12),
+}
+
+
+def _rl_target(t: str):
+    """(label, wins(n), multiplier, winning-numbers-out-of-37) or None for a junk id."""
+    if t in RL_BETS:
+        return RL_BETS[t]
+    if t.startswith("n") and t[1:].isdigit() and 0 <= int(t[1:]) <= 36:
+        k = int(t[1:])
+        return (f"Number {_rl_label(k)}", (lambda n, k=k: n == k), 36, 1)
+    return None
+
+
+@dataclass
+class RLPlayer(GPlayer):
+    bets: list = field(default_factory=list)      # [(target, stake), ...]
+
+    def reset_round(self) -> None:
+        super().reset_round()
+        self.bets = []
+
+
+class RouletteSession(GamblinSession):
+    NAME = "Roulette"
+    EMOJI = "🎡"
+    JOIN_ID = "rl:join"
+
+    def __init__(self, channel, started_by: int) -> None:
+        super().__init__(channel, started_by)
+        self.rl = ""                          # "" -> "bet" -> "spin" -> "done"
+        self.history: list[int] = []
+        self.empty_rounds = 0
+        self.stop_early = False
+
+    @property
+    def total_rounds(self) -> int:
+        return GAMBLIN_RL_ROUNDS
+
+    def _lobby_embed(self, end_ts: int) -> discord.Embed:
+        return discord.Embed(
+            title="🎡 ROULETTE is starting!",
+            description=(
+                "**Place your bets, ladies and gentlemen!**\n"
+                f"Press **Join** to play with your Milo points. Starts <t:{end_ts}:R>.\n\n"
+                f"• {GAMBLIN_RL_ROUNDS} spins · bets {GAMBLIN_MIN_BET}–{GAMBLIN_MAX_BET} pts · up to {RL_MAX_BETS} bets a spin\n"
+                "• Real European wheel (0–36): Red/Black/Odd/Even/Low/High **x2**, Dozens **x3**, one Number **x36**\n"
+                "• Your winnings count towards the **leaderboard**\n"
+                "• Everything is buttons — no typing needed\n"
+                "• `/slots` and `/ask` are paused until it's over"
+            ),
+            color=discord.Color.red(),
+        )
+
+    def _hist_text(self) -> str:
+        return " ".join(_rl_label(n) for n in self.history[-10:][::-1]) or "—"
+
+    def _table_embed(self, status: str, lines: list[str] | None = None) -> discord.Embed:
+        e = discord.Embed(title=f"🎡 Roulette — Spin {self.round}/{GAMBLIN_RL_ROUNDS}", color=discord.Color.red())
+        e.description = (status + (("\n\n" + "\n".join(lines)) if lines else ""))[:4000]
+        e.add_field(name="Last numbers", value=self._hist_text(), inline=False)
+        e.set_footer(text=f"{len(self.players)} players · bets {GAMBLIN_MIN_BET}–{GAMBLIN_MAX_BET} pts · max {RL_MAX_BETS} bets a spin")
+        return e
+
+    async def _play_round(self, r: int) -> None:
+        self.round = r
+        self.phase = "betting"
+        self.rl = "bet"
+        for p in self.players.values():
+            p.reset_round()
+        secs = GAMBLIN_RL_BET_SECONDS
+        self.deadline = time.time() + secs
+        self.msg = await self._send(
+            embed=self._table_embed(
+                f"💰 **Place your bets!** Closing <t:{int(self.deadline)}:R>\n"
+                "Press **Place bets** — Red/Black, Odd/Even, Low/High, Dozens, or a single Number."
+            ),
+            view=_gview(_gb("💰 Place bets", "rl:bet", "green")),
+        )
+        if self.msg is None:
+            raise RuntimeError("couldn't post the table message")
+        self.window_open = True
+        await asyncio.sleep(secs)
+        self.window_open = False                          # sync from here: no late bets
+
+        bettors = [p for p in self.players.values() if p.bets]
+        if not bettors:
+            self.empty_rounds += 1
+            self.rl = "done"
+            note = "No bets this spin."
+            if self.empty_rounds >= 2:
+                self.stop_early = True
+                note += " Two quiet spins in a row, so the table is closing."
+            await self._edit(self.msg, embed=self._table_embed(note), view=None)
+            return
+        self.empty_rounds = 0
+
+        self.rl = "spin"
+        result = random.randrange(37)
+        for _ in range(3):
+            await self._edit(self.msg, embed=self._table_embed(f"🎡 **The wheel is spinning…** `{random.randrange(37)}`"), view=None)
+            await asyncio.sleep(1.2)
+
+        lines = []
+        for p in bettors:
+            parts = []
+            before = p.round_net
+            for t, stake in p.bets:
+                label, wins, mult, _ = _rl_target(t)
+                if wins(result):
+                    self._settle(p, stake, stake * mult)
+                    parts.append(f"{label} ✅{stake:,}")
+                else:
+                    self._settle(p, stake, 0)
+                    parts.append(f"{label} ❌{stake:,}")
+            net = p.round_net - before
+            lines.append(f"<@{p.uid}> **{net:+,}** · " + " · ".join(parts))
+        self.history.append(result)
+        self.rl = "done"
+        status = f"🎡 **The ball lands on {_rl_label(result)}!**"
+        await self._edit(self.msg, embed=self._table_embed(status, lines[:25]), view=None)
+
+    async def _finish(self) -> None:
+        await _standings(self, "🎡 Roulette is over!", discord.Color.red())
+
+
+def _rl_bet_error(g: "RouletteSession", p: RLPlayer) -> str | None:
+    if g.rl != "bet" or not g.window_open:
+        return "⏳ Bets are closed right now — wait for the next spin."
+    if len(p.bets) >= RL_MAX_BETS:
+        return f"🔒 That's the maximum of {RL_MAX_BETS} bets for this spin."
+    return None
+
+
+def _rl_bets_text(p: RLPlayer) -> str:
+    if not p.bets:
+        return "No bets yet this spin."
+    return "\n".join(f"• {_rl_target(t)[0]} — {stake:,} pts" for t, stake in p.bets)
+
+
+async def _rl_type_panel(interaction, p: RLPlayer) -> None:
+    buttons = [_gb(f"{RL_BETS[k][0]} {_fx(RL_BETS[k][2])}", f"rl:pick:{k}", "grey") for k in RL_BETS]
+    buttons.append(_gb("🎯 Number x36", "rl:num", "blue"))
+    text = (
+        "🎡 **What do you want to bet on?**\n"
+        f"Your bets ({len(p.bets)}/{RL_MAX_BETS}):\n{_rl_bets_text(p)}"
+    )
+    await _gpanel(interaction, text, _gview(*buttons))
+
+
+async def _rl_stake_panel(interaction, p: RLPlayer, t: str) -> None:
+    label, _, mult, count = _rl_target(t)
+    await _stake_panel(
+        interaction, p,
+        f"🎡 Bet on **{label}** — pays **{_fx(mult)}** · {count}/37 chance",
+        lambda amt: f"rl:conf:{t}:{amt}", f"rl:cust:{t}", "rl:bet",
+    )
+
+
+async def _rl_confirm_panel(interaction, t: str, amt: int) -> None:
+    label, _, mult, count = _rl_target(t)
+    text = (
+        f"Bet **{amt:,}** on **{label}** (pays {_fx(mult)})?\n"
+        f"Win → **{amt * mult:,}** back (+{amt * (mult - 1):,}) · Lose → −{amt:,}\n"
+        "⚠️ Once locked, it can't be changed."
+    )
+    await _gpanel(interaction, text, _gview(
+        _gb(f"🔒 Lock it in ({amt})", f"rl:lock:{t}:{amt}", "green"),
+        _gb("← Back", f"rl:pick:{t}", "grey"),
+    ))
+
+
+class RLStakeModal(discord.ui.Modal):
+    def __init__(self, t: str, cap: int) -> None:
+        super().__init__(title="Custom bet", timeout=300)
+        self.t = t
+        self.amount = discord.ui.TextInput(
+            label=f"Points ({GAMBLIN_MIN_BET}–{cap})", placeholder=str(cap), min_length=1, max_length=7,
+        )
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        g = GAMBLIN
+        p = g.players.get(interaction.user.id) if isinstance(g, RouletteSession) else None
+        if p is None:
+            await interaction.response.send_message("🎡 That table is closed.", ephemeral=True)
+            return
+        err = _rl_bet_error(g, p)
+        raw = str(self.amount.value).strip().replace(",", "")
+        if err is None and not raw.isdigit():
+            err = "Numbers only please 🐾"
+        if err is None:
+            err = _gstake_error(p, int(raw))
+        if err is not None:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        await _rl_confirm_panel(interaction, self.t, int(raw))
+
+
+class RLNumberModal(discord.ui.Modal):
+    """Popup to pick the single number (0-36) for a straight-up bet."""
+
+    def __init__(self) -> None:
+        super().__init__(title="Bet on a number", timeout=300)
+        self.number = discord.ui.TextInput(label="Number (0–36)", placeholder="17", min_length=1, max_length=2)
+        self.add_item(self.number)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        g = GAMBLIN
+        p = g.players.get(interaction.user.id) if isinstance(g, RouletteSession) else None
+        if p is None:
+            await interaction.response.send_message("🎡 That table is closed.", ephemeral=True)
+            return
+        err = _rl_bet_error(g, p)
+        raw = str(self.number.value).strip()
+        if err is None and not (raw.isdigit() and 0 <= int(raw) <= 36):
+            err = "Pick a whole number from 0 to 36."
+        if err is not None:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        await _rl_stake_panel(interaction, p, f"n{int(raw)}")
+
+
+async def handle_rl_click(interaction: discord.Interaction, custom_id: str) -> None:
+    async def say(text: str) -> None:
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+
+    if not is_allowed_guild(interaction.guild_id):
+        await say("This bot is not configured for this server.")
+        return
+    g = GAMBLIN
+    if not isinstance(g, RouletteSession):
+        await say("🎡 That table is closed — catch the next one! 🐾")
+        return
+    parts = custom_id.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    uid = interaction.user.id
+
+    if action == "join":
+        if g.phase != "lobby":
+            await say("🎡 Already started — tap **Place bets** on the table message to join in!")
+        elif uid in g.players:
+            await say("You're already in! 🎡")
+        else:
+            err = _join_table(g, uid, RLPlayer, "🎡")
+            if err:
+                await say(err)
+            else:
+                await interaction.response.send_message(
+                    f"🎡 <@{uid}> is participating! ({len(g.players)} in)",
+                    allowed_mentions=discord.AllowedMentions(users=True),
+                )
+        return
+
+    if action == "bet":
+        if g.rl != "bet" or not g.window_open:
+            await say("⏳ Bets are closed right now — wait for the next spin.")
+            return
+        err = _join_table(g, uid, RLPlayer, "🎡")
+        if err:
+            await say(err)
+            return
+        p = g.players[uid]
+        err = _rl_bet_error(g, p)
+        if err:
+            await say(err)
+            return
+        await _rl_type_panel(interaction, p)
+        return
+
+    p = g.players.get(uid)
+    if p is None:
+        await say("🎡 You're not at this table — tap **Place bets** during the betting window!")
+        return
+    err = _rl_bet_error(g, p)
+    if err:
+        await say(err)
+        return
+
+    if action == "num":
+        await interaction.response.send_modal(RLNumberModal())
+        return
+    if action not in ("pick", "conf", "lock", "cust") or len(parts) < 3 or _rl_target(parts[2]) is None:
+        await say("That button looks broken — tap **Place bets** again.")
+        return
+    t = parts[2]
+    if action == "pick":
+        await _rl_stake_panel(interaction, p, t)
+        return
+    if action == "cust":
+        cap = min(_g_avail(p), GAMBLIN_MAX_BET)
+        if cap < GAMBLIN_MIN_BET:
+            await say(f"You need at least {GAMBLIN_MIN_BET} free points to bet.")
+            return
+        await interaction.response.send_modal(RLStakeModal(t, cap))
+        return
+    if len(parts) != 4 or not parts[3].isdigit():
+        await say("That button looks broken — tap **Place bets** again.")
+        return
+    amt = int(parts[3])
+    err = _gstake_error(p, amt)
+    if err:
+        await say(err)
+        return
+    if action == "conf":
+        await _rl_confirm_panel(interaction, t, amt)
+        return
+    p.bets.append((t, amt))                               # lock: instant memory work, no awaits
+    p.pending += amt
+    more = len(p.bets) < RL_MAX_BETS
+    text = f"🔒 **Locked:** {amt:,} pts on {_rl_target(t)[0]}.\nYour bets ({len(p.bets)}/{RL_MAX_BETS}):\n{_rl_bets_text(p)}"
+    await _gpanel(interaction, text, _gview(_gb("➕ Add another bet", "rl:bet", "blue")) if more else None)
+
+
+# =========================================================================
+# ?gamblin -- ONE command for every game
+# =========================================================================
+GAMBLIN_GAMES = {
+    "slots": ("🎰", "Slots", GamblinSession),
+    "bj": ("🃏", "Blackjack", BlackjackSession),
+    "duck": ("🦆", "Duck Race", DuckRaceSession),
+    "roulette": ("🎡", "Roulette", RouletteSession),
+}
+_GAMBLIN_ALIASES = {
+    "slots": "slots", "slot": "slots", "bj": "bj", "blackjack": "bj", "duck": "duck",
+    "ducks": "duck", "duckrace": "duck", "roulette": "roulette", "rl": "roulette",
+}
+
+
+async def _gamblin_preflight():
+    """Everything that must be true before a game can start. Returns (channel, error_text)."""
+    if GAMBLIN is not None:
+        return None, f"{GAMBLIN.EMOJI} {GAMBLIN.NAME} is already running. Use `?gamblin stop` to end it."
+    if not GAMBLIN_CHANNEL_ID:
+        return None, "⚠️ Set `GAMBLIN_CHANNEL_ID` first so I know where to run Gamblin."
+    if not POINTS.ready:
+        return None, "❌ Points haven't loaded from the database yet. Try again in a minute."
+    channel = bot.get_channel(GAMBLIN_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(GAMBLIN_CHANNEL_ID)
+        except discord.HTTPException:
+            channel = None
+    if not isinstance(channel, discord.TextChannel):
+        return None, "❌ I can't find the Gamblin channel — check `GAMBLIN_CHANNEL_ID` and my permissions there."
+    return channel, None
+
+
+def _clear_gamblin(session) -> None:
+    """Runs whenever a game's task ends, however it ended. Guarantees the 'Gamblin is
+    running' pause can never get stuck on (e.g. if a game is stopped before it began)."""
+    global GAMBLIN
+    if GAMBLIN is session:
+        GAMBLIN = None
+
+
+async def _start_gamblin(kind: str, manager_id: int):
+    """Start a game. Returns (channel, error_text)."""
+    global GAMBLIN
+    channel, err = await _gamblin_preflight()
+    if err:
+        return None, err
+    emoji, name, cls = GAMBLIN_GAMES[kind]
+    GAMBLIN = cls(channel, manager_id)
+    GAMBLIN.task = asyncio.create_task(GAMBLIN.run())
+    _background_tasks.add(GAMBLIN.task)
+    GAMBLIN.task.add_done_callback(_background_tasks.discard)
+    GAMBLIN.task.add_done_callback(lambda _t, _s=GAMBLIN: _clear_gamblin(_s))   # safety net: the flag ALWAYS clears
+    await log_event(f"{emoji} {name} started by <@{manager_id}> in {channel.mention}.")
+    return channel, None
+
+
+class GamblinPicker(discord.ui.View):
+    """'Which game?' -- only the manager who typed ?gamblin can press it."""
+
+    def __init__(self, owner_id: int) -> None:
+        super().__init__(timeout=60)
+        self.owner_id = owner_id
+        self.message: discord.Message | None = None
+        for key, (emoji, name, _) in GAMBLIN_GAMES.items():
+            button = discord.ui.Button(label=name, emoji=emoji, style=discord.ButtonStyle.success)
+            button.callback = self._make_callback(key)
+            self.add_item(button)
+        cancel = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary)
+        cancel.callback = self._cancel
+        self.add_item(cancel)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Only the manager who typed this can pick 🐾", ephemeral=True)
+            return False
+        return True
+
+    def _make_callback(self, key: str):
+        async def callback(interaction: discord.Interaction) -> None:
+            self.stop()
+            emoji, name, _ = GAMBLIN_GAMES[key]
+            await interaction.response.edit_message(content=f"{emoji} Starting **{name}**…", view=None)
+            channel, err = await _start_gamblin(key, interaction.user.id)
+            if err:
+                await interaction.edit_original_response(content=err)
+            else:
+                await interaction.edit_original_response(content=f"{emoji} **{name}** is starting in {channel.mention}!")
+            await asyncio.sleep(10)
+            try:
+                await interaction.delete_original_response()
+            except discord.HTTPException:
+                pass
+        return callback
+
+    async def _cancel(self, interaction: discord.Interaction) -> None:
+        self.stop()
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+        await asyncio.sleep(3)
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            pass
+
+    async def on_timeout(self) -> None:
+        if self.message is not None:
+            try:
+                await self.message.delete()
+            except discord.HTTPException:
+                pass
+
+
+# ---- hidden Manager-only command: ?gamblin [game | stop] ---------------------------------
+async def _handle_gamblin_command(message: discord.Message) -> None:
+    if not MANAGER_ROLE_ID:
+        return
+    if message.guild is None or not isinstance(message.author, discord.Member):
+        return
+    if MANAGER_ROLE_ID not in {role.id for role in message.author.roles}:
+        return  # not authorised -- stay silent, like ?send / ?rolemenu / ?updateDB
+    try:
+        await message.delete()
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        pass
+
+    async def reply(text: str) -> None:
+        await message.channel.send(text, delete_after=30, allowed_mentions=discord.AllowedMentions.none())
+
+    words = message.content.strip().lower().split()
+    arg = words[1] if len(words) > 1 else ""
+
+    if arg in ("stop", "end", "cancel"):
+        if GAMBLIN is None:
+            await reply("🎲 Nothing is running.")
+        else:
+            GAMBLIN.task.cancel()
+            await reply(f"{GAMBLIN.EMOJI} Ending {GAMBLIN.NAME}… unresolved bets won't be charged.")
+        return
+
+    if arg:
+        kind = _GAMBLIN_ALIASES.get(arg)
+        if kind is None:
+            await reply("Games: `slots`, `bj`, `duck`, `roulette` — or just `?gamblin` to pick with buttons. `?gamblin stop` ends any game.")
+            return
+        channel, err = await _start_gamblin(kind, message.author.id)
+        await reply(err or f"{GAMBLIN_GAMES[kind][0]} {GAMBLIN_GAMES[kind][1]} is starting in {channel.mention}!")
+        return
+
+    _, err = await _gamblin_preflight()
+    if err:
+        await reply(err)
+        return
+    view = GamblinPicker(message.author.id)
+    view.message = await message.channel.send("🎲 **Which Gamblin game?** (pick one — I'll ping everyone and start)", view=view)
+
+
+
+# ---------------------------------------------------------------------------
 # 🛠️ Manager toolbox -- hidden ?commands (Manager role only, silent to others)
 #
 #   ?give @user +300 pts     add points   (or -40 pts to take some away)
@@ -5082,7 +5904,8 @@ _MGR_TARGET = r"(?:<@!?(\d+)>|(\d{15,20}))"
 _GIVE_RE = re.compile(rf"^\?give\s+{_MGR_TARGET}\s+([+-]?[\d,]+)\s*(?:pts?|points?)?\s*(.*)$", re.I | re.S)
 _SET_RE = re.compile(rf"^\?set\s+{_MGR_TARGET}\s+([\d,]+)\s*(?:pts?|points?)?\s*(.*)$", re.I | re.S)
 _ONLY_TARGET_RE = re.compile(rf"^\?\w+\s+{_MGR_TARGET}\s*$", re.I)
-_MGR_WORDS = {"?give", "?set", "?undo", "?check", "?balances", "?resetspins", "?snapshot", "?mhelp"}
+_MGR_WORDS = {"?give", "?set", "?undo", "?check", "?balances", "?resetspins", "?snapshot", "?mhelp",
+              "?resetleaderboard", "?resetleaderbord"}
 _mgr_history: list[dict] = []           # recent balance changes, newest last (memory only)
 
 
@@ -5151,6 +5974,67 @@ async def _log_startup_and_daily_snapshots() -> None:
 def _mgr_rank_text(uid: int) -> str:
     rank = POINTS.rank_of(uid)
     return f"#{rank}" if rank else f"not on it ({POINTS.total_earned(uid):,}/{LEADERBOARD_MIN_POINTS:,})"
+
+
+class ResetLeaderboardView(discord.ui.View):
+    """Confirm / Cancel for ?resetleaderboard. Only the manager who typed it can press."""
+
+    def __init__(self, owner_id: int) -> None:
+        super().__init__(timeout=45)
+        self.owner_id = owner_id
+        self.message: discord.Message | None = None
+        self.done = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Only the manager who typed this can press it 🐾", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Yes, reset it", emoji="⚠️", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.done:
+            return
+        self.done = True
+        self.stop()
+        if GAMBLIN is not None:
+            await interaction.response.edit_message(content="🎰 A Gamblin game started in the meantime — try again when it's over.", view=None)
+            return
+        if not POINTS.ready:
+            await interaction.response.edit_message(content="❌ Points aren't loaded yet — try again in a minute.", view=None)
+            return
+        before = sorted(POINTS.earned.items(), key=lambda t: (-t[1], t[0]))[:10]
+        changed = POINTS.reset_earned_to_balance()
+        await interaction.response.edit_message(content=f"✅ Leaderboard reset for {changed} people. Saving to the database…", view=None)
+        ok, _, detail = await POINTS.flush("leaderboard reset")
+        if POINTS.store is None:
+            result = "⚠️ No database is configured, so this only lasts until Milo restarts."
+        elif ok:
+            result = "💾 Saved. Safe to redeploy."
+        else:
+            result = f"⚠️ NOT saved yet ({detail}). Run `?updateDB` before redeploying."
+        board = len(POINTS.qualified())
+        await interaction.edit_original_response(
+            content=f"✅ **Leaderboard reset** — everyone's all-time earned is now their current points ({changed} people changed, {board} on the board). {result}"
+        )
+        old = "\n".join(f"{i}. <@{u}> {v:,}" for i, (u, v) in enumerate(before, 1)) or "(empty)"
+        await log_event(
+            f"🧹 `?resetleaderboard` by <@{interaction.user.id}> — {changed} people changed, {board} on the board now. {result}\n"
+            f"**Top earned before the reset:**\n{old}"
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.done = True
+        self.stop()
+        await interaction.response.edit_message(content="Cancelled — nothing changed. 🐾", view=None)
+
+    async def on_timeout(self) -> None:
+        if self.message is not None and not self.done:
+            try:
+                await self.message.edit(content="Timed out — nothing changed.", view=None)
+            except discord.HTTPException:
+                pass
 
 
 async def _handle_manager_command(message: discord.Message, word: str) -> bool:
@@ -5334,6 +6218,30 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
         await reply("📸 Posted to the log channel.")
         return
 
+    # ---- ?resetleaderboard ----
+    if word in ("?resetleaderboard", "?resetleaderbord"):
+        blocked = guard()
+        if blocked:
+            await reply(blocked)
+            return
+        changed = sum(1 for u in set(POINTS.earned) | set(POINTS.balance)
+                      if max(0, POINTS.balance.get(u, 0)) != POINTS.earned.get(u, 0))
+        will_qualify = sum(1 for b in POINTS.balance.values() if b >= LEADERBOARD_MIN_POINTS)
+        top = POINTS.qualified()[:5]
+        top_text = "\n".join(f"{i}. <@{u}> {v:,}" for i, (u, v) in enumerate(top, 1)) or "(nobody yet)"
+        view = ResetLeaderboardView(mgr.id)
+        view.message = await message.channel.send(
+            "⚠️ **Reset the all-time leaderboard?**\n"
+            "Everyone's **total earned** will be set to their **current points**. Balances don't change.\n"
+            f"• {changed} people will change\n"
+            f"• After the reset, **{will_qualify}** people have {LEADERBOARD_MIN_POINTS:,}+ points, "
+            "so only they will show on the board (the rest return as they earn)\n"
+            f"• Top earners now:\n{top_text}\n"
+            "This can't be undone (the old top 10 is saved in the log channel).",
+            view=view, allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
     # ---- ?mhelp ----
     if word == "?mhelp":
         await reply(
@@ -5345,7 +6253,9 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
             "`?balances` — everyone's points\n"
             "`?resetspins @user` — restore today's spins\n"
             "`?snapshot` — post everyone's points to the log channel\n"
-            "`?updateDB` — save to Upstash now · `?gamblin` / `?gamblin stop` · `?rolemenu` · `?send`\n"
+            "`?resetleaderboard` — set the all-time leaderboard to everyone's current points (asks you to confirm)\n"
+            "`?gamblin` — pick a game (slots / blackjack / duck race / roulette), ping everyone and start · `?gamblin stop` ends any game\n"
+            "`?updateDB` — save to Upstash now · `?rolemenu` · `?send`\n"
             "Changes only move balances (never the all-time leaderboard).",
             keep=120,
         )
@@ -5375,8 +6285,8 @@ async def on_message(message: discord.Message):
         return
 
     _first_word = message.content.strip().lower().split(None, 1)[0] if message.content.strip() else ""
-    if _first_word in ("?gamblin", "?gamblinbj"):
-        await _handle_gamblin_command(message, bj=(_first_word == "?gamblinbj"))
+    if _first_word == "?gamblin":
+        await _handle_gamblin_command(message)
         return
     if _first_word in _MGR_WORDS:
         if await _handle_manager_command(message, _first_word) is not False:
@@ -5515,6 +6425,10 @@ async def on_interaction(interaction: discord.Interaction):
             await handle_gamblin_click(interaction, custom_id)
         elif custom_id.startswith(BJ_PREFIX):
             await handle_bj_click(interaction, custom_id)
+        elif custom_id.startswith(DK_PREFIX):
+            await handle_dk_click(interaction, custom_id)
+        elif custom_id.startswith(RL_PREFIX):
+            await handle_rl_click(interaction, custom_id)
         # else: not a button we recognize -- ignore silently.
 
     except Exception:
