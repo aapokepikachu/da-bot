@@ -3,7 +3,7 @@
 A simple, single-server, **cat-themed** Discord bot built with **Python 3.12+** and **discord.py 2.x**.
 
 Features:
-- 46 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, points & slots, party/social, AI, lookups, and utility — see Section 9 for the full list
+- 47 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, points & slots, party/social, AI, lookups, and utility — see Section 9 for the full list
 - A points economy: win points in `/slots` (25 free spins a day, then bonus spins for points), check them with `/points`, climb `/leaderboard` — kept in memory and saved to Upstash in the background (Section 15)
 - A persistent **✔️ Interested** button on `/join` messages — survives bot restarts, **no database required**
 - A cat-themed welcome message when new members join
@@ -223,6 +223,7 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `/slots` | Spin a 3-reel slot machine for points. **25 free spins a day**, then up to **20 bonus spins** in packs: **5 points buys a pack of 10 spins**. Match all three to win: 7️⃣ 100 · ⭐ 25 · 🍇 12 · 🍉 8 · 🍋 6 · 🍒 4. Every **200th spin since your last 777 is a guaranteed 777**, and a small win is guaranteed after 19 misses. Buying a pack asks you to confirm first. 5-second cooldown. Can be limited to certain channels with `SLOTS_CHANNEL_IDS`. |
 | `/daily` | Claim free points once a day. Day 1 gives 15 and each consecutive day adds 5 (up to day 7), and **every 7th day in a row adds a +50 bonus**. Miss a day and the streak restarts. Works out to roughly 37 points a day for a perfect streak. |
 | `/pay @user amount` | Send some of your points to another member. You confirm first, and there's a **daily limit of 200 points sent** per person (`PAY_DAILY_CAP`). Not allowed to yourself, to bots, to or from frozen people, or while a Gamblin game runs. |
+| `/lottery` | **Daily lottery.** Pick 3 numbers from 1–15 (or take a quick pick) for 10 points a ticket, up to 5 tickets a day. The draw is at midnight: 3 matches share the rollover **jackpot**, 2 matches win 4× the ticket, 1 match refunds it. Section 24. |
 | `/gamblinstats [user]` | Your Gamblin record (games, total profit, biggest win, best game, favourite) plus the **hall of fame**: biggest single win, best single game, most games, highest total profit. |
 | `/points user:<member>` | Your balance, total points earned, leaderboard rank (or progress toward it), and spins left today. Private to you. Add a member to peek at theirs (spins hidden). |
 | `/leaderboard` | Two boards: the top 10 by **total points earned** (all-time; you need 1,000 earned via `LEADERBOARD_MIN_POINTS` to appear, until then it shows who's closest) and, below it, the top 5 **richest right now** by current balance (no minimum). Both come from memory — 0 Upstash commands. |
@@ -292,6 +293,11 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `SLOTS_PACK_COST` / `SLOTS_PACK_SPINS` | Optional | A bonus pack: points it costs (default `5`) and spins it gives (default `10`). **Replaces the old `SLOTS_SPIN_COST`, which is now ignored.** |
 | `SLOTS_JACKPOT_PITY_AT` | Optional | The spin number (since your last 777) that is guaranteed to be a 777. Default `200`. |
 | `DAILY_BASE` / `DAILY_STREAK_BONUS` / `DAILY_STREAK_CAP` / `DAILY_WEEK_BONUS` | Optional | `/daily`: day-1 reward (default `15`), extra per streak day (`5`), streak days that count (`7`), and the bonus on every 7th day (`50`). |
+| `POINTS_NAME` | Optional | What the currency is called everywhere in Discord, e.g. `Milo Chips`. Default `points`. See Section 25. |
+| `POINTS_EMOJI` | Optional | An emoji shown with the name: a custom emoji **ID** (just the digits), a full `<:name:id>` / `<a:name:id>`, or a normal emoji like 🪙. Default none. |
+| `POINTS_NAME_SINGULAR` | Optional | Only if the automatic "1 chip" (it drops a trailing `s`) is wrong for your name, e.g. `Gas`. |
+| `LOTTERY_TICKET_COST` / `LOTTERY_MAX_TICKETS` / `LOTTERY_JACKPOT_SEED` | Optional | Lottery ticket price (default `10`), most tickets per person per draw (`5`), and the jackpot's starting amount (`50`). |
+| `LOTTERY_CHANNEL_ID` | Optional | Where the nightly lottery results post. Falls back to `RESET_ANNOUNCE_CHANNEL_ID`. If neither is set, results only go to the log channel and `/lottery`. |
 | `RESET_ANNOUNCE_CHANNEL_ID` | Optional | Your #general (or any channel). At 12:00 AM `LIMIT_RESET_TZ` Milo posts "everything has reset" with an @everyone ping. Off if unset. See Section 23. |
 | `PAY_DAILY_CAP` | Optional | Most points one person can `/pay` per day. Default `200`. |
 | `LOG_CHANNEL_ID` | Optional | A private staff channel where Milo logs manager actions, Gamblin results, save problems, online/offline notices, and everyone's points at the nightly reset. See Section 17. |
@@ -786,3 +792,48 @@ The numbers come from your settings, so it stays correct if you change `SLOTS_FR
 - **If Milo is offline at midnight** (for example a redeploy at 11:59 PM), that day's announcement is skipped; it doesn't make up for it later.
 - **It's a lot of pings.** An @everyone every night can annoy people. Members can mute the channel, or tell me and I can switch it to a role ping instead.
 - **Cost:** 0 Upstash commands.
+
+
+## 24. Daily lottery (`/lottery`)
+
+Pick **3 numbers from 1 to 15** (15 buttons, tap three) or press **Quick pick**. One ticket costs **10 points** (`LOTTERY_TICKET_COST`) and each person can hold up to **5** per draw. Everything is private (only you see your panel).
+
+**The draw** happens at the daily reset, **12:00 AM** in `LIMIT_RESET_TZ`, for all tickets bought that day:
+
+| Matches | Prize | Chance per ticket |
+|---|---|---|
+| 3 | the **jackpot**, split equally between all winning tickets | 1 in 455 (0.22%) |
+| 2 | **4× the ticket** (40 at the default price) | 7.9% |
+| 1 | **your ticket back** | 43.5% |
+| 0 | nothing | 48.4% |
+
+You win *something* on about **52%** of tickets. These odds are exact: I enumerated every ticket against every possible draw.
+
+**The jackpot** starts at 50 (`LOTTERY_JACKPOT_SEED`). Every ticket adds 2 points to it. If nobody hits all 3, it **rolls over** and keeps growing; when someone wins it restarts at 50. The other prizes are paid from nowhere (not from the jackpot), so on average players get back about **95%** of what they spend and the other ~5% leaves the economy. `/lottery` shows the jackpot, your tickets, how many tickets are sold and last night's result.
+
+**Details worth knowing**
+- **Saved:** tickets, the jackpot and the last result are in the database, so redeploys don't lose them. Cost: roughly 1 Upstash command per ticket bought plus a few per draw.
+- **Offline at midnight?** The draw happens as soon as Milo is back (it catches up on any missed day, up to 3 days).
+- **Results:** posted as an embed (no pings) in `LOTTERY_CHANNEL_ID`, or in `RESET_ANNOUNCE_CHANNEL_ID` if that's your only channel, and always summarised in the log channel. The midnight announcement also mentions `/lottery`.
+- **Leaderboard:** lottery prizes change balances but do **not** count towards "total earned", so one lucky jackpot can't dominate the all-time board.
+- **Blocked** while a Gamblin game is running, and for frozen people.
+- **Backups:** `?backup` / `?restore` don't include lottery tickets. If you restore a backup made earlier in the day, tickets bought afterwards stay valid.
+
+
+## 25. Naming the currency (`POINTS_NAME`, `POINTS_EMOJI`)
+
+By default the currency is called **points**. Set these in Render and Milo says it everywhere (balances, `/daily`, `/pay`, slots, Gamblin, the lottery, leaderboards, `/help`, manager messages, announcements):
+
+| Env var | Example | What it does |
+|---|---|---|
+| `POINTS_NAME` | `Milo Chips` | The plural name (max 24 characters). `1` uses the singular automatically: "1 Milo Chip", "5 Milo Chips". |
+| `POINTS_EMOJI` | `1554818642804482078` | Your custom emoji ID, or `<:chip:1554818642804482078>`, or `<a:chip:...>` for an animated one, or any normal emoji like `🪙`. |
+| `POINTS_NAME_SINGULAR` | `Gas` | Optional. Only needed if dropping the trailing "s" gives nonsense (for "Gas" it would say "Ga"). |
+
+**Where the emoji shows:** in normal messages it goes after the name ("sent 5 Milo Chips 🪙 to @Archo!"). In tight spots like the leaderboards and balances it shows **instead of** the name ("**1,200** 🪙"). In **footers, button labels and popup titles** Discord can't display custom emoji, so only the plain name is used there.
+
+**Getting an emoji ID:** upload the emoji to your server, then in any channel type a backslash before it, like `\:chip:`, and Discord shows `<:chip:1234567890>`; the digits are the ID. For an animated emoji copy the whole `<a:chip:1234567890>`.
+
+**What does *not* change:** the slash command names (`/points`, `/pay`, `/daily`…) stay as they are, and so do the database keys, so nothing saved is affected. Leave both variables empty and everything reads exactly as before.
+
+If you change `POINTS_NAME` later, just redeploy. Nothing else needs touching.

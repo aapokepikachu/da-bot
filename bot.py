@@ -70,6 +70,51 @@ CREATOR_USER_ID = os.getenv("CREATOR_USER_ID", "").strip()
 # us, but stays overridable via env in case you ever move servers.
 MILO_EMOJI = os.getenv("MILO_EMOJI", "<:Milo:1554818642804482078>").strip()
 
+
+# ---------------------------------------------------------------------------
+# The points currency: its NAME and EMOJI come from the environment, so you can call
+# it "Milo Chips", "Treats", whatever. Every message in the bot is built from these.
+#   POINTS_NAME           plural name, default "points"          e.g. Milo Chips
+#   POINTS_NAME_SINGULAR  optional; otherwise a trailing "s" is dropped for "1 ..."
+#   POINTS_EMOJI          a custom emoji ID (digits), a full <:name:id> / <a:name:id>,
+#                         or a normal emoji like 🪙. Default: none.
+# Slash COMMAND names (/points, /pay ...) are fixed; only the wording changes.
+# ---------------------------------------------------------------------------
+def _parse_emoji(raw: str) -> str:
+    raw = raw.strip()
+    return f"<:points:{raw}>" if raw.isdigit() else raw
+
+
+def _singular(name: str) -> str:
+    return name[:-1] if len(name) > 1 and name.lower().endswith("s") and not name.lower().endswith("ss") else name
+
+
+PTS_NAME = " ".join(os.getenv("POINTS_NAME", "").split())[:24] or "points"
+PTS_ONE = " ".join(os.getenv("POINTS_NAME_SINGULAR", "").split())[:24] or _singular(PTS_NAME)
+PTS_EMOJI = _parse_emoji(os.getenv("POINTS_EMOJI", ""))
+PTS_CAP = PTS_NAME[:1].upper() + PTS_NAME[1:]          # for the start of a sentence / a title
+
+
+def pname(n: int = 2) -> str:
+    """The currency's name for this amount: '1 chip', '5 chips'."""
+    return PTS_ONE if n == 1 else PTS_NAME
+
+
+def pamt(n: int) -> str:
+    """Plain text, no emoji -- for footers, buttons, modals and logs (they can't show custom emoji)."""
+    return f"{n:,} {pname(n)}"
+
+
+def pfmt(n: int) -> str:
+    """Amount + name, then the emoji if one is set -- for normal messages."""
+    return pamt(n) + (f" {PTS_EMOJI}" if PTS_EMOJI else "")
+
+
+def pcompact(n: int, bold: bool = False) -> str:
+    """Emoji ONLY when one is set (else the name) -- for tight spots like leaderboards."""
+    num = f"**{n:,}**" if bold else f"{n:,}"
+    return f"{num} {PTS_EMOJI}" if PTS_EMOJI else f"{num} {pname(n)}"
+
 # Optional: TheCatAPI started requiring an API key on /v1/breeds around late
 # September 2026 (it used to work unauthenticated). Free to get at
 # thecatapi.com/signup. Without it, /catbreed is disabled with a clear
@@ -415,6 +460,9 @@ class MiloClient(discord.Client):
         sched_task = asyncio.create_task(_gamblin_scheduler())
         _background_tasks.add(sched_task)
         sched_task.add_done_callback(_background_tasks.discard)
+        lottery_task = asyncio.create_task(_lottery_loop())
+        _background_tasks.add(lottery_task)
+        lottery_task.add_done_callback(_background_tasks.discard)
         if RESET_ANNOUNCE_CHANNEL_ID:
             reset_task = asyncio.create_task(_daily_reset_announcer())
             _background_tasks.add(reset_task)
@@ -438,7 +486,7 @@ class MiloClient(discord.Client):
         except Exception:
             logger.exception("Unexpected error during the shutdown save")
         try:
-            await asyncio.wait_for(log_event("🔴 **Milo is shutting down** (redeploy or restart) — points were saved first."), timeout=4)
+            await asyncio.wait_for(log_event(f"🔴 **Milo is shutting down** (redeploy or restart) — {PTS_NAME} were saved first."), timeout=4)
         except Exception:
             pass
         if self.session is not None:
@@ -540,7 +588,7 @@ async def aboutme_slash(interaction: discord.Interaction):
         f"Here's what I get up to around here:\n"
         f"• 🏐 Rounding up players for game lobbies with `/join`\n"
         f"• 🎭 Letting you pick your own roles\n"
-        f"• 🎰 Handing out points in `/slots` (and keeping a leaderboard)\n"
+        f"• 🎰 Handing out {PTS_NAME} in `/slots` (and keeping a leaderboard)\n"
         f"• 🐾 Saying hi, flipping coins, rolling dice, answering the magic 8-ball, and running polls\n"
         f"• 👋 Welcoming new members the moment they join\n\n"
         f"I run on pure vibes and whatever's happening right now — no database, no memory banks, "
@@ -2648,9 +2696,20 @@ POINTS_KEY_STATS = "milo:points:stats"       # HASH  user id -> JSON of Gamblin 
 POINTS_KEY_JP = "milo:points:jackpot"        # HASH  user id -> spins since their last 777 (the 200-spin guarantee)
 POINTS_KEY_FROZEN = "milo:points:frozen"     # SET   user ids a manager has frozen
 POINTS_KEY_SCHED = "milo:gamblin:schedule"   # STRING JSON list of scheduled Gamblin games
+LOTTERY_KEY_STATE = "milo:lottery:state"     # STRING JSON {"carry": jackpot, "drawn": last drawn day, "last": last result}
+LOTTERY_KEY_TICKETS = "milo:lottery:t:"      # + YYYY-MM-DD, HASH "<id>:<n>" -> "a,b,c" (that day's tickets)
+LOTTERY_RANGE = 15                            # numbers 1-15 (15 buttons fit Discord's 5x5 limit)
+LOTTERY_PICKS = 3
+LOTTERY_COST = _env_int("LOTTERY_TICKET_COST", 10)
+LOTTERY_MAX_TICKETS = _env_int("LOTTERY_MAX_TICKETS", 5)
+LOTTERY_SEED = _env_int("LOTTERY_JACKPOT_SEED", 50)      # the jackpot restarts here after a win
+LOTTERY_PRIZE_2 = LOTTERY_COST * 4                       # 2 matches pays 4x a ticket; 1 match refunds the ticket
+LOTTERY_CUT = max(1, (LOTTERY_COST * 3 + 10) // 20)     # ~15% of each ticket feeds the jackpot (rounded to nearest)
+_raw_lottery_channel = os.getenv("LOTTERY_CHANNEL_ID", "").strip()
+LOTTERY_CHANNEL_ID = int(_raw_lottery_channel) if _raw_lottery_channel.isdigit() else None
 
 _POINTS_UNAVAILABLE = (
-    f"{MILO_EMOJI} My points book isn't open right now (I'm having trouble reaching "
+    f"{MILO_EMOJI} My {PTS_NAME} book isn't open right now (I'm having trouble reaching "
     "my storage). Give me a minute and try again!"
 )
 
@@ -2662,7 +2721,7 @@ def _to_int(value) -> int:
 def frozen_block(uid: int) -> str | None:
     """A friendly note if a manager froze this person (no earning or gambling), else None."""
     if uid in POINTS.frozen:
-        return f"🧊 Your points are frozen, so you can't earn, gamble or trade right now. Ask a manager if you think that's a mistake. {MILO_EMOJI}"
+        return f"🧊 Your {PTS_NAME} are frozen, so you can't earn, gamble or trade right now. Ask a manager if you think that's a mistake. {MILO_EMOJI}"
     return None
 
 
@@ -2704,6 +2763,11 @@ class PointsManager:
         self._p_frozen: dict[int, bool] = {}
         self._p_sent: dict[tuple[str, int], int] = {}
         self._p_sched: str | None = None
+        self.tickets: dict[str, dict[int, dict[int, tuple]]] = {}   # lottery: day -> user -> {n: (a, b, c)}
+        self._p_tickets: dict[tuple[str, int, int], str] = {}
+        self._expire_tk: set[str] = set()
+        self.lottery: dict = {"carry": LOTTERY_SEED, "drawn": "", "last": None}
+        self._p_lstate: str | None = None
         # Memory-only, fine to lose:
         self.pity: dict[int, int] = {}
         self.last_spin: dict[int, float] = {}
@@ -2784,6 +2848,31 @@ class PointsManager:
         st["bs"] = max(st["bs"], net)
         st["gm"][game] = st["gm"].get(game, 0) + 1
         self._p_stats.add(uid)
+
+    def ticket_count(self, uid: int, day: str) -> int:
+        return len(self.tickets.get(day, {}).get(uid, {}))
+
+    def tickets_sold(self, day: str) -> int:
+        return sum(len(v) for v in self.tickets.get(day, {}).values())
+
+    def _mark_lottery(self) -> None:
+        self._p_lstate = json.dumps(self.lottery, separators=(",", ":"))
+
+    def buy_ticket(self, uid: int, day: str, picks: tuple, cost: int, cut: int) -> None:
+        """Take the cost, record the ticket (saved), and feed the jackpot."""
+        self.add_balance(uid, -cost)
+        mine = self.tickets.setdefault(day, {}).setdefault(uid, {})
+        n = max(mine, default=-1) + 1
+        mine[n] = tuple(picks)
+        self._p_tickets[(day, uid, n)] = ",".join(str(x) for x in picks)
+        self.lottery["carry"] += cut
+        self._mark_lottery()
+
+    def finish_lottery(self, day: str, carry: int, last: dict | None) -> None:
+        self.lottery["drawn"], self.lottery["carry"] = day, carry
+        if last is not None:
+            self.lottery["last"] = last
+        self._mark_lottery()
 
     def set_frozen(self, uid: int, flag: bool) -> bool:
         """Returns False if nothing changed."""
@@ -2905,6 +2994,7 @@ class PointsManager:
         users |= {u for (_, u), c in self._p_spins.items() if any(c)}
         users |= set(self._p_daily) | set(self._p_stats) | {u for u, d in self._p_jp.items() if d}
         users |= {u for (_, u), d in self._p_sent.items() if d}
+        users |= {u for (_, u, _n) in self._p_tickets}
         return users
 
     def _build_flush(self) -> tuple[list[list], list[tuple]]:
@@ -2957,6 +3047,18 @@ class PointsManager:
         if self._p_sched is not None:
             cmds.append(["SET", POINTS_KEY_SCHED, self._p_sched])
             meta.append(("sched", None, self._p_sched))
+        tk_queued: set[str] = set()
+        for (day, uid, n), val in self._p_tickets.items():
+            key = LOTTERY_KEY_TICKETS + day
+            cmds.append(["HSET", key, f"{uid}:{n}", val])
+            meta.append(("ticket", (day, uid, n), val))
+            if day not in self._expire_tk and day not in tk_queued:
+                cmds.append(["EXPIRE", key, 259200])           # a day's tickets tidy themselves up after 3 days
+                meta.append(("expire_t", day, 0))
+                tk_queued.add(day)
+        if self._p_lstate is not None:
+            cmds.append(["SET", LOTTERY_KEY_STATE, self._p_lstate])
+            meta.append(("lstate", None, self._p_lstate))
         return cmds, meta
 
     def _apply_saved(self, kind: str, ref, delta: int, result) -> None:
@@ -3010,6 +3112,14 @@ class PointsManager:
         elif kind == "sched":
             if self._p_sched == delta:
                 self._p_sched = None
+        elif kind == "ticket":
+            if self._p_tickets.get(ref) == delta:
+                del self._p_tickets[ref]
+        elif kind == "expire_t":
+            self._expire_tk.add(ref)
+        elif kind == "lstate":
+            if self._p_lstate == delta:
+                self._p_lstate = None
 
     def _prune_days(self) -> None:
         yesterday = _day_info(datetime.now(_LIMIT_TZ) - timedelta(days=1))[0]
@@ -3024,7 +3134,7 @@ class PointsManager:
         if store is None:
             return False, 0, "no Upstash database is configured"
         if not self.ready:
-            return False, 0, "points haven't been loaded from the database yet"
+            return False, 0, f"{PTS_NAME} haven't been loaded from the database yet"
         async with self._io_lock:
             cmds, meta = self._build_flush()
             if not cmds:
@@ -3074,6 +3184,10 @@ class PointsManager:
                 ["HGETALL", POINTS_KEY_JP],
                 ["SMEMBERS", POINTS_KEY_FROZEN],
                 ["GET", POINTS_KEY_SCHED],
+                ["HGETALL", LOTTERY_KEY_TICKETS + day],
+                ["HGETALL", LOTTERY_KEY_TICKETS + _day_before(day)],
+                ["HGETALL", LOTTERY_KEY_TICKETS + _day_before(_day_before(day))],
+                ["GET", LOTTERY_KEY_STATE],
             ])
             for item in results:
                 if not isinstance(item, dict) or "error" in item:
@@ -3125,6 +3239,30 @@ class PointsManager:
                     self.schedule = [x for x in parsed if isinstance(x, dict) and str(x.get("ts", "")).lstrip("-").isdigit()][:10]
                 except (TypeError, ValueError):
                     logger.warning("Ignoring unreadable Gamblin schedule in the database")
+            for n, tday in enumerate((day, _day_before(day), _day_before(_day_before(day)))):
+                merged: dict[tuple[int, int], tuple] = {}
+                for fld, v in _flat_pairs(results[8 + n].get("result")):
+                    u, _, i = fld.partition(":")
+                    if u.isdigit() and i.isdigit():
+                        merged[(int(u), int(i))] = tuple(int(x) for x in str(v).split(",") if x.isdigit())
+                for (pday, u, i), val in self._p_tickets.items():          # unsaved tickets win
+                    if pday == tday:
+                        merged[(u, i)] = tuple(int(x) for x in val.split(","))
+                by_user: dict[int, dict[int, tuple]] = {}
+                for (u, i), picks in merged.items():
+                    if len(picks) == LOTTERY_PICKS:
+                        by_user.setdefault(u, {})[i] = picks
+                if by_user or tday in self.tickets:
+                    self.tickets[tday] = by_user
+            raw_state = results[11].get("result")
+            if self._p_lstate is None and raw_state:
+                try:
+                    parsed = json.loads(raw_state)
+                    if isinstance(parsed, dict) and isinstance(parsed.get("carry"), int):
+                        self.lottery = {"carry": parsed["carry"], "drawn": str(parsed.get("drawn", "")),
+                                        "last": parsed.get("last") if isinstance(parsed.get("last"), dict) else None}
+                except (TypeError, ValueError):
+                    logger.warning("Ignoring unreadable lottery state in the database")
             self.ready = True
             self.last_error = None
 
@@ -3161,8 +3299,8 @@ class PointsManager:
                     self._save_fails += 1
                     if self._save_fails == 2:
                         await log_event(
-                            f"⚠️ **Saving points to Upstash has failed twice in a row** ({detail}). "
-                            "Points are safe in memory — don't redeploy until this clears; try `?updateDB`."
+                            f"⚠️ **Saving {PTS_NAME} to Upstash has failed twice in a row** ({detail}). "
+                            f"{PTS_CAP} are safe in memory — don't redeploy until this clears; try `?updateDB`."
                         )
 
     def start(self) -> None:
@@ -3229,7 +3367,7 @@ def _spin_precheck(uid: int) -> tuple[str, dict]:
         if balance < SLOTS_PACK_COST:
             return "broke", {"msg": (
                 f"🎰 You've used all {SLOTS_FREE_SPINS} free spins today. A bonus pack ({SLOTS_PACK_SPINS} spins) "
-                f"costs {SLOTS_PACK_COST} points and you have {balance}. Fresh free spins in "
+                f"costs {pfmt(SLOTS_PACK_COST)} and you have {pamt(balance)}. Fresh free spins in "
                 f"{_format_wait(secs_to_reset)}!"
             )}
         return "ok", {"paid": True, "cost": SLOTS_PACK_COST, "day": day}
@@ -3250,11 +3388,11 @@ def _perform_spin(uid: int, *, paid: bool, cost: int, day: str) -> discord.Embed
 
     symbol = reels[0]
     if payout and symbol == SLOT_JACKPOT:
-        headline, color = f"💥 **JACKPOT!!!** Triple 7️⃣ — **+{payout} points!**", discord.Color.gold()
+        headline, color = f"💥 **JACKPOT!!!** Triple 7️⃣ — **+{pfmt(payout)}!**", discord.Color.gold()
     elif payout and symbol == "⭐":
-        headline, color = f"🌟 **Triple stars!** **+{payout} points!**", discord.Color.gold()
+        headline, color = f"🌟 **Triple stars!** **+{pfmt(payout)}!**", discord.Color.gold()
     elif payout:
-        headline, color = f"🎉 **Triple {symbol}!** **+{payout} points!**", discord.Color.green()
+        headline, color = f"🎉 **Triple {symbol}!** **+{pfmt(payout)}!**", discord.Color.green()
     elif len({*reels}) == 2:
         headline, color = "✨ Almost! Two matched.", discord.Color.dark_grey()
     else:
@@ -3267,7 +3405,7 @@ def _perform_spin(uid: int, *, paid: bool, cost: int, day: str) -> discord.Embed
     free_used, bonus_used = POINTS.used(uid, day)
     pack_left = (-bonus_used) % SLOTS_PACK_SPINS if paid else 0
     if paid and cost:
-        spin_line = f"💰 Bonus pack bought (−{cost} points) — {SLOTS_PACK_SPINS} spins"
+        spin_line = f"💰 Bonus pack bought (−{pfmt(cost)}) — {SLOTS_PACK_SPINS} spins"
     elif paid:
         spin_line = "🎁 Bonus pack spin"
     else:
@@ -3278,7 +3416,7 @@ def _perform_spin(uid: int, *, paid: bool, cost: int, day: str) -> discord.Embed
         color=color,
     )
     footer = (
-        f"Balance: {POINTS.points(uid):,} pts · Free spins left: {SLOTS_FREE_SPINS - free_used}/{SLOTS_FREE_SPINS} "
+        f"Balance: {pamt(POINTS.points(uid))} · Free spins left: {SLOTS_FREE_SPINS - free_used}/{SLOTS_FREE_SPINS} "
         f"· Bonus spins left: {SLOTS_PAID_SPINS - bonus_used}/{SLOTS_PAID_SPINS}"
     )
     if pack_left:
@@ -3303,8 +3441,8 @@ class BonusSpinConfirmView(discord.ui.View):
         self.owner_id = owner_id
         self.used = False
         self.summary = (
-            f"💰 **Bonus pack** — **{SLOTS_PACK_SPINS} spins for {SLOTS_PACK_COST} points**.\n"
-            f"You have **{balance:,}** pts · **{bonus_left}/{SLOTS_PAID_SPINS}** bonus spins left today.\n"
+            f"💰 **Bonus pack** — **{SLOTS_PACK_SPINS} spins for {pfmt(SLOTS_PACK_COST)}**.\n"
+            f"You have {pcompact(balance, True)} · **{bonus_left}/{SLOTS_PAID_SPINS}** bonus spins left today.\n"
             f"Buy the pack and take your first spin?"
         )
 
@@ -3314,7 +3452,7 @@ class BonusSpinConfirmView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label=f"Buy pack ({SLOTS_PACK_COST} pts)", emoji="🎰", style=discord.ButtonStyle.success)
+    @discord.ui.button(label=f"Buy pack ({pamt(SLOTS_PACK_COST)})", emoji="🎰", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.used:
             await interaction.response.send_message("Already handled!", ephemeral=True)
@@ -3345,14 +3483,14 @@ class BonusSpinConfirmView(discord.ui.View):
         self.used = True
         self.stop()
         await interaction.response.edit_message(
-            content="Cancelled — no points spent. 🐾", view=None
+            content=f"Cancelled — no {PTS_NAME} spent. 🐾", view=None
         )
 
     async def on_timeout(self) -> None:
         self.used = True  # nothing charged; the buttons just go dead
 
 
-@bot.tree.command(name="slots", description="Spin the slot machine and win points.")
+@bot.tree.command(name="slots", description=f"Spin the slot machine and win {PTS_NAME}.")
 async def slots_slash(interaction: discord.Interaction):
     if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
         await interaction.response.send_message(
@@ -3394,8 +3532,8 @@ async def slots_slash(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="points", description="Check your Milo points, rank, and spins left.")
-@app_commands.describe(user="Whose points to check (defaults to you)")
+@bot.tree.command(name="points", description=f"Check your {PTS_NAME}, rank, and spins left.")
+@app_commands.describe(user=f"Whose {PTS_NAME} to check (defaults to you)")
 async def points_slash(interaction: discord.Interaction, user: discord.Member | None = None):
     if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
         await interaction.response.send_message(
@@ -3414,14 +3552,14 @@ async def points_slash(interaction: discord.Interaction, user: discord.Member | 
         board_text = f"#{rank} on the leaderboard"
     else:
         board_text = (
-            f"Not on it yet — **{earned:,}/{LEADERBOARD_MIN_POINTS:,}** points earned. "
+            f"Not on it yet — **{earned:,}/{LEADERBOARD_MIN_POINTS:,}** {PTS_NAME} earned. "
             f"Earn {LEADERBOARD_MIN_POINTS - earned:,} more to get on the leaderboard!"
         )
 
     embed = discord.Embed(
-        title=f"{MILO_EMOJI} {target.display_name}'s points", color=discord.Color.blurple()
+        title=f"{MILO_EMOJI} {target.display_name}'s {PTS_NAME}", color=discord.Color.blurple()
     )
-    embed.add_field(name="💰 Balance", value=f"{POINTS.points(uid):,}")
+    embed.add_field(name="💰 Balance", value=pcompact(POINTS.points(uid)))
     embed.add_field(name="🏆 Total earned", value=f"{earned:,}")
     embed.add_field(name="📊 Leaderboard", value=board_text, inline=False)
     if target.id == interaction.user.id:
@@ -3431,7 +3569,7 @@ async def points_slash(interaction: discord.Interaction, user: discord.Member | 
             name="🎰 Spins today",
             value=(
                 f"Free: **{SLOTS_FREE_SPINS - free_used}/{SLOTS_FREE_SPINS}** left · "
-                f"Bonus ({SLOTS_PACK_SPINS}-spin pack for {SLOTS_PACK_COST} pts): **{SLOTS_PAID_SPINS - bonus_used}/{SLOTS_PAID_SPINS}** left\n"
+                f"Bonus ({SLOTS_PACK_SPINS}-spin pack for {pfmt(SLOTS_PACK_COST)}): **{SLOTS_PAID_SPINS - bonus_used}/{SLOTS_PAID_SPINS}** left\n"
                 f"Resets in {_format_wait(secs)}."
             ),
             inline=False,
@@ -3442,7 +3580,7 @@ async def points_slash(interaction: discord.Interaction, user: discord.Member | 
             inline=False,
         )
     if POINTS.store is None:
-        embed.set_footer(text="⚠️ Points aren't being saved yet (no database is set up).")
+        embed.set_footer(text=f"⚠️ {PTS_CAP} aren't being saved yet (no database is set up).")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -3462,7 +3600,7 @@ async def leaderboard_slash(interaction: discord.Interaction):
     medals = ["🥇", "🥈", "🥉"]
     if board:
         lines = [
-            f"{medals[i] if i < 3 else f'`#{i + 1}`'} <@{uid}> — **{earned:,}** pts"
+            f"{medals[i] if i < 3 else f'`#{i + 1}`'} <@{uid}> — {pcompact(earned, True)}"
             for i, (uid, earned) in enumerate(board[:10])
         ]
         embed.description = "**📈 Top earners (all-time)**\n" + "\n".join(lines)
@@ -3474,7 +3612,7 @@ async def leaderboard_slash(interaction: discord.Interaction):
         near = POINTS.closest()
         text = (
             f"**📈 Top earners (all-time)**\nNobody's on this board yet! **Earn your first "
-            f"{LEADERBOARD_MIN_POINTS:,} points to reach it.** Win them in `/slots`! 🎰"
+            f"{pfmt(LEADERBOARD_MIN_POINTS)} to reach it.** Win them in `/slots`! 🎰"
         )
         if near:
             text += "\n\n**Closest so far:**\n" + "\n".join(
@@ -3486,12 +3624,12 @@ async def leaderboard_slash(interaction: discord.Interaction):
     rich = POINTS.richest(5)
     if rich:
         rich_lines = [
-            f"{medals[i] if i < 3 else f'`#{i + 1}`'} <@{uid}> — **{bal:,}** pts"
+            f"{medals[i] if i < 3 else f'`#{i + 1}`'} <@{uid}> — {pcompact(bal, True)}"
             for i, (uid, bal) in enumerate(rich)
         ]
         rich_text = "\n".join(rich_lines)
     else:
-        rich_text = "Nobody's holding any points right now."
+        rich_text = f"Nobody's holding any {PTS_NAME} right now."
     embed.add_field(name="💰 Richest right now (current balance)", value=rich_text, inline=False)
     embed.set_footer(text=footer + " · Balance board has no minimum")
     await interaction.response.send_message(embed=embed)
@@ -3515,11 +3653,11 @@ async def _handle_updatedb_command(message: discord.Message) -> None:
         text = "🎰 Gamblin is running — it saves everything automatically when it ends. Use `?gamblin stop` first if you need to redeploy now."
     elif POINTS.store is None:
         text = (
-            "⚠️ No Upstash database is configured, so points only exist in memory and "
+            f"⚠️ No Upstash database is configured, so {PTS_NAME} only exist in memory and "
             "**WILL be lost on redeploy.** Set `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` first."
         )
     elif not POINTS.ready:
-        text = "❌ Points haven't been loaded from the database yet, so there's nothing safe to save. Try again in a minute."
+        text = f"❌ {PTS_CAP} haven't been loaded from the database yet, so there's nothing safe to save. Try again in a minute."
     else:
         try:
             ok, people, detail = await asyncio.wait_for(POINTS.flush("manual"), timeout=25)
@@ -3528,7 +3666,7 @@ async def _handle_updatedb_command(message: discord.Message) -> None:
         if ok and detail == "nothing unsaved":
             text = "✅ Everything was already saved — nothing new since the last save. **Safe to redeploy.**"
         elif ok:
-            text = f"✅ Saved {people} {'person' if people == 1 else 'people'}'s points to Upstash. **Safe to redeploy.**"
+            text = f"✅ Saved {people} {'person' if people == 1 else 'people'}'s {PTS_NAME} to Upstash. **Safe to redeploy.**"
         else:
             text = f"❌ **NOT saved:** {detail}. **Don't redeploy yet** — try `?updateDB` again in a minute."
     await message.channel.send(text, delete_after=120)
@@ -3979,18 +4117,19 @@ async def help_slash(interaction: discord.Interaction):
     )
     payout_line = " · ".join(f"{sym} {pts}" for sym, pts in SLOT_PAYOUTS.items())
     embed.add_field(
-        name="🎰 Slots & Points",
+        name=f"🎰 Slots & {PTS_CAP}",
         value=(
-            f"`/slots` — spin for points: **{SLOTS_FREE_SPINS} free spins a day**, then up to "
-            f"{SLOTS_PAID_SPINS} bonus spins ({SLOTS_PACK_SPINS}-spin packs for {SLOTS_PACK_COST} points). "
+            f"`/slots` — spin for {PTS_NAME}: **{SLOTS_FREE_SPINS} free spins a day**, then up to "
+            f"{SLOTS_PAID_SPINS} bonus spins ({SLOTS_PACK_SPINS}-spin packs for {pfmt(SLOTS_PACK_COST)}). "
             f"Every {SLOTS_JACKPOT_PITY_AT}th spin without a 777 **is** a 777!\n"
             f"Match all 3 to win: {payout_line}\n"
             "`/points` — your balance, rank and spins left\n"
-            f"`/daily` — claim free points every day; a streak makes it bigger (+{DAILY_WEEK_BONUS} bonus every 7th day!)\n"
-            f"`/pay @user amount` — send points to a friend (up to {PAY_DAILY_CAP} a day)\n"
+            f"`/daily` — claim free {PTS_NAME} every day; a streak makes it bigger (+{DAILY_WEEK_BONUS} bonus every 7th day!)\n"
+            f"`/pay @user amount` — send {PTS_NAME} to a friend (up to {pamt(PAY_DAILY_CAP)} a day)\n"
             "`/gamblinstats` — your Gamblin record + the hall of fame\n"
+            f"`/lottery` — pick 3 numbers for the daily draw (rollover jackpot)\n"
             f"`/leaderboard` — top 10 all-time earners (earn {LEADERBOARD_MIN_POINTS:,} to join) + top 5 richest right now\n"
-            f"Bonus packs ask for confirmation before spending points\n"
+            f"Bonus packs ask for confirmation before spending {PTS_NAME}\n"
             "🎲 Managers sometimes run **Gamblin** nights (slots, blackjack, duck race & roulette) — watch for the @everyone ping!"
         ),
         inline=False,
@@ -4434,8 +4573,8 @@ class GamblinSession:
             title="🎰 GAMBLIN is starting!",
             description=(
                 "**[ ❔ | ❔ | ❔ ]**\n"
-                f"Press **Join** to play with your Milo points. Starts <t:{end_ts}:R>.\n\n"
-                f"• {GAMBLIN_ROUNDS} rounds · bets {GAMBLIN_MIN_BET}–{GAMBLIN_MAX_BET} pts\n"
+                f"Press **Join** to play with your {PTS_NAME}. Starts <t:{end_ts}:R>.\n\n"
+                f"• {GAMBLIN_ROUNDS} rounds · bets {GAMBLIN_MIN_BET}–{pfmt(GAMBLIN_MAX_BET)}\n"
                 "• Your winnings count towards the **leaderboard**\n"
                 "• Everything is buttons — no typing needed\n"
                 "• `/slots` and `/ask` are paused until it's over"
@@ -4475,7 +4614,7 @@ class GamblinSession:
         )
         if stage:
             self._odds_fields(embed, stage)
-        embed.set_footer(text=f"{len(self.players)} players · bets {GAMBLIN_MIN_BET}–{GAMBLIN_MAX_BET} pts")
+        embed.set_footer(text=f"{len(self.players)} players · bets {GAMBLIN_MIN_BET}–{pamt(GAMBLIN_MAX_BET)}")
         return embed
 
     async def _play_round(self, r: int) -> None:
@@ -4579,7 +4718,7 @@ class GamblinSession:
         ]
         embed = discord.Embed(
             title="🎰 Gamblin is over!",
-            description="\n".join(lines)[:4000] + "\n\n💾 Saving everyone's points… `/slots` and `/ask` are back!",
+            description="\n".join(lines)[:4000] + f"\n\n💾 Saving everyone's {PTS_NAME}… `/slots` and `/ask` are back!",
             color=discord.Color.gold(),
         )
         await self._send(embed=embed)
@@ -4622,11 +4761,11 @@ def _gcheck(g: GamblinSession, p: GPlayer, t: str, x: str) -> str | None:
 def _gstake_error(p: GPlayer, amt: int) -> str | None:
     avail = _g_avail(p)
     if amt < GAMBLIN_MIN_BET:
-        return f"Minimum bet is {GAMBLIN_MIN_BET} points."
+        return f"Minimum bet is {pfmt(GAMBLIN_MIN_BET)}."
     if amt > GAMBLIN_MAX_BET:
-        return f"Maximum bet is {GAMBLIN_MAX_BET} points."
+        return f"Maximum bet is {pfmt(GAMBLIN_MAX_BET)}."
     if amt > avail:
-        return f"You only have {avail:,} points free to bet."
+        return f"You only have {pfmt(avail)} free to bet."
     return None
 
 
@@ -4648,7 +4787,7 @@ async def _g_stake_panel(interaction, p: GPlayer, t: str, x: str) -> None:
     avail = _g_avail(p)
     cap = min(avail, GAMBLIN_MAX_BET)
     if cap < GAMBLIN_MIN_BET:
-        await _gpanel(interaction, f"You need at least {GAMBLIN_MIN_BET} free points to bet (you have {avail:,}).")
+        await _gpanel(interaction, f"You need at least {GAMBLIN_MIN_BET} free {PTS_NAME} to bet (you have {avail:,}).")
         return
     seen: set[int] = set()
     buttons = []
@@ -4664,7 +4803,7 @@ async def _g_stake_panel(interaction, p: GPlayer, t: str, x: str) -> None:
     buttons.append(_gb("← Back", "gmb:open:full" if t == "f" else "gmb:open:reel", "grey"))
     text = (
         f"{desc} · pays **{_fx(mult)}** · {_g_odds(prob)}\n"
-        f"You have **{avail:,}** pts free (max bet {GAMBLIN_MAX_BET}). How much do you want to bet?"
+        f"You have {pcompact(avail, True)} free (max bet {GAMBLIN_MAX_BET}). How much do you want to bet?"
     )
     await _gpanel(interaction, text, _gview(*buttons))
 
@@ -4673,7 +4812,7 @@ async def _g_confirm_panel(interaction, p: GPlayer, t: str, x: str, amt: int) ->
     desc, prob, mult = _gtarget(t, x)
     payout = math.floor(amt * mult)
     text = (
-        f"Lock **{amt:,}** pts on {desc}?\n"
+        f"Lock {pcompact(amt, True)} on {desc}?\n"
         f"Win → **{payout:,}** back (+{payout - amt:,}) · Lose → −{amt:,}\n"
         "⚠️ Once locked, it can't be changed."
     )
@@ -4690,7 +4829,7 @@ class GamblinStakeModal(discord.ui.Modal):
         super().__init__(title="Custom bet", timeout=300)
         self.t, self.x = t, x
         self.amount = discord.ui.TextInput(
-            label=f"Points ({GAMBLIN_MIN_BET}–{cap})", placeholder=str(cap), min_length=1, max_length=7,
+            label=f"{PTS_CAP} ({GAMBLIN_MIN_BET}–{cap})", placeholder=str(cap), min_length=1, max_length=7,
         )
         self.add_item(self.amount)
 
@@ -4740,7 +4879,7 @@ async def handle_gamblin_click(interaction: discord.Interaction, custom_id: str)
         elif len(g.players) >= GAMBLIN_MAX_PLAYERS:
             await say("🎰 The table is full!")
         elif POINTS.points(uid) < GAMBLIN_MIN_BET:
-            await say(f"You need at least {GAMBLIN_MIN_BET} points to play (you have {POINTS.points(uid)}). Win some in `/slots`!")
+            await say(f"You need at least {pfmt(GAMBLIN_MIN_BET)} to play (you have {POINTS.points(uid)}). Win some in `/slots`!")
         else:
             g.players[uid] = GPlayer(uid)
             await interaction.response.send_message(
@@ -4766,7 +4905,7 @@ async def handle_gamblin_click(interaction: discord.Interaction, custom_id: str)
             await say(err)
             return
         if _g_avail(p) < GAMBLIN_MIN_BET:
-            await say(f"You need at least {GAMBLIN_MIN_BET} free points to bet (you have {_g_avail(p):,}).")
+            await say(f"You need at least {GAMBLIN_MIN_BET} free {PTS_NAME} to bet (you have {_g_avail(p):,}).")
             return
         await _g_pick_panel(interaction, p, kind)
         return
@@ -4783,7 +4922,7 @@ async def handle_gamblin_click(interaction: discord.Interaction, custom_id: str)
         if action == "cust":
             cap = min(_g_avail(p), GAMBLIN_MAX_BET)
             if cap < GAMBLIN_MIN_BET:
-                await say(f"You need at least {GAMBLIN_MIN_BET} free points to bet.")
+                await say(f"You need at least {GAMBLIN_MIN_BET} free {PTS_NAME} to bet.")
                 return
             await interaction.response.send_modal(GamblinStakeModal(t, x, cap))
             return
@@ -4807,7 +4946,7 @@ async def handle_gamblin_click(interaction: discord.Interaction, custom_id: str)
         p.pending += amt
         tail = ("Wait for the reels — good luck! 🍀" if t == "f"
                 else "Result comes when the reel stops. You can bet on the next reel when it opens.")
-        await _gpanel(interaction, f"🔒 **Locked:** {amt:,} pts on {desc} (pays {_fx(mult)}).\n{tail}")
+        await _gpanel(interaction, f"🔒 **Locked:** {pfmt(amt)} on {desc} (pays {_fx(mult)}).\n{tail}")
         return
 
     await say("That button looks broken — open a fresh bet from the main message.")
@@ -4914,8 +5053,8 @@ class BlackjackSession(GamblinSession):
             title="🃏 BLACKJACK is starting!",
             description=(
                 "**[ `A♠` | `K♥` ]**\n"
-                f"Press **Join** to play with your Milo points. Starts <t:{end_ts}:R>.\n\n"
-                f"• {GAMBLIN_BJ_ROUNDS} rounds vs the dealer · bets {GAMBLIN_MIN_BET}–{GAMBLIN_MAX_BET} pts\n"
+                f"Press **Join** to play with your {PTS_NAME}. Starts <t:{end_ts}:R>.\n\n"
+                f"• {GAMBLIN_BJ_ROUNDS} rounds vs the dealer · bets {GAMBLIN_MIN_BET}–{pfmt(GAMBLIN_MAX_BET)}\n"
                 "• **Hit / Stand / Double** — blackjack pays **3:2**, dealer stands on 17\n"
                 "• Your winnings count towards the **leaderboard**\n"
                 "• Everything is buttons — no typing needed\n"
@@ -4948,7 +5087,7 @@ class BlackjackSession(GamblinSession):
                 line += f"  →  {results[p.uid]}"
             lines.append(line)
         e.description = "\n".join(lines)[:4000]
-        e.set_footer(text=f"{len(self.players)} players · bets {GAMBLIN_MIN_BET}–{GAMBLIN_MAX_BET} pts · blackjack pays 3:2")
+        e.set_footer(text=f"{len(self.players)} players · bets {GAMBLIN_MIN_BET}–{pamt(GAMBLIN_MAX_BET)} · blackjack pays 3:2")
         return e
 
     # ---- one round --------------------------------------------------------------
@@ -4966,7 +5105,7 @@ class BlackjackSession(GamblinSession):
             title=f"🃏 Blackjack — Round {r}/{GAMBLIN_BJ_ROUNDS}",
             description=(
                 f"💰 **Place your bets!** Closing <t:{int(self.deadline)}:R>\n"
-                f"Press **Place bet** — bets {GAMBLIN_MIN_BET}–{GAMBLIN_MAX_BET} pts. "
+                f"Press **Place bet** — bets {GAMBLIN_MIN_BET}–{pfmt(GAMBLIN_MAX_BET)}. "
                 "New players can sit down any round."
             ),
             color=discord.Color.dark_green(),
@@ -5060,7 +5199,7 @@ class BlackjackSession(GamblinSession):
         ]
         embed = discord.Embed(
             title="🃏 Blackjack is over!",
-            description="\n".join(lines)[:4000] + "\n\n💾 Saving everyone's points… `/slots` and `/ask` are back!",
+            description="\n".join(lines)[:4000] + f"\n\n💾 Saving everyone's {PTS_NAME}… `/slots` and `/ask` are back!",
             color=discord.Color.dark_green(),
         )
         await self._send(embed=embed)
@@ -5071,7 +5210,7 @@ async def _bj_stake_panel(interaction, p: BJPlayer) -> None:
     avail = _g_avail(p)
     cap = min(avail, GAMBLIN_MAX_BET)
     if cap < GAMBLIN_MIN_BET:
-        await _gpanel(interaction, f"You need at least {GAMBLIN_MIN_BET} free points to bet (you have {avail:,}).")
+        await _gpanel(interaction, f"You need at least {GAMBLIN_MIN_BET} free {PTS_NAME} to bet (you have {avail:,}).")
         return
     seen: set[int] = set()
     buttons = []
@@ -5086,13 +5225,13 @@ async def _bj_stake_panel(interaction, p: BJPlayer) -> None:
     buttons.append(_gb("✏️ Custom", "bj:cust", "blue"))
     text = (
         f"🃏 **How much do you want to bet this round?**\n"
-        f"You have **{avail:,}** pts free (max bet {GAMBLIN_MAX_BET}). Blackjack pays 3:2, win pays 1:1."
+        f"You have {pcompact(avail, True)} free (max bet {GAMBLIN_MAX_BET}). Blackjack pays 3:2, win pays 1:1."
     )
     await _gpanel(interaction, text, _gview(*buttons))
 
 
 async def _bj_confirm_panel(interaction, amt: int) -> None:
-    text = f"Sit down with **{amt:,}** pts?\n⚠️ Once locked, it can't be changed (you can still Double later if you have the points)."
+    text = f"Sit down with {pcompact(amt, True)}?\n⚠️ Once locked, it can't be changed (you can still Double later if you have the {PTS_NAME})."
     await _gpanel(interaction, text, _gview(
         _gb(f"🔒 Lock it in ({amt})", f"bj:lock:{amt}", "green"),
         _gb("← Back", "bj:bet", "grey"),
@@ -5132,7 +5271,7 @@ class BJStakeModal(discord.ui.Modal):
     def __init__(self, cap: int) -> None:
         super().__init__(title="Custom bet", timeout=300)
         self.amount = discord.ui.TextInput(
-            label=f"Points ({GAMBLIN_MIN_BET}–{cap})", placeholder=str(cap), min_length=1, max_length=7,
+            label=f"{PTS_CAP} ({GAMBLIN_MIN_BET}–{cap})", placeholder=str(cap), min_length=1, max_length=7,
         )
         self.add_item(self.amount)
 
@@ -5181,7 +5320,7 @@ async def handle_bj_click(interaction: discord.Interaction, custom_id: str) -> N
         if len(g.players) >= GAMBLIN_MAX_PLAYERS:
             return "🃏 The table is full!"
         if POINTS.points(uid) < GAMBLIN_MIN_BET:
-            return f"You need at least {GAMBLIN_MIN_BET} points to play (you have {POINTS.points(uid)}). Win some in `/slots`!"
+            return f"You need at least {pfmt(GAMBLIN_MIN_BET)} to play (you have {POINTS.points(uid)}). Win some in `/slots`!"
         g.players[uid] = BJPlayer(uid)
         return None
 
@@ -5230,7 +5369,7 @@ async def handle_bj_click(interaction: discord.Interaction, custom_id: str) -> N
         if action == "cust":
             cap = min(_g_avail(p), GAMBLIN_MAX_BET)
             if cap < GAMBLIN_MIN_BET:
-                await say(f"You need at least {GAMBLIN_MIN_BET} free points to bet.")
+                await say(f"You need at least {GAMBLIN_MIN_BET} free {PTS_NAME} to bet.")
                 return
             await interaction.response.send_modal(BJStakeModal(cap))
             return
@@ -5247,7 +5386,7 @@ async def handle_bj_click(interaction: discord.Interaction, custom_id: str) -> N
             return
         p.bet = amt                                   # lock: instant memory work, no awaits
         p.pending += amt
-        await _gpanel(interaction, f"🔒 **Locked:** {amt:,} pts. Cards are dealt when betting closes — good luck! 🍀")
+        await _gpanel(interaction, f"🔒 **Locked:** {pfmt(amt)}. Cards are dealt when betting closes — good luck! 🍀")
         return
 
     if action == "hand":
@@ -5282,7 +5421,7 @@ async def handle_bj_click(interaction: discord.Interaction, custom_id: str) -> N
                 await say("⏫ You can only double on your first two cards.")
                 return
             if _g_avail(p) < p.bet:
-                await say(f"⏫ You need {p.bet:,} more free points to double.")
+                await say(f"⏫ You need {p.bet:,} more free {PTS_NAME} to double.")
                 return
             extra = p.bet
             p.pending += extra
@@ -5325,7 +5464,7 @@ async def _stake_panel(interaction, p: GPlayer, header: str, conf_id, cust_id: s
     avail = _g_avail(p)
     cap = min(avail, GAMBLIN_MAX_BET)
     if cap < GAMBLIN_MIN_BET:
-        await _gpanel(interaction, f"You need at least {GAMBLIN_MIN_BET} free points to bet (you have {avail:,}).")
+        await _gpanel(interaction, f"You need at least {GAMBLIN_MIN_BET} free {PTS_NAME} to bet (you have {avail:,}).")
         return
     seen: set[int] = set()
     buttons = []
@@ -5342,7 +5481,7 @@ async def _stake_panel(interaction, p: GPlayer, header: str, conf_id, cust_id: s
         buttons.append(_gb("← Back", back_id, "grey"))
     await _gpanel(
         interaction,
-        f"{header}\nYou have **{avail:,}** pts free (max bet {GAMBLIN_MAX_BET}). How much?",
+        f"{header}\nYou have {pcompact(avail, True)} free (max bet {GAMBLIN_MAX_BET}). How much?",
         _gview(*buttons),
     )
 
@@ -5356,7 +5495,7 @@ def _join_table(g: GamblinSession, uid: int, player_cls, emoji: str) -> str | No
     if len(g.players) >= GAMBLIN_MAX_PLAYERS:
         return f"{emoji} The table is full!"
     if POINTS.points(uid) < GAMBLIN_MIN_BET:
-        return f"You need at least {GAMBLIN_MIN_BET} points to play (you have {POINTS.points(uid)}). Win some in `/slots`!"
+        return f"You need at least {pfmt(GAMBLIN_MIN_BET)} to play (you have {POINTS.points(uid)}). Win some in `/slots`!"
     g.players[uid] = player_cls(uid)
     return None
 
@@ -5401,8 +5540,8 @@ class DuckRaceSession(GamblinSession):
             title="🦆 DUCK RACE is starting!",
             description=(
                 "**🟥🟦🟩🟨🟪🟧 — pick your duck!**\n"
-                f"Press **Join** to play with your Milo points. Starts <t:{end_ts}:R>.\n\n"
-                f"• {GAMBLIN_DUCK_ROUNDS} races · bets {GAMBLIN_MIN_BET}–{GAMBLIN_MAX_BET} pts\n"
+                f"Press **Join** to play with your {PTS_NAME}. Starts <t:{end_ts}:R>.\n\n"
+                f"• {GAMBLIN_DUCK_ROUNDS} races · bets {GAMBLIN_MIN_BET}–{pfmt(GAMBLIN_MAX_BET)}\n"
                 "• 6 ducks with different odds — the long shots pay the most\n"
                 "• Your winnings count towards the **leaderboard**\n"
                 "• Everything is buttons — no typing needed\n"
@@ -5426,7 +5565,7 @@ class DuckRaceSession(GamblinSession):
             for i in range(6):
                 lines.append(f"{DUCKS[i][0]} {'·' * pos[i]}🦆{'·' * (DUCK_TRACK - pos[i])}🏁")
         e.description = "\n".join(lines)
-        e.set_footer(text=f"{len(self.players)} players · bets {GAMBLIN_MIN_BET}–{GAMBLIN_MAX_BET} pts · one bet per race")
+        e.set_footer(text=f"{len(self.players)} players · bets {GAMBLIN_MIN_BET}–{pamt(GAMBLIN_MAX_BET)} · one bet per race")
         return e
 
     def _finish_order(self) -> list[int]:
@@ -5522,7 +5661,7 @@ async def _standings(g: GamblinSession, title: str, color) -> None:
     ]
     embed = discord.Embed(
         title=title,
-        description="\n".join(lines)[:4000] + "\n\n💾 Saving everyone's points… `/slots` and `/ask` are back!",
+        description="\n".join(lines)[:4000] + f"\n\n💾 Saving everyone's {PTS_NAME}… `/slots` and `/ask` are back!",
         color=color,
     )
     await g._send(embed=embed)
@@ -5556,7 +5695,7 @@ class DKStakeModal(discord.ui.Modal):
         super().__init__(title="Custom bet", timeout=300)
         self.duck = duck
         self.amount = discord.ui.TextInput(
-            label=f"Points ({GAMBLIN_MIN_BET}–{cap})", placeholder=str(cap), min_length=1, max_length=7,
+            label=f"{PTS_CAP} ({GAMBLIN_MIN_BET}–{cap})", placeholder=str(cap), min_length=1, max_length=7,
         )
         self.add_item(self.amount)
 
@@ -5652,7 +5791,7 @@ async def handle_dk_click(interaction: discord.Interaction, custom_id: str) -> N
     if action == "cust":
         cap = min(_g_avail(p), GAMBLIN_MAX_BET)
         if cap < GAMBLIN_MIN_BET:
-            await say(f"You need at least {GAMBLIN_MIN_BET} free points to bet.")
+            await say(f"You need at least {GAMBLIN_MIN_BET} free {PTS_NAME} to bet.")
             return
         await interaction.response.send_modal(DKStakeModal(duck, cap))
         return
@@ -5669,7 +5808,7 @@ async def handle_dk_click(interaction: discord.Interaction, custom_id: str) -> N
         return
     p.bet = (duck, amt)                                   # lock: instant memory work, no awaits
     p.pending += amt
-    await _gpanel(interaction, f"🔒 **Locked:** {amt:,} pts on {DUCKS[duck][0]} **{DUCKS[duck][1]}** (pays {_fx(g.mults[duck])}). Good luck! 🍀")
+    await _gpanel(interaction, f"🔒 **Locked:** {pfmt(amt)} on {DUCKS[duck][0]} **{DUCKS[duck][1]}** (pays {_fx(g.mults[duck])}). Good luck! 🍀")
 
 
 # =========================================================================
@@ -5736,8 +5875,8 @@ class RouletteSession(GamblinSession):
             title="🎡 ROULETTE is starting!",
             description=(
                 "**Place your bets, ladies and gentlemen!**\n"
-                f"Press **Join** to play with your Milo points. Starts <t:{end_ts}:R>.\n\n"
-                f"• {GAMBLIN_RL_ROUNDS} spins · bets {GAMBLIN_MIN_BET}–{GAMBLIN_MAX_BET} pts · up to {RL_MAX_BETS} bets a spin\n"
+                f"Press **Join** to play with your {PTS_NAME}. Starts <t:{end_ts}:R>.\n\n"
+                f"• {GAMBLIN_RL_ROUNDS} spins · bets {GAMBLIN_MIN_BET}–{pfmt(GAMBLIN_MAX_BET)} · up to {RL_MAX_BETS} bets a spin\n"
                 "• Real European wheel (0–36): Red/Black/Odd/Even/Low/High **x2**, Dozens **x3**, one Number **x36**\n"
                 "• Your winnings count towards the **leaderboard**\n"
                 "• Everything is buttons — no typing needed\n"
@@ -5753,7 +5892,7 @@ class RouletteSession(GamblinSession):
         e = discord.Embed(title=f"🎡 Roulette — Spin {self.round}/{GAMBLIN_RL_ROUNDS}", color=discord.Color.red())
         e.description = (status + (("\n\n" + "\n".join(lines)) if lines else ""))[:4000]
         e.add_field(name="Last numbers", value=self._hist_text(), inline=False)
-        e.set_footer(text=f"{len(self.players)} players · bets {GAMBLIN_MIN_BET}–{GAMBLIN_MAX_BET} pts · max {RL_MAX_BETS} bets a spin")
+        e.set_footer(text=f"{len(self.players)} players · bets {GAMBLIN_MIN_BET}–{pamt(GAMBLIN_MAX_BET)} · max {RL_MAX_BETS} bets a spin")
         return e
 
     async def _play_round(self, r: int) -> None:
@@ -5829,7 +5968,7 @@ def _rl_bet_error(g: "RouletteSession", p: RLPlayer) -> str | None:
 def _rl_bets_text(p: RLPlayer) -> str:
     if not p.bets:
         return "No bets yet this spin."
-    return "\n".join(f"• {_rl_target(t)[0]} — {stake:,} pts" for t, stake in p.bets)
+    return "\n".join(f"• {_rl_target(t)[0]} — {pfmt(stake)}" for t, stake in p.bets)
 
 
 async def _rl_type_panel(interaction, p: RLPlayer) -> None:
@@ -5869,7 +6008,7 @@ class RLStakeModal(discord.ui.Modal):
         super().__init__(title="Custom bet", timeout=300)
         self.t = t
         self.amount = discord.ui.TextInput(
-            label=f"Points ({GAMBLIN_MIN_BET}–{cap})", placeholder=str(cap), min_length=1, max_length=7,
+            label=f"{PTS_CAP} ({GAMBLIN_MIN_BET}–{cap})", placeholder=str(cap), min_length=1, max_length=7,
         )
         self.add_item(self.amount)
 
@@ -5987,7 +6126,7 @@ async def handle_rl_click(interaction: discord.Interaction, custom_id: str) -> N
     if action == "cust":
         cap = min(_g_avail(p), GAMBLIN_MAX_BET)
         if cap < GAMBLIN_MIN_BET:
-            await say(f"You need at least {GAMBLIN_MIN_BET} free points to bet.")
+            await say(f"You need at least {GAMBLIN_MIN_BET} free {PTS_NAME} to bet.")
             return
         await interaction.response.send_modal(RLStakeModal(t, cap))
         return
@@ -6005,7 +6144,7 @@ async def handle_rl_click(interaction: discord.Interaction, custom_id: str) -> N
     p.bets.append((t, amt))                               # lock: instant memory work, no awaits
     p.pending += amt
     more = len(p.bets) < RL_MAX_BETS
-    text = f"🔒 **Locked:** {amt:,} pts on {_rl_target(t)[0]}.\nYour bets ({len(p.bets)}/{RL_MAX_BETS}):\n{_rl_bets_text(p)}"
+    text = f"🔒 **Locked:** {pfmt(amt)} on {_rl_target(t)[0]}.\nYour bets ({len(p.bets)}/{RL_MAX_BETS}):\n{_rl_bets_text(p)}"
     await _gpanel(interaction, text, _gview(_gb("➕ Add another bet", "rl:bet", "blue")) if more else None)
 
 
@@ -6031,7 +6170,7 @@ async def _gamblin_preflight():
     if not GAMBLIN_CHANNEL_ID:
         return None, "⚠️ Set `GAMBLIN_CHANNEL_ID` first so I know where to run Gamblin."
     if not POINTS.ready:
-        return None, "❌ Points haven't loaded from the database yet. Try again in a minute."
+        return None, f"❌ {PTS_CAP} haven't loaded from the database yet. Try again in a minute."
     channel = bot.get_channel(GAMBLIN_CHANNEL_ID)
     if channel is None:
         try:
@@ -6202,7 +6341,7 @@ def _day_before(day: str) -> str:
     return (datetime.strptime(day, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
 
 
-@bot.tree.command(name="daily", description="Claim your daily Milo points — keep your streak going for bigger rewards!")
+@bot.tree.command(name="daily", description=f"Claim your daily {PTS_NAME} — keep your streak going for bigger rewards!")
 async def daily_slash(interaction: discord.Interaction):
     if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
         await interaction.response.send_message("This bot is not configured for this server.", ephemeral=True)
@@ -6221,7 +6360,7 @@ async def daily_slash(interaction: discord.Interaction):
     if last >= day:                                           # instant memory check, no awaits before the claim
         await interaction.response.send_message(
             f"🎁 You already claimed today! Streak 🔥 **{streak}**. Come back in {_format_wait(secs)} "
-            f"for **+{_daily_reward(streak + 1)}** points.",
+            f"for **+{pfmt(_daily_reward(streak + 1))}**.",
             ephemeral=True,
         )
         return
@@ -6232,7 +6371,7 @@ async def daily_slash(interaction: discord.Interaction):
     lost = streak > 1 and new_streak == 1
     embed = discord.Embed(title="🎁 Daily reward!", color=discord.Color.green())
     embed.description = (
-        f"{interaction.user.mention} claimed **+{reward} points**\n"
+        f"{interaction.user.mention} claimed **+{pfmt(reward)}**\n"
         f"🔥 Streak: **{new_streak}** day{'s' if new_streak != 1 else ''}"
         + (f" *(your {streak}-day streak ended — fresh start!)*" if lost else "")
     )
@@ -6240,10 +6379,10 @@ async def daily_slash(interaction: discord.Interaction):
     days_to_week = 7 - (new_streak % 7)
     embed.add_field(
         name="Tomorrow",
-        value=f"**+{_daily_reward(nxt)}** points" + (f" · a **+{DAILY_WEEK_BONUS} bonus** in {days_to_week} day{'s' if days_to_week != 1 else ''}!" if days_to_week else ""),
+        value=f"**+{pfmt(_daily_reward(nxt))}**" + (f" · a **+{DAILY_WEEK_BONUS} bonus** in {days_to_week} day{'s' if days_to_week != 1 else ''}!" if days_to_week else ""),
         inline=False,
     )
-    embed.set_footer(text=f"Balance: {POINTS.points(uid):,} pts · Miss a day and the streak resets")
+    embed.set_footer(text=f"Balance: {pamt(POINTS.points(uid))} · Miss a day and the streak resets")
     await interaction.response.send_message(embed=embed)
 
 
@@ -6255,22 +6394,22 @@ def _pay_error(sender_id: int, recipient: discord.abc.User, amount: int) -> str 
         return blocked
     for uid in (sender_id, recipient.id):
         if uid in POINTS.frozen:
-            return ("🧊 Your points are frozen, so you can't send points right now." if uid == sender_id
-                    else "🧊 That person's points are frozen, so they can't receive points right now.")
+            return (f"🧊 Your {PTS_NAME} are frozen, so you can't send {PTS_NAME} right now." if uid == sender_id
+                    else f"🧊 That person's {PTS_NAME} are frozen, so they can't receive {PTS_NAME} right now.")
     if recipient.id == sender_id:
         return "You can't pay yourself 🐾"
     if recipient.bot:
-        return "Bots don't need points 🐾"
+        return f"Bots don't need {PTS_NAME} 🐾"
     if amount < 1:
-        return "Send at least 1 point."
+        return f"Send at least {pamt(1)}."
     day, secs = _day_info()
     sent = POINTS.sent_today(sender_id, day)
     if sent + amount > PAY_DAILY_CAP:
         left = max(0, PAY_DAILY_CAP - sent)
-        return (f"💸 Daily limit: you can send **{PAY_DAILY_CAP}** points a day and you've sent **{sent}**. "
+        return (f"💸 Daily limit: you can send {pcompact(PAY_DAILY_CAP, True)} a day and you've sent **{sent}**. "
                 f"**{left}** left (resets in {_format_wait(secs)}).")
     if POINTS.points(sender_id) < amount:
-        return f"You only have {POINTS.points(sender_id):,} points."
+        return f"You only have {pfmt(POINTS.points(sender_id))}."
     return None
 
 
@@ -6302,11 +6441,11 @@ class PayConfirmView(discord.ui.View):
         day = _day_info()[0]
         POINTS.record_pay(self.sender.id, self.recipient.id, self.amount, day)
         await interaction.response.edit_message(
-            content=f"✅ Sent {self.amount:,} points to {self.recipient.display_name}.", view=None
+            content=f"✅ Sent {pfmt(self.amount)} to {self.recipient.display_name}.", view=None
         )
         try:
             await interaction.followup.send(
-                f"💸 {self.sender.mention} sent **{self.amount:,}** points to {self.recipient.mention}!",
+                f"💸 {self.sender.mention} sent {pcompact(self.amount, True)} to {self.recipient.mention}!",
                 allowed_mentions=discord.AllowedMentions(users=True),
             )
         except discord.HTTPException:
@@ -6321,8 +6460,8 @@ class PayConfirmView(discord.ui.View):
         await interaction.response.edit_message(content="Cancelled — nothing sent. 🐾", view=None)
 
 
-@bot.tree.command(name="pay", description="Send some of your points to another member (daily limit applies).")
-@app_commands.describe(user="Who gets the points", amount="How many points to send")
+@bot.tree.command(name="pay", description=f"Send some of your {PTS_NAME} to another member (daily limit applies).")
+@app_commands.describe(user=f"Who gets the {PTS_NAME}", amount=f"How many {PTS_NAME} to send")
 async def pay_slash(interaction: discord.Interaction, user: discord.Member, amount: app_commands.Range[int, 1, 1_000_000]):
     if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
         await interaction.response.send_message("This bot is not configured for this server.", ephemeral=True)
@@ -6335,7 +6474,7 @@ async def pay_slash(interaction: discord.Interaction, user: discord.Member, amou
     left = PAY_DAILY_CAP - POINTS.sent_today(interaction.user.id, day)
     view = PayConfirmView(interaction.user, user, amount)
     await interaction.response.send_message(
-        f"💸 Send **{amount:,}** points to **{user.display_name}**?\n"
+        f"💸 Send {pcompact(amount, True)} to **{user.display_name}**?\n"
         f"You have {POINTS.points(interaction.user.id):,} · you can still send {left:,} today (limit {PAY_DAILY_CAP}).",
         view=view, ephemeral=True,
     )
@@ -6359,7 +6498,7 @@ async def gamblinstats_slash(interaction: discord.Interaction, user: discord.Mem
         fav = max(st["gm"].items(), key=lambda kv: kv[1])[0] if st.get("gm") else "—"
         embed.add_field(name="Games played", value=f"{st['s']:,}")
         embed.add_field(name="Total profit", value=f"{st['net']:+,}")
-        embed.add_field(name="Points wagered", value=f"{st['wg']:,}")
+        embed.add_field(name=f"{PTS_CAP} wagered", value=f"{st['wg']:,}")
         embed.add_field(name="Biggest single win", value=f"+{st['bw']:,}")
         embed.add_field(name="Best game", value=f"+{st['bs']:,}")
         embed.add_field(name="Favourite", value=fav)
@@ -6480,7 +6619,7 @@ class RestoreView(discord.ui.View):
             await interaction.response.edit_message(content="🎰 A Gamblin game started in the meantime — try again when it's over.", view=None)
             return
         if not POINTS.ready:
-            await interaction.response.edit_message(content="❌ Points aren't loaded yet — try again in a minute.", view=None)
+            await interaction.response.edit_message(content=f"❌ {PTS_CAP} aren't loaded yet — try again in a minute.", view=None)
             return
         counts = POINTS.restore_data(self.data)
         await interaction.response.edit_message(content="✅ Restored in memory. Saving to the database…", view=None)
@@ -6596,7 +6735,7 @@ async def _schedule_gamblin(kind: str, ts: int, manager_id: int) -> str:
     """Add a scheduled game and announce it. Returns the reply text for the manager."""
     emoji, name, _ = GAMBLIN_GAMES[kind]
     if not POINTS.ready:
-        return "❌ Points haven't loaded from the database yet. Try again in a minute."
+        return f"❌ {PTS_CAP} haven't loaded from the database yet. Try again in a minute."
     channel = await _gamblin_channel()
     if channel is None:
         return "❌ I can't find the Gamblin channel — check `GAMBLIN_CHANNEL_ID` and my permissions there."
@@ -6605,7 +6744,7 @@ async def _schedule_gamblin(kind: str, ts: int, manager_id: int) -> str:
     POINTS.set_schedule(sorted(POINTS.schedule + [{"ts": ts, "kind": kind, "by": manager_id}], key=lambda x: x["ts"]))
     embed = discord.Embed(
         title=f"{emoji} {name} Gamblin is coming!",
-        description=f"Starts <t:{ts}:F> (<t:{ts}:R>) in this channel.\nBring your Milo points — everything is buttons!",
+        description=f"Starts <t:{ts}:F> (<t:{ts}:R>) in this channel.\nBring your {PTS_NAME} — everything is buttons!",
         color=discord.Color.gold(),
     )
     try:
@@ -6705,10 +6844,11 @@ def _reset_announce_embed() -> discord.Embed:
     if THINK_TIERS:
         ask += ": " + " · ".join(f"{t.emoji} {t.label} ×{t.user_daily}" for t in THINK_TIERS)
     lines = [
-        "🎁 `/daily` — claim your free points and keep your streak going 🔥",
+        f"🎁 `/daily` — claim your free {PTS_NAME} and keep your streak going 🔥",
         f"🎰 `/slots` — your **{SLOTS_FREE_SPINS} free spins** are back (bonus packs too)",
+        "🎟️ `/lottery` — a fresh draw is open: pick 3 numbers and chase the jackpot",
         ask,
-        f"💸 `/pay` — your {PAY_DAILY_CAP}-point sending limit is back",
+        f"💸 `/pay` — your {pamt(PAY_DAILY_CAP)} sending limit is back",
     ]
     embed = discord.Embed(title="🌅 New day — everything has reset!", description="\n".join(lines), color=discord.Color.gold())
     embed.set_footer(text=f"Limits reset every day at 12:00 AM ({LIMIT_RESET_TZ})")
@@ -6742,6 +6882,298 @@ async def _daily_reset_announcer() -> None:
             await _post_reset_announcement()
             continue
         await asyncio.sleep(max(0.5, min(secs, 30)))      # wakes right at midnight, not up to a minute late
+
+
+# ---------------------------------------------------------------------------
+# 🎟️ DAILY LOTTERY -- /lottery
+#
+# Pick 3 numbers from 1-15. Tickets for "today" are drawn at the daily reset (12:00 AM,
+# LIMIT_RESET_TZ). Matches: 3 = the (rollover) JACKPOT, split between winners;
+# 2 = LOTTERY_PRIZE_2; 1 = your ticket back. Tickets + the jackpot are saved to the
+# database; if Milo is offline at midnight the draw happens when it comes back.
+# Lottery prizes move balances only (they don't count for the leaderboard).
+# ---------------------------------------------------------------------------
+def _lottery_nums(nums) -> str:
+    return " · ".join(f"{n:02d}" for n in sorted(nums))
+
+
+def _lottery_chance(k: int) -> float:
+    """Chance a single ticket matches exactly k of the 3 drawn numbers."""
+    return math.comb(LOTTERY_PICKS, k) * math.comb(LOTTERY_RANGE - LOTTERY_PICKS, LOTTERY_PICKS - k) / math.comb(LOTTERY_RANGE, LOTTERY_PICKS)
+
+
+def _lottery_embed(uid: int) -> discord.Embed:
+    day = _day_info()[0]
+    mine = POINTS.tickets.get(day, {}).get(uid, {})
+    e = discord.Embed(
+        title="🎟️ Daily Lottery",
+        description=(
+            f"Pick **{LOTTERY_PICKS} numbers from 1–{LOTTERY_RANGE}**. The draw is every night at 12:00 AM ({LIMIT_RESET_TZ}).\n"
+            f"A ticket costs {pfmt(LOTTERY_COST)} · up to **{LOTTERY_MAX_TICKETS}** per person per draw."
+        ),
+        color=discord.Color.gold(),
+    )
+    e.add_field(name=f"💰 Jackpot ({LOTTERY_PICKS} matches)", inline=False,
+                value=f"**{pfmt(POINTS.lottery['carry'])}** — split between winners. Nobody wins? It keeps growing!")
+    e.add_field(name="🏅 Other prizes", inline=False,
+                value=f"2 matches → **{pfmt(LOTTERY_PRIZE_2)}**\n1 match → your ticket back ({pfmt(LOTTERY_COST)})")
+    p1, p2, p3 = (_lottery_chance(k) for k in (1, 2, 3))
+    e.add_field(name="📊 Odds per ticket", inline=False,
+                value=f"Win something: **{(p1 + p2 + p3) * 100:.0f}%** · 2+ matches: **{(p2 + p3) * 100:.1f}%** · jackpot: **1 in {round(1 / p3):,}**")
+    lines = [f"`{_lottery_nums(p)}`" for _, p in sorted(mine.items())]
+    e.add_field(name=f"🎫 Your tickets tonight ({len(mine)}/{LOTTERY_MAX_TICKETS})", inline=False,
+                value="\n".join(lines) or "None yet — buy one below!")
+    e.add_field(name="🧾 Sold tonight", value=f"{POINTS.tickets_sold(day):,} tickets")
+    last = POINTS.lottery.get("last")
+    if last:
+        winners = " ".join(f"<@{u}>" for u in last.get("top", [])) or "nobody"
+        e.add_field(name=f"🎱 Last draw ({last['day']})", inline=False,
+                    value=f"Numbers: **{_lottery_nums(last['nums'])}** · {last['tickets']:,} tickets\nJackpot: {winners if last['w3'] else 'no winner — it rolled over'} · 2 matches: {last['w2']} · 1 match: {last['w1']}")
+    e.set_footer(text=f"Tickets cost {pamt(LOTTERY_COST)} · the jackpot restarts at {pamt(LOTTERY_SEED)} after a win")
+    return e
+
+
+def _lottery_buy_error(uid: int) -> str | None:
+    if not POINTS.ready:
+        return _POINTS_UNAVAILABLE
+    blocked = frozen_block(uid) or gamblin_block_text("`/lottery`")
+    if blocked:
+        return blocked
+    if POINTS.ticket_count(uid, _day_info()[0]) >= LOTTERY_MAX_TICKETS:
+        return f"🎟️ You already have {LOTTERY_MAX_TICKETS} tickets for tonight's draw — good luck!"
+    if POINTS.points(uid) < LOTTERY_COST:
+        return f"🎟️ A ticket costs {pfmt(LOTTERY_COST)} and you have {pamt(POINTS.points(uid))}."
+    return None
+
+
+def _lottery_buy(uid: int, picks) -> None:
+    """Instant memory work (no awaits): takes the cost, records the ticket, grows the jackpot."""
+    POINTS.buy_ticket(uid, _day_info()[0], tuple(sorted(picks)), LOTTERY_COST, LOTTERY_CUT)
+
+
+class LotteryMenuView(discord.ui.View):
+    """The main /lottery panel: buy a ticket by picking numbers, or take a random one."""
+
+    def __init__(self, owner_id: int) -> None:
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Open your own with `/lottery` 🐾", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Pick my numbers", emoji="🎟️", style=discord.ButtonStyle.success)
+    async def pick(self, interaction: discord.Interaction, button: discord.ui.Button):
+        err = _lottery_buy_error(self.owner_id)
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        await interaction.response.edit_message(content=f"🎟️ **Pick {LOTTERY_PICKS} numbers** (1–{LOTTERY_RANGE}):", embed=None, view=LotteryPickView(self.owner_id))
+
+    @discord.ui.button(label="Quick pick", emoji="🎲", style=discord.ButtonStyle.primary)
+    async def quick(self, interaction: discord.Interaction, button: discord.ui.Button):
+        err = _lottery_buy_error(self.owner_id)
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        picks = sorted(random.sample(range(1, LOTTERY_RANGE + 1), LOTTERY_PICKS))
+        _lottery_buy(self.owner_id, picks)
+        await interaction.response.edit_message(
+            content=f"🎲 Quick pick bought: **{_lottery_nums(picks)}** (−{pfmt(LOTTERY_COST)}). Good luck! 🍀",
+            embed=_lottery_embed(self.owner_id), view=LotteryMenuView(self.owner_id),
+        )
+
+
+class LotteryPickView(discord.ui.View):
+    """15 number buttons: tap exactly 3, then Buy. (Memory only; nothing is charged until Buy.)"""
+
+    def __init__(self, owner_id: int) -> None:
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+        self.picks: set[int] = set()
+        self.num_buttons: dict[int, discord.ui.Button] = {}
+        for n in range(1, LOTTERY_RANGE + 1):
+            b = discord.ui.Button(label=str(n), style=discord.ButtonStyle.secondary, row=(n - 1) // 5)
+            b.callback = self._toggle(n)
+            self.num_buttons[n] = b
+            self.add_item(b)
+        self.rand = discord.ui.Button(label="Random", emoji="🎲", style=discord.ButtonStyle.primary, row=3)
+        self.rand.callback = self._random
+        self.clear = discord.ui.Button(label="Clear", style=discord.ButtonStyle.secondary, row=3)
+        self.clear.callback = self._clear
+        self.buy = discord.ui.Button(label=f"Buy ({pamt(LOTTERY_COST)})", emoji="✅", style=discord.ButtonStyle.success, row=3, disabled=True)
+        self.buy.callback = self._buy
+        for b in (self.rand, self.clear, self.buy):
+            self.add_item(b)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Open your own with `/lottery` 🐾", ephemeral=True)
+            return False
+        return True
+
+    def _text(self) -> str:
+        chosen = _lottery_nums(self.picks) if self.picks else "—"
+        return f"🎟️ **Pick {LOTTERY_PICKS} numbers** (1–{LOTTERY_RANGE}): **{chosen}** ({len(self.picks)}/{LOTTERY_PICKS})"
+
+    def _refresh(self) -> None:
+        for n, b in self.num_buttons.items():
+            b.style = discord.ButtonStyle.success if n in self.picks else discord.ButtonStyle.secondary
+        self.buy.disabled = len(self.picks) != LOTTERY_PICKS
+
+    def _toggle(self, n: int):
+        async def callback(interaction: discord.Interaction) -> None:
+            if n in self.picks:
+                self.picks.discard(n)
+            elif len(self.picks) < LOTTERY_PICKS:
+                self.picks.add(n)
+            else:
+                await interaction.response.send_message(f"You already picked {LOTTERY_PICKS} — tap one to unselect it first.", ephemeral=True)
+                return
+            self._refresh()
+            await interaction.response.edit_message(content=self._text(), view=self)
+        return callback
+
+    async def _random(self, interaction: discord.Interaction) -> None:
+        self.picks = set(random.sample(range(1, LOTTERY_RANGE + 1), LOTTERY_PICKS))
+        self._refresh()
+        await interaction.response.edit_message(content=self._text(), view=self)
+
+    async def _clear(self, interaction: discord.Interaction) -> None:
+        self.picks = set()
+        self._refresh()
+        await interaction.response.edit_message(content=self._text(), view=self)
+
+    async def _buy(self, interaction: discord.Interaction) -> None:
+        err = _lottery_buy_error(self.owner_id)
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        if len(self.picks) != LOTTERY_PICKS:
+            await interaction.response.send_message(f"Pick exactly {LOTTERY_PICKS} numbers first.", ephemeral=True)
+            return
+        picks = sorted(self.picks)
+        _lottery_buy(self.owner_id, picks)
+        self.stop()
+        await interaction.response.edit_message(
+            content=f"✅ Ticket bought: **{_lottery_nums(picks)}** (−{pfmt(LOTTERY_COST)}). Good luck! 🍀",
+            embed=_lottery_embed(self.owner_id), view=LotteryMenuView(self.owner_id),
+        )
+
+
+@bot.tree.command(name="lottery", description="Daily lottery — pick 3 numbers, the draw is at midnight!")
+async def lottery_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message("This bot is not configured for this server.", ephemeral=True)
+        return
+    if not POINTS.ready:
+        await interaction.response.send_message(_POINTS_UNAVAILABLE, ephemeral=True)
+        return
+    await interaction.response.send_message(
+        embed=_lottery_embed(interaction.user.id), view=LotteryMenuView(interaction.user.id), ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+def _lottery_draw(day: str) -> dict | None:
+    """Draw the numbers for one day's tickets and pay everyone. Instant memory work.
+    Returns the result, or None if there was nothing to draw (or it was already drawn)."""
+    state = POINTS.lottery
+    if state["drawn"] >= day:
+        return None
+    tickets = POINTS.tickets.get(day, {})
+    total = sum(len(v) for v in tickets.values())
+    if total == 0:
+        POINTS.finish_lottery(day, state["carry"], None)
+        return None
+    nums = sorted(random.sample(range(1, LOTTERY_RANGE + 1), LOTTERY_PICKS))
+    winning = set(nums)
+    prizes: dict[int, int] = {}
+    jackpot_tickets: list[int] = []
+    n2 = n1 = 0
+    for uid, mine in tickets.items():
+        for picks in mine.values():
+            matched = len(winning & set(picks))
+            if matched == LOTTERY_PICKS:
+                jackpot_tickets.append(uid)
+            elif matched == 2:
+                prizes[uid] = prizes.get(uid, 0) + LOTTERY_PRIZE_2
+                n2 += 1
+            elif matched == 1:
+                prizes[uid] = prizes.get(uid, 0) + LOTTERY_COST
+                n1 += 1
+    carry, paid = state["carry"], 0
+    if jackpot_tickets:
+        share = carry // len(jackpot_tickets)
+        for uid in jackpot_tickets:
+            prizes[uid] = prizes.get(uid, 0) + share
+        paid = share * len(jackpot_tickets)
+        carry = LOTTERY_SEED + (carry - paid)                   # restart (any leftover coins stay in)
+    for uid, amount in prizes.items():
+        POINTS.add_balance(uid, amount)
+    result = {"day": day, "nums": nums, "tickets": total, "w3": len(jackpot_tickets), "w2": n2, "w1": n1,
+              "jackpot": paid, "carry": carry, "top": sorted(set(jackpot_tickets))[:10]}
+    POINTS.finish_lottery(day, carry, result)
+    POINTS.tickets.pop(day, None)
+    return result
+
+
+def _lottery_result_embed(r: dict) -> discord.Embed:
+    e = discord.Embed(title=f"🎟️ Lottery draw — {r['day']}", color=discord.Color.gold())
+    lines = [f"🎱 **{_lottery_nums(r['nums'])}**", f"{r['tickets']:,} ticket{'s' if r['tickets'] != 1 else ''} {'were' if r['tickets'] != 1 else 'was'} played.", ""]
+    if r["w3"]:
+        lines.append(f"🏆 **JACKPOT!** {' '.join(f'<@{u}>' for u in r['top'])} won **{pfmt(r['jackpot'])}**"
+                     + (f" ({r['w3']} winning tickets, shared)" if r["w3"] > 1 else "") + " 🎉")
+    else:
+        lines.append(f"No jackpot winner — it rolls over to **{pfmt(r['carry'])}**!")
+    lines.append(f"🥈 2 matches: **{r['w2']}** ticket{'s' if r['w2'] != 1 else ''} × {pfmt(LOTTERY_PRIZE_2)}")
+    lines.append(f"🥉 1 match: **{r['w1']}** ticket{'s' if r['w1'] != 1 else ''} refunded")
+    lines.append("\nNew tickets are on sale now — `/lottery`!")
+    e.description = "\n".join(lines)
+    return e
+
+
+async def _post_lottery_result(r: dict) -> None:
+    embed = _lottery_result_embed(r)
+    channel_id = LOTTERY_CHANNEL_ID or RESET_ANNOUNCE_CHANNEL_ID
+    if channel_id:
+        try:
+            channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except Exception:
+            logger.warning("Couldn't post the lottery result", exc_info=True)
+    await log_event(f"🎟️ Lottery {r['day']}: numbers {_lottery_nums(r['nums'])}, {r['tickets']} tickets, "
+                    f"{r['w3']} jackpot / {r['w2']} two-match / {r['w1']} one-match winners, jackpot now {pamt(r['carry'])}.")
+
+
+async def _lottery_settle(day: str) -> None:
+    result = _lottery_draw(day)
+    if result is None:
+        return
+    await POINTS.flush("lottery draw")          # prizes + the new jackpot are saved right away
+    await _post_lottery_result(result)
+
+
+async def _lottery_loop() -> None:
+    """Background task: draws at the daily reset, and catches up on any day that was
+    missed because Milo was offline at midnight."""
+    await bot.wait_until_ready()
+    while not POINTS.ready:
+        await asyncio.sleep(5)
+    today = _day_info()[0]
+    for old_day in sorted(d for d in POINTS.tickets if d < today):
+        await _lottery_settle(old_day)
+    last = today
+    while True:
+        day, secs = _day_info()
+        if day != last:
+            ended, last = last, day
+            await _lottery_settle(ended)
+            continue
+        await asyncio.sleep(max(0.5, min(secs, 30)))
+
 
 
 # ---------------------------------------------------------------------------
@@ -6790,9 +7222,9 @@ def _snapshot_embeds(title: str) -> list[discord.Embed]:
     """Everyone's current points, richest first, split into as many embeds as needed."""
     rows = sorted(((u, b) for u, b in POINTS.balance.items() if b != 0), key=lambda t: (-t[1], t[0]))
     total = sum(b for _, b in rows)
-    footer = f"{len(rows)} people with points · {total:,} pts in total"
+    footer = f"{len(rows)} people with {PTS_NAME} · {pamt(total)} in total"
     if not rows:
-        return [discord.Embed(title=title, description="Nobody has any points yet.", color=discord.Color.dark_teal())]
+        return [discord.Embed(title=title, description=f"Nobody has any {PTS_NAME} yet.", color=discord.Color.dark_teal())]
     chunks: list[list[str]] = [[]]
     size = 0
     for i, (uid, bal) in enumerate(rows, 1):
@@ -6825,12 +7257,12 @@ async def _log_startup_and_daily_snapshots() -> None:
     await bot.wait_until_ready()
     while not POINTS.ready:
         await asyncio.sleep(5)
-    await log_event(f"🟢 **Milo is online** — points loaded for {len(POINTS.balance)} people.")
+    await log_event(f"🟢 **Milo is online** — {PTS_NAME} loaded for {len(POINTS.balance)} people.")
     while True:
         day, secs = _day_info()
         await asyncio.sleep(secs + 2)
         try:
-            await post_snapshot(f"🌙 Daily reset — everyone's points at the end of {day}")
+            await post_snapshot(f"🌙 Daily reset — everyone's {PTS_NAME} at the end of {day}")
             await post_backup(f"💾 Nightly backup — {day} (keep this file safe; `?restore` loads it back)")
         except Exception:
             logger.exception("Daily snapshot failed")
@@ -6866,7 +7298,7 @@ class ResetLeaderboardView(discord.ui.View):
             await interaction.response.edit_message(content="🎰 A Gamblin game started in the meantime — try again when it's over.", view=None)
             return
         if not POINTS.ready:
-            await interaction.response.edit_message(content="❌ Points aren't loaded yet — try again in a minute.", view=None)
+            await interaction.response.edit_message(content=f"❌ {PTS_CAP} aren't loaded yet — try again in a minute.", view=None)
             return
         before = sorted(POINTS.earned.items(), key=lambda t: (-t[1], t[0]))[:10]
         changed = POINTS.reset_earned_to_balance()
@@ -6880,7 +7312,7 @@ class ResetLeaderboardView(discord.ui.View):
             result = f"⚠️ NOT saved yet ({detail}). Run `?updateDB` before redeploying."
         board = len(POINTS.qualified())
         await interaction.edit_original_response(
-            content=f"✅ **Leaderboard reset** — everyone's all-time earned is now their current points ({changed} people changed, {board} on the board). {result}"
+            content=f"✅ **Leaderboard reset** — everyone's all-time earned is now their current {PTS_NAME} ({changed} people changed, {board} on the board). {result}"
         )
         old = "\n".join(f"{i}. <@{u}> {v:,}" for i, (u, v) in enumerate(before, 1)) or "(empty)"
         await log_event(
@@ -6941,7 +7373,7 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
 
     def guard() -> str | None:
         if not POINTS.ready:
-            return "❌ Points haven't loaded from the database yet — try again in a minute."
+            return f"❌ {PTS_CAP} haven't loaded from the database yet — try again in a minute."
         if GAMBLIN is not None:
             return "🎰 Gamblin is running — balance changes would clash with held bets. Wait for it to end or use `?gamblin stop`."
         return None
@@ -6958,7 +7390,7 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
         if before + d < 0:
             d, clamped = -before, True          # balances never go below 0
         if d == 0:
-            await reply(f"ℹ️ No change — {member.display_name} already has {before:,} points.")
+            await reply(f"ℹ️ No change — {member.display_name} already has {pfmt(before)}.")
             return
         POINTS.adjust_balance(uid, d)
         after = POINTS.points(uid)
@@ -6976,7 +7408,7 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
         m = _GIVE_RE.match(text)
         amount = int(m.group(3).replace(",", "")) if m and m.group(3).replace(",", "").lstrip("+-").isdigit() else None
         if not m or amount is None:
-            await reply("Usage: `?give @user +300 pts` · `?give @user -40 pts`")
+            await reply("Usage: `?give @user +300` · `?give @user -40` (add a note after it if you like; the unit is optional)")
             return
         if abs(amount) > MGR_MAX_AMOUNT:
             await reply(f"❌ That's a lot — the limit per command is {MGR_MAX_AMOUNT:,}.")
@@ -7049,7 +7481,7 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
             )
             return
         if not POINTS.ready:
-            await reply("❌ Points haven't loaded from the database yet — try again in a minute.")
+            await reply(f"❌ {PTS_CAP} haven't loaded from the database yet — try again in a minute.")
             return
         key = (day, uid)
         cur = POINTS.spins.get(key, [0, 0])
@@ -7070,9 +7502,9 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
     # ---- ?balances ----
     if word == "?balances":
         if not POINTS.ready:
-            await reply("❌ Points haven't loaded from the database yet — try again in a minute.")
+            await reply(f"❌ {PTS_CAP} haven't loaded from the database yet — try again in a minute.")
             return
-        embeds = _snapshot_embeds("💰 Everyone's points right now")
+        embeds = _snapshot_embeds(f"💰 Everyone's {PTS_NAME} right now")
         await message.channel.send(
             embed=embeds[0], delete_after=120, allowed_mentions=discord.AllowedMentions.none()
         )
@@ -7083,7 +7515,7 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
     # ---- ?snapshot ----
     if word == "?snapshot":
         if not POINTS.ready:
-            await reply("❌ Points haven't loaded from the database yet — try again in a minute.")
+            await reply(f"❌ {PTS_CAP} haven't loaded from the database yet — try again in a minute.")
             return
         if not LOG_CHANNEL_ID:
             await reply("⚠️ Set `LOG_CHANNEL_ID` first so I know where to post it.")
@@ -7106,9 +7538,9 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
         view = ResetLeaderboardView(mgr.id)
         view.message = await message.channel.send(
             "⚠️ **Reset the all-time leaderboard?**\n"
-            "Everyone's **total earned** will be set to their **current points**. Balances don't change.\n"
+            f"Everyone's **total earned** will be set to their **current {PTS_NAME}**. Balances don't change.\n"
             f"• {changed} people will change\n"
-            f"• After the reset, **{will_qualify}** people have {LEADERBOARD_MIN_POINTS:,}+ points, "
+            f"• After the reset, **{will_qualify}** people have {LEADERBOARD_MIN_POINTS:,}+ {PTS_NAME}, "
             "so only they will show on the board (the rest return as they earn)\n"
             f"• Top earners now:\n{top_text}\n"
             "This can't be undone (the old top 10 is saved in the log channel).",
@@ -7123,7 +7555,7 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
             await reply(f"Usage: `{word} @user`" + (" `optional reason`" if word == "?freeze" else ""))
             return
         if not POINTS.ready:
-            await reply("❌ Points haven't loaded from the database yet — try again in a minute.")
+            await reply(f"❌ {PTS_CAP} haven't loaded from the database yet — try again in a minute.")
             return
         member = await find_member(m.group(1) or m.group(2))
         if member is None:
@@ -7145,7 +7577,7 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
     # ---- ?backup / ?restore ----
     if word == "?backup":
         if not POINTS.ready:
-            await reply("❌ Points haven't loaded from the database yet — try again in a minute.")
+            await reply(f"❌ {PTS_CAP} haven't loaded from the database yet — try again in a minute.")
         elif not LOG_CHANNEL_ID:
             await reply("⚠️ Set `LOG_CHANNEL_ID` first — backups are posted to the log channel so they stay private.")
         else:
@@ -7168,7 +7600,7 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
         view.message = await message.channel.send(
             "⚠️ **Restore this backup?**\n"
             + (f"Made <t:{data['created']}:F>\n" if data["created"] else "")
-            + f"• {len(data['balance'])} balances ({sum(data['balance'].values()):,} pts in the file vs {sum(POINTS.balance.values()):,} now)\n"
+            + f"• {len(data['balance'])} balances ({pfmt(sum(data['balance'].values()))} in the file vs {sum(POINTS.balance.values()):,} now)\n"
             f"• {len(data['earned'])} leaderboard totals, {len(data['jackpot'])} jackpot counters, {len(data['daily'])} daily streaks, "
             f"{len(data['stats'])} Gamblin records, {len(data['frozen'])} frozen\n"
             "Only people **in the file** are changed (everyone else is left alone); the frozen list is set to match the file exactly.\n"
@@ -7195,12 +7627,12 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
     # ---- ?mhelp ----
     if word == "?mhelp":
         e = discord.Embed(title="🛠️ Manager commands", description="Only people with the Manager role can use these.", color=discord.Color.dark_teal())
-        e.add_field(name="💰 Points", inline=False, value=(
-            "`?give @user +300 pts` / `-40 pts` — add or remove points (optional note after it)\n"
+        e.add_field(name=f"💰 {PTS_CAP}", inline=False, value=(
+            f"`?give @user +300` / `-40` — add or remove {PTS_NAME} (optional note after it)\n"
             "`?set @user 500` — set an exact balance · `?undo` — reverse the last ?give / ?set\n"
             "`?check @user` — balance, earned, rank, spins, streak, pity, frozen?\n"
-            "`?balances` — everyone's points · `?resetspins @user` — restore today's spins\n"
-            "`?resetleaderboard` — set the all-time leaderboard to everyone's current points (asks to confirm)\n"
+            f"`?balances` — everyone's {PTS_NAME} · `?resetspins @user` — restore today's spins\n"
+            f"`?resetleaderboard` — set the all-time leaderboard to everyone's current {PTS_NAME} (asks to confirm)\n"
             "`?freeze @user [reason]` / `?unfreeze @user` / `?frozen` — stop (or allow) earning, gambling and trading"))
         e.add_field(name="🎲 Games & events", inline=False, value=(
             "`?gamblin` — pick a game (slots / blackjack / duck race / roulette), ping everyone and start it\n"
@@ -7214,7 +7646,7 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
             "`?send` — speak as Milo · `?rolemenu` — post the self-role menu\n"
             "`?backup` — post a backup file to the log channel (also automatic every night)\n"
             "`?restore` — attach a backup file to the message, then confirm\n"
-            "`?snapshot` — post everyone's points to the log channel · `?updateDB` — save to Upstash now"))
+            f"`?snapshot` — post everyone's {PTS_NAME} to the log channel · `?updateDB` — save to Upstash now"))
         e.set_footer(text="Balance changes never touch the all-time leaderboard (except ?resetleaderboard).")
         await message.channel.send(embed=e, delete_after=180)
         return
