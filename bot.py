@@ -26,6 +26,8 @@ See .env.example for every environment variable this bot uses.
 """
 
 import asyncio
+import io
+import json
 import logging
 import math
 import os
@@ -410,6 +412,9 @@ class MiloClient(discord.Client):
             task.add_done_callback(_background_tasks.discard)
         else:
             logger.info("LOG_CHANNEL_ID not set -- the manager log channel is disabled.")
+        sched_task = asyncio.create_task(_gamblin_scheduler())
+        _background_tasks.add(sched_task)
+        sched_task.add_done_callback(_background_tasks.discard)
 
     async def close(self) -> None:
         # Last chance to save: Render gives ~30 seconds after SIGTERM. The save
@@ -2608,23 +2613,35 @@ def _parse_id_set(env_name: str) -> set[int]:
 # Channels where /slots works (blank = anywhere). Keeps spins out of #general.
 SLOTS_CHANNEL_IDS: set[int] = _parse_id_set("SLOTS_CHANNEL_IDS")
 SLOTS_FREE_SPINS = _env_int("SLOTS_FREE_SPINS", 25)    # free spins per person per day
-SLOTS_PAID_SPINS = _env_int("SLOTS_PAID_SPINS", 10)    # extra spins bought with points, per day
-SLOTS_SPIN_COST = _env_int("SLOTS_SPIN_COST", 5)       # points per extra spin
+# Bonus spins come in PACKS: pay SLOTS_PACK_COST points once, get SLOTS_PACK_SPINS spins.
+SLOTS_PACK_COST = _env_int("SLOTS_PACK_COST", 5)
+SLOTS_PACK_SPINS = _env_int("SLOTS_PACK_SPINS", 10)
+# Most bonus spins per person per day (rounded down to whole packs; default 2 packs).
+SLOTS_PAID_SPINS = max(SLOTS_PACK_SPINS, (_env_int("SLOTS_PAID_SPINS", 2 * SLOTS_PACK_SPINS) // SLOTS_PACK_SPINS) * SLOTS_PACK_SPINS)
 SLOTS_COOLDOWN_SECONDS = 5                             # between one person's spins
-SLOTS_PITY_AT = 20                                     # the 20th spin without a win always wins (0 = off)
+SLOTS_PITY_AT = 20                                     # the 20th spin without ANY win always wins small (0 = off)
+SLOTS_JACKPOT_PITY_AT = _env_int("SLOTS_JACKPOT_PITY_AT", 200)   # the 200th spin since your last 777 IS a 777 (saved, survives restarts)
+SLOT_JACKPOT = "7️⃣"
 LEADERBOARD_MIN_POINTS = _env_int("LEADERBOARD_MIN_POINTS", 1000)
 POINTS_SAVE_SECONDS = _env_int("POINTS_SAVE_MINUTES", 5) * 60
 POINTS_RESYNC_DELAY = 120   # one re-load after startup, once Render's old/new overlap is over
 _PIPELINE_CHUNK = 200
 
 # Pays only when all three reels match. Each triple is a 1-in-216 chance.
-SLOT_PAYOUTS = {"7️⃣": 100, "⭐": 50, "🍇": 25, "🍉": 15, "🍋": 10, "🍒": 5}
+# Mid tiers were trimmed when the 200-spin jackpot guarantee was added, so the average
+# income per spin stays about the same (~1.18 points) instead of jumping by a quarter.
+SLOT_PAYOUTS = {"7️⃣": 100, "⭐": 25, "🍇": 12, "🍉": 8, "🍋": 6, "🍒": 4}
 SLOT_SYMBOLS = list(SLOT_PAYOUTS)
 SLOT_PITY_SYMBOLS = ["🍒", "🍋"]   # pity only ever pays the LOW tier, so jackpots stay rare
 
 POINTS_KEY_BALANCE = "milo:points:balance"   # HASH  user id -> current balance
 POINTS_KEY_EARNED = "milo:points:earned"     # ZSET  user id -> lifetime points earned (the leaderboard)
-POINTS_KEY_DAY = "milo:points:day:"          # + YYYY-MM-DD, HASH "<id>:f"/"<id>:p" -> spins used that day
+POINTS_KEY_DAY = "milo:points:day:"          # + YYYY-MM-DD, HASH "<id>:f"/"<id>:p" -> spins used, "<id>:s" -> points /pay'd that day
+POINTS_KEY_DAILY = "milo:points:daily"       # HASH  user id -> "YYYY-MM-DD:streak" (last /daily claim)
+POINTS_KEY_STATS = "milo:points:stats"       # HASH  user id -> JSON of Gamblin stats
+POINTS_KEY_JP = "milo:points:jackpot"        # HASH  user id -> spins since their last 777 (the 200-spin guarantee)
+POINTS_KEY_FROZEN = "milo:points:frozen"     # SET   user ids a manager has frozen
+POINTS_KEY_SCHED = "milo:gamblin:schedule"   # STRING JSON list of scheduled Gamblin games
 
 _POINTS_UNAVAILABLE = (
     f"{MILO_EMOJI} My points book isn't open right now (I'm having trouble reaching "
@@ -2634,6 +2651,13 @@ _POINTS_UNAVAILABLE = (
 
 def _to_int(value) -> int:
     return int(float(value))
+
+
+def frozen_block(uid: int) -> str | None:
+    """A friendly note if a manager froze this person (no earning or gambling), else None."""
+    if uid in POINTS.frozen:
+        return f"🧊 Your points are frozen, so you can't earn, gamble or trade right now. Ask a manager if you think that's a mistake. {MILO_EMOJI}"
+    return None
 
 
 def _flat_pairs(result) -> list[tuple[str, object]]:
@@ -2661,6 +2685,19 @@ class PointsManager:
         self._p_earn: dict[int, int] = {}
         self._p_spins: dict[tuple[str, int], list[int]] = {}
         self._expire_sent: set[str] = set()
+        # Saved state added with /daily, /pay, the 200-spin guarantee, stats, freeze and scheduling:
+        self.daily: dict[int, str] = {}                        # user -> "YYYY-MM-DD:streak"
+        self.stats: dict[int, dict] = {}                       # user -> Gamblin stats
+        self.jp: dict[int, int] = {}                           # user -> spins since their last 777
+        self.frozen: set[int] = set()
+        self.sent: dict[tuple[str, int], int] = {}             # (day, user) -> points /pay'd that day
+        self.schedule: list[dict] = []                         # [{"ts": unix, "kind": "duck", "by": user id}]
+        self._p_daily: dict[int, str] = {}
+        self._p_stats: set[int] = set()
+        self._p_jp: dict[int, int] = {}
+        self._p_frozen: dict[int, bool] = {}
+        self._p_sent: dict[tuple[str, int], int] = {}
+        self._p_sched: str | None = None
         # Memory-only, fine to lose:
         self.pity: dict[int, int] = {}
         self.last_spin: dict[int, float] = {}
@@ -2685,18 +2722,128 @@ class PointsManager:
     def total_earned(self, uid: int) -> int:
         return self.earned.get(uid, 0)
 
-    def record_spin(self, uid: int, *, paid: bool, cost: int, payout: int, day: str | None = None) -> None:
+    def record_spin(self, uid: int, *, paid: bool, cost: int, payout: int, day: str | None = None,
+                    hit_777: bool = False) -> None:
         key = (day or _day_info()[0], uid)
         idx = 1 if paid else 0
         self.spins.setdefault(key, [0, 0])[idx] += 1
         self._p_spins.setdefault(key, [0, 0])[idx] += 1
-        delta = payout - (cost if paid else 0)
-        if delta:
-            self.balance[uid] = self.balance.get(uid, 0) + delta
-            self._p_bal[uid] = self._p_bal.get(uid, 0) + delta
+        self.add_balance(uid, payout - (cost if paid else 0))
         if payout:
             self.earned[uid] = self.earned.get(uid, 0) + payout
             self._p_earn[uid] = self._p_earn.get(uid, 0) + payout
+        # the 200-spin guarantee counter: +1 per spin, back to 0 on any 777
+        live = self.jp.get(uid, 0)
+        change = -live if hit_777 else 1
+        if change:
+            self.jp[uid] = live + change
+            self._p_jp[uid] = self._p_jp.get(uid, 0) + change
+
+    # ---- /daily, /pay, stats, freeze, schedule, backup ----------------------
+    def daily_state(self, uid: int) -> tuple[str, int]:
+        """(last claim day, current streak) -- ("", 0) if they've never claimed."""
+        day, _, streak = self.daily.get(uid, "").partition(":")
+        return (day, int(streak)) if streak.isdigit() else ("", 0)
+
+    def claim_daily(self, uid: int, day: str, streak: int, reward: int) -> None:
+        value = f"{day}:{streak}"
+        self.daily[uid] = value
+        self._p_daily[uid] = value
+        self.add_balance(uid, reward)
+        self.add_earned(uid, reward)
+
+    def add_balance(self, uid: int, delta: int) -> None:
+        if delta:
+            self.balance[uid] = self.balance.get(uid, 0) + delta
+            self._p_bal[uid] = self._p_bal.get(uid, 0) + delta
+
+    def sent_today(self, uid: int, day: str | None = None) -> int:
+        return self.sent.get((day or _day_info()[0], uid), 0)
+
+    def record_pay(self, sender: int, recipient: int, amount: int, day: str) -> None:
+        self.add_balance(sender, -amount)
+        self.add_balance(recipient, amount)
+        self.sent[(day, sender)] = self.sent.get((day, sender), 0) + amount
+        self._p_sent[(day, sender)] = self._p_sent.get((day, sender), 0) + amount
+
+    def jp_count(self, uid: int) -> int:
+        return self.jp.get(uid, 0)
+
+    def record_session(self, uid: int, game: str, net: int, best_win: int, wagered: int) -> None:
+        st = self.stats.setdefault(uid, {"s": 0, "net": 0, "bw": 0, "bs": 0, "wg": 0, "gm": {}})
+        st["s"] += 1
+        st["net"] += net
+        st["wg"] += wagered
+        st["bw"] = max(st["bw"], best_win)
+        st["bs"] = max(st["bs"], net)
+        st["gm"][game] = st["gm"].get(game, 0) + 1
+        self._p_stats.add(uid)
+
+    def set_frozen(self, uid: int, flag: bool) -> bool:
+        """Returns False if nothing changed."""
+        if (uid in self.frozen) == flag:
+            return False
+        (self.frozen.add if flag else self.frozen.discard)(uid)
+        self._p_frozen[uid] = flag
+        return True
+
+    def set_schedule(self, items: list[dict]) -> None:
+        self.schedule = items
+        self._p_sched = json.dumps(items, separators=(",", ":"))
+
+    def backup_data(self) -> dict:
+        return {
+            "version": 1, "created": int(time.time()), "day": _day_info()[0],
+            "balance": {str(u): b for u, b in self.balance.items() if b > 0},
+            "earned": {str(u): e for u, e in self.earned.items() if e > 0},
+            "jackpot": {str(u): n for u, n in self.jp.items() if n > 0},
+            "daily": dict((str(u), v) for u, v in self.daily.items()),
+            "stats": {str(u): st for u, st in self.stats.items()},
+            "frozen": sorted(self.frozen),
+        }
+
+    def restore_data(self, data: dict) -> dict[str, int]:
+        """Apply a (validated) backup. Only people IN the file are touched, except the
+        frozen list, which is set exactly. Saved as ordinary deltas. Returns counts."""
+        counts = {"balance": 0, "earned": 0, "jackpot": 0, "daily": 0, "stats": 0, "frozen": 0}
+        for uid_s, value in data.get("balance", {}).items():
+            uid, target = int(uid_s), max(0, int(value))
+            d = target - self.balance.get(uid, 0)
+            if d:
+                self.add_balance(uid, d)
+                counts["balance"] += 1
+        for uid_s, value in data.get("earned", {}).items():
+            uid, target = int(uid_s), max(0, int(value))
+            d = target - self.earned.get(uid, 0)
+            if d:
+                self.earned[uid] = target
+                self._p_earn[uid] = self._p_earn.get(uid, 0) + d
+                counts["earned"] += 1
+        for uid_s, value in data.get("jackpot", {}).items():
+            uid, target = int(uid_s), max(0, int(value))
+            d = target - self.jp.get(uid, 0)
+            if d:
+                self.jp[uid] = target
+                self._p_jp[uid] = self._p_jp.get(uid, 0) + d
+                counts["jackpot"] += 1
+        for uid_s, value in data.get("daily", {}).items():
+            uid = int(uid_s)
+            if self.daily.get(uid) != value:
+                self.daily[uid] = value
+                self._p_daily[uid] = value
+                counts["daily"] += 1
+        for uid_s, st in data.get("stats", {}).items():
+            uid = int(uid_s)
+            if self.stats.get(uid) != st:
+                self.stats[uid] = st
+                self._p_stats.add(uid)
+                counts["stats"] += 1
+        wanted = {int(x) for x in data.get("frozen", [])}
+        for uid in wanted - self.frozen:
+            counts["frozen"] += self.set_frozen(uid, True)
+        for uid in self.frozen - wanted:
+            counts["frozen"] += self.set_frozen(uid, False)
+        return counts
 
     def reset_earned_to_balance(self) -> int:
         """?resetleaderboard: everyone's all-time 'earned' becomes their current
@@ -2720,15 +2867,11 @@ class PointsManager:
 
     def adjust_balance(self, uid: int, delta: int) -> None:
         """Manager change (?give / ?set / ?undo): balance only, never 'earned'."""
-        if delta:
-            self.balance[uid] = self.balance.get(uid, 0) + delta
-            self._p_bal[uid] = self._p_bal.get(uid, 0) + delta
+        self.add_balance(uid, delta)
 
     def apply_gamble(self, uid: int, delta: int) -> None:
-        """Gamblin result: moves the balance only (never the all-time 'earned' board)."""
-        if delta:
-            self.balance[uid] = self.balance.get(uid, 0) + delta
-            self._p_bal[uid] = self._p_bal.get(uid, 0) + delta
+        """Gamblin result: moves the balance only (the leaderboard credit comes when the game ends)."""
+        self.add_balance(uid, delta)
 
     # ---- leaderboard ----------------------------------------------------------
     def qualified(self) -> list[tuple[int, int]]:
@@ -2754,6 +2897,8 @@ class PointsManager:
     def unsaved_users(self) -> set[int]:
         users = {u for u, d in self._p_bal.items() if d} | {u for u, d in self._p_earn.items() if d}
         users |= {u for (_, u), c in self._p_spins.items() if any(c)}
+        users |= set(self._p_daily) | set(self._p_stats) | {u for u, d in self._p_jp.items() if d}
+        users |= {u for (_, u), d in self._p_sent.items() if d}
         return users
 
     def _build_flush(self) -> tuple[list[list], list[tuple]]:
@@ -2780,6 +2925,32 @@ class PointsManager:
                 cmds.append(["EXPIRE", key, 172800])   # day hashes tidy themselves up after 2 days
                 meta.append(("expire", day, 0))
                 expire_queued.add(day)
+        for (day, uid), sent in self._p_sent.items():
+            key = POINTS_KEY_DAY + day
+            if sent:
+                cmds.append(["HINCRBY", key, f"{uid}:s", sent])
+                meta.append(("sent", (day, uid), sent))
+                if day not in self._expire_sent and day not in expire_queued:
+                    cmds.append(["EXPIRE", key, 172800])
+                    meta.append(("expire", day, 0))
+                    expire_queued.add(day)
+        for uid, d in self._p_jp.items():
+            if d:
+                cmds.append(["HINCRBY", POINTS_KEY_JP, str(uid), d])
+                meta.append(("jp", uid, d))
+        for uid, value in self._p_daily.items():
+            cmds.append(["HSET", POINTS_KEY_DAILY, str(uid), value])
+            meta.append(("daily", uid, value))
+        for uid in self._p_stats:
+            blob = json.dumps(self.stats.get(uid, {}), separators=(",", ":"))
+            cmds.append(["HSET", POINTS_KEY_STATS, str(uid), blob])
+            meta.append(("stats", uid, blob))
+        for uid, flag in self._p_frozen.items():
+            cmds.append(["SADD" if flag else "SREM", POINTS_KEY_FROZEN, str(uid)])
+            meta.append(("frozen", uid, flag))
+        if self._p_sched is not None:
+            cmds.append(["SET", POINTS_KEY_SCHED, self._p_sched])
+            meta.append(("sched", None, self._p_sched))
         return cmds, meta
 
     def _apply_saved(self, kind: str, ref, delta: int, result) -> None:
@@ -2807,11 +2978,39 @@ class PointsManager:
             self.spins.setdefault(ref, [0, 0])[idx] = _to_int(result) + left
         elif kind == "expire":
             self._expire_sent.add(ref)
+        elif kind == "jp":
+            left = self._p_jp.get(ref, 0) - delta
+            if left:
+                self._p_jp[ref] = left
+            else:
+                self._p_jp.pop(ref, None)
+            self.jp[ref] = max(0, _to_int(result) + left)
+        elif kind == "sent":
+            left = self._p_sent.get(ref, 0) - delta
+            if left:
+                self._p_sent[ref] = left
+            else:
+                self._p_sent.pop(ref, None)
+            self.sent[ref] = _to_int(result) + left
+        elif kind == "daily":
+            if self._p_daily.get(ref) == delta:          # unchanged since we sent it
+                del self._p_daily[ref]
+        elif kind == "stats":
+            if json.dumps(self.stats.get(ref, {}), separators=(",", ":")) == delta:
+                self._p_stats.discard(ref)
+        elif kind == "frozen":
+            if self._p_frozen.get(ref) == delta:
+                del self._p_frozen[ref]
+        elif kind == "sched":
+            if self._p_sched == delta:
+                self._p_sched = None
 
     def _prune_days(self) -> None:
         yesterday = _day_info(datetime.now(_LIMIT_TZ) - timedelta(days=1))[0]
         for key in [k for k in self.spins if k[0] < yesterday and k not in self._p_spins]:
             del self.spins[key]
+        for key in [k for k in self.sent if k[0] < yesterday and k not in self._p_sent]:
+            del self.sent[key]
 
     async def flush(self, reason: str) -> tuple[bool, int, str]:
         """Save every unsaved change. Returns (ok, people_saved, detail)."""
@@ -2864,6 +3063,11 @@ class PointsManager:
                 ["HGETALL", POINTS_KEY_BALANCE],
                 ["ZRANGE", POINTS_KEY_EARNED, 0, -1, "WITHSCORES"],
                 ["HGETALL", POINTS_KEY_DAY + day],
+                ["HGETALL", POINTS_KEY_DAILY],
+                ["HGETALL", POINTS_KEY_STATS],
+                ["HGETALL", POINTS_KEY_JP],
+                ["SMEMBERS", POINTS_KEY_FROZEN],
+                ["GET", POINTS_KEY_SCHED],
             ])
             for item in results:
                 if not isinstance(item, dict) or "error" in item:
@@ -2871,10 +3075,13 @@ class PointsManager:
             bal = {int(k): _to_int(v) for k, v in _flat_pairs(results[0].get("result")) if k.isdigit()}
             earn = {int(k): _to_int(v) for k, v in _flat_pairs(results[1].get("result")) if k.isdigit()}
             counts: dict[tuple[int, int], int] = {}
-            for field, v in _flat_pairs(results[2].get("result")):
-                uid_s, _, kind = field.partition(":")
+            sent_counts: dict[int, int] = {}
+            for fld, v in _flat_pairs(results[2].get("result")):
+                uid_s, _, kind = fld.partition(":")
                 if uid_s.isdigit() and kind in ("f", "p"):
                     counts[(int(uid_s), 0 if kind == "f" else 1)] = _to_int(v)
+                elif uid_s.isdigit() and kind == "s":
+                    sent_counts[int(uid_s)] = _to_int(v)
             for uid in set(bal) | set(self._p_bal):
                 self.balance[uid] = bal.get(uid, 0) + self._p_bal.get(uid, 0)
             for uid in set(earn) | set(self._p_earn):
@@ -2884,6 +3091,34 @@ class PointsManager:
                 pend = self._p_spins.get((day, uid), [0, 0])
                 for idx in (0, 1):
                     live[idx] = counts.get((uid, idx), 0) + pend[idx]
+            for uid in set(sent_counts) | {u for (d, u) in self._p_sent if d == day}:
+                self.sent[(day, uid)] = sent_counts.get(uid, 0) + self._p_sent.get((day, uid), 0)
+            for uid, value in _flat_pairs(results[3].get("result")):
+                if uid.isdigit() and int(uid) not in self._p_daily:
+                    self.daily[int(uid)] = str(value)
+            for uid, blob in _flat_pairs(results[4].get("result")):
+                if uid.isdigit() and int(uid) not in self._p_stats:
+                    try:
+                        parsed = json.loads(blob)
+                        if isinstance(parsed, dict):
+                            self.stats[int(uid)] = parsed
+                    except (TypeError, ValueError):
+                        logger.warning("Skipping unreadable Gamblin stats for %s", uid)
+            jp_db = {int(k): _to_int(v) for k, v in _flat_pairs(results[5].get("result")) if k.isdigit()}
+            for uid in set(jp_db) | set(self._p_jp):
+                self.jp[uid] = max(0, jp_db.get(uid, 0) + self._p_jp.get(uid, 0))
+            members = results[6].get("result") or []
+            frozen = {int(x) for x in members if str(x).isdigit()}
+            for uid, flag in self._p_frozen.items():
+                (frozen.add if flag else frozen.discard)(uid)
+            self.frozen = frozen
+            raw_sched = results[7].get("result")
+            if self._p_sched is None and raw_sched:
+                try:
+                    parsed = json.loads(raw_sched)
+                    self.schedule = [x for x in parsed if isinstance(x, dict) and str(x.get("ts", "")).lstrip("-").isdigit()][:10]
+                except (TypeError, ValueError):
+                    logger.warning("Ignoring unreadable Gamblin schedule in the database")
             self.ready = True
             self.last_error = None
 
@@ -2949,21 +3184,28 @@ POINTS = PointsManager()
 
 
 # ---- the slot machine ------------------------------------------------------------
-def _roll_slots(since_win: int) -> tuple[list[str], int, bool]:
-    """One spin. `since_win` = spins since this person's last win. Returns
-    (reels, payout, pity_triggered)."""
+def _roll_slots(since_win: int, since_jp: int) -> tuple[list[str], int, str]:
+    """One spin. Returns (reels, payout, pity) where pity is "", "soft" or "jackpot".
+    since_jp  = spins since this person's last 777 (saved, survives restarts)
+    since_win = spins since their last win of any kind (memory only)."""
+    if SLOTS_JACKPOT_PITY_AT and since_jp + 1 >= SLOTS_JACKPOT_PITY_AT:
+        return [SLOT_JACKPOT] * 3, SLOT_PAYOUTS[SLOT_JACKPOT], "jackpot"     # the 200th spin IS a 777
     if SLOTS_PITY_AT and since_win + 1 >= SLOTS_PITY_AT:
         sym = random.choice(SLOT_PITY_SYMBOLS)
-        return [sym] * 3, SLOT_PAYOUTS[sym], True
+        return [sym] * 3, SLOT_PAYOUTS[sym], "soft"
     reels = [random.choice(SLOT_SYMBOLS) for _ in range(3)]
     won = reels[0] == reels[1] == reels[2]
-    return reels, (SLOT_PAYOUTS[reels[0]] if won else 0), False
+    return reels, (SLOT_PAYOUTS[reels[0]] if won else 0), ""
 
 
 def _spin_precheck(uid: int) -> tuple[str, dict]:
     """Instant memory check for a spin. Returns (status, info):
-    "cooldown" / "broke" / "exhausted" -> info["msg"] is the private reply;
-    "ok" -> info has paid, cost, day."""
+    "frozen" / "cooldown" / "broke" / "exhausted" -> info["msg"] is the private reply;
+    "ok" -> info has paid, cost (points charged by THIS spin: the pack price on a
+    pack's first spin, 0 for the rest), day."""
+    blocked = frozen_block(uid)
+    if blocked:
+        return "frozen", {"msg": blocked}
     now = time.time()
     last = POINTS.last_spin.get(uid)
     if last is not None and now - last < SLOTS_COOLDOWN_SECONDS:
@@ -2975,14 +3217,16 @@ def _spin_precheck(uid: int) -> tuple[str, dict]:
     if free_used < SLOTS_FREE_SPINS:
         return "ok", {"paid": False, "cost": 0, "day": day}
     if bonus_used < SLOTS_PAID_SPINS:
+        if bonus_used % SLOTS_PACK_SPINS:                    # inside a pack you already paid for
+            return "ok", {"paid": True, "cost": 0, "day": day}
         balance = POINTS.points(uid)
-        if balance < SLOTS_SPIN_COST:
+        if balance < SLOTS_PACK_COST:
             return "broke", {"msg": (
-                f"🎰 You've used all {SLOTS_FREE_SPINS} free spins today. A bonus spin costs "
-                f"{SLOTS_SPIN_COST} points and you have {balance}. Fresh free spins in "
+                f"🎰 You've used all {SLOTS_FREE_SPINS} free spins today. A bonus pack ({SLOTS_PACK_SPINS} spins) "
+                f"costs {SLOTS_PACK_COST} points and you have {balance}. Fresh free spins in "
                 f"{_format_wait(secs_to_reset)}!"
             )}
-        return "ok", {"paid": True, "cost": SLOTS_SPIN_COST, "day": day}
+        return "ok", {"paid": True, "cost": SLOTS_PACK_COST, "day": day}
     return "exhausted", {"msg": (
         f"🎰 You've used all {SLOTS_FREE_SPINS} free spins and {SLOTS_PAID_SPINS} bonus spins "
         f"for today. They come back in {_format_wait(secs_to_reset)}!"
@@ -2994,12 +3238,12 @@ def _perform_spin(uid: int, *, paid: bool, cost: int, day: str) -> discord.Embed
     can never both sneak under a limit."""
     POINTS.last_spin[uid] = time.time()
     since_win = POINTS.pity.get(uid, 0)
-    reels, payout, pity_hit = _roll_slots(since_win)
+    reels, payout, pity = _roll_slots(since_win, POINTS.jp_count(uid))
     POINTS.pity[uid] = 0 if payout else since_win + 1
-    POINTS.record_spin(uid, paid=paid, cost=cost, payout=payout, day=day)
+    POINTS.record_spin(uid, paid=paid, cost=cost, payout=payout, day=day, hit_777=reels == [SLOT_JACKPOT] * 3)
 
     symbol = reels[0]
-    if payout and symbol == "7️⃣":
+    if payout and symbol == SLOT_JACKPOT:
         headline, color = f"💥 **JACKPOT!!!** Triple 7️⃣ — **+{payout} points!**", discord.Color.gold()
     elif payout and symbol == "⭐":
         headline, color = f"🌟 **Triple stars!** **+{payout} points!**", discord.Color.gold()
@@ -3009,30 +3253,43 @@ def _perform_spin(uid: int, *, paid: bool, cost: int, day: str) -> discord.Embed
         headline, color = "✨ Almost! Two matched.", discord.Color.dark_grey()
     else:
         headline, color = "No match — spin again!", discord.Color.dark_grey()
-    if pity_hit:
+    if pity == "jackpot":
+        headline += f"\n🎯 *Jackpot guarantee! Milo promised a 777 within {SLOTS_JACKPOT_PITY_AT} spins.* {MILO_EMOJI}"
+    elif pity == "soft":
         headline += f"\n🍀 *Pity win! Milo felt bad after {SLOTS_PITY_AT - 1} misses.* {MILO_EMOJI}"
 
-    free_left = SLOTS_FREE_SPINS - POINTS.used(uid, day)[0]
-    bonus_left = SLOTS_PAID_SPINS - POINTS.used(uid, day)[1]
-    spin_line = f"💰 Bonus spin (−{cost} points)" if paid else "🆓 Free spin"
+    free_used, bonus_used = POINTS.used(uid, day)
+    pack_left = (-bonus_used) % SLOTS_PACK_SPINS if paid else 0
+    if paid and cost:
+        spin_line = f"💰 Bonus pack bought (−{cost} points) — {SLOTS_PACK_SPINS} spins"
+    elif paid:
+        spin_line = "🎁 Bonus pack spin"
+    else:
+        spin_line = "🆓 Free spin"
     embed = discord.Embed(
         title="🎰 Slots",
         description=f"**[ {' | '.join(reels)} ]**\n{headline}\n{spin_line}",
         color=color,
     )
     footer = (
-        f"Balance: {POINTS.points(uid):,} pts · Free spins left: {free_left}/{SLOTS_FREE_SPINS} "
-        f"· Bonus spins left: {bonus_left}/{SLOTS_PAID_SPINS}"
+        f"Balance: {POINTS.points(uid):,} pts · Free spins left: {SLOTS_FREE_SPINS - free_used}/{SLOTS_FREE_SPINS} "
+        f"· Bonus spins left: {SLOTS_PAID_SPINS - bonus_used}/{SLOTS_PAID_SPINS}"
     )
-    until_pity = SLOTS_PITY_AT - POINTS.pity.get(uid, 0)
-    if SLOTS_PITY_AT and not payout and until_pity <= 5:
-        footer += f" · 🍀 Win guaranteed within {until_pity} spin{'s' if until_pity != 1 else ''}"
+    if pack_left:
+        footer += f" ({pack_left} left in your pack)"
+    to_jackpot = SLOTS_JACKPOT_PITY_AT - POINTS.jp_count(uid)
+    if SLOTS_JACKPOT_PITY_AT and to_jackpot <= 25:
+        footer += f" · 🎯 777 guaranteed in {to_jackpot} spin{'s' if to_jackpot != 1 else ''}"
+    else:
+        until_pity = SLOTS_PITY_AT - POINTS.pity.get(uid, 0)
+        if SLOTS_PITY_AT and not payout and until_pity <= 5:
+            footer += f" · 🍀 Win guaranteed within {until_pity} spin{'s' if until_pity != 1 else ''}"
     embed.set_footer(text=footer)
     return embed
 
 
 class BonusSpinConfirmView(discord.ui.View):
-    """Private 'are you sure?' shown before a bonus spin costs points.
+    """Private 'are you sure?' shown before a bonus PACK costs points.
     Lives in memory only (30s) -- if it expires, nothing is charged."""
 
     def __init__(self, owner_id: int, balance: int, bonus_left: int) -> None:
@@ -3040,9 +3297,9 @@ class BonusSpinConfirmView(discord.ui.View):
         self.owner_id = owner_id
         self.used = False
         self.summary = (
-            f"💰 **Bonus spin** — costs **{SLOTS_SPIN_COST} points**.\n"
+            f"💰 **Bonus pack** — **{SLOTS_PACK_SPINS} spins for {SLOTS_PACK_COST} points**.\n"
             f"You have **{balance:,}** pts · **{bonus_left}/{SLOTS_PAID_SPINS}** bonus spins left today.\n"
-            f"Spin for {SLOTS_SPIN_COST} points?"
+            f"Buy the pack and take your first spin?"
         )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -3051,7 +3308,7 @@ class BonusSpinConfirmView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label=f"Spin ({SLOTS_SPIN_COST} pts)", emoji="🎰", style=discord.ButtonStyle.success)
+    @discord.ui.button(label=f"Buy pack ({SLOTS_PACK_COST} pts)", emoji="🎰", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.used:
             await interaction.response.send_message("Already handled!", ephemeral=True)
@@ -3120,14 +3377,14 @@ async def slots_slash(interaction: discord.Interaction):
         await interaction.response.send_message(info["msg"], ephemeral=True)
         return
 
-    if info["paid"]:
-        # Costs points -> ask first. Nothing is charged until they press Spin.
+    if info["cost"]:
+        # Buying a pack costs points -> ask first. Nothing is charged until they confirm.
         bonus_left = SLOTS_PAID_SPINS - POINTS.used(uid, info["day"])[1]
         view = BonusSpinConfirmView(uid, POINTS.points(uid), bonus_left)
         await interaction.response.send_message(view.summary, view=view, ephemeral=True)
         return
 
-    embed = _perform_spin(uid, paid=False, cost=0, day=info["day"])
+    embed = _perform_spin(uid, paid=info["paid"], cost=0, day=info["day"])
     await interaction.response.send_message(embed=embed)
 
 
@@ -3168,9 +3425,14 @@ async def points_slash(interaction: discord.Interaction, user: discord.Member | 
             name="🎰 Spins today",
             value=(
                 f"Free: **{SLOTS_FREE_SPINS - free_used}/{SLOTS_FREE_SPINS}** left · "
-                f"Bonus ({SLOTS_SPIN_COST} pts each): **{SLOTS_PAID_SPINS - bonus_used}/{SLOTS_PAID_SPINS}** left\n"
+                f"Bonus ({SLOTS_PACK_SPINS}-spin pack for {SLOTS_PACK_COST} pts): **{SLOTS_PAID_SPINS - bonus_used}/{SLOTS_PAID_SPINS}** left\n"
                 f"Resets in {_format_wait(secs)}."
             ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🎯 777 guarantee",
+            value=f"**{POINTS.jp_count(uid)}/{SLOTS_JACKPOT_PITY_AT}** spins since your last 777 — the {SLOTS_JACKPOT_PITY_AT}th is always a 777.",
             inline=False,
         )
     if POINTS.store is None:
@@ -3714,11 +3976,15 @@ async def help_slash(interaction: discord.Interaction):
         name="🎰 Slots & Points",
         value=(
             f"`/slots` — spin for points: **{SLOTS_FREE_SPINS} free spins a day**, then up to "
-            f"{SLOTS_PAID_SPINS} bonus spins at {SLOTS_SPIN_COST} points each\n"
+            f"{SLOTS_PAID_SPINS} bonus spins ({SLOTS_PACK_SPINS}-spin packs for {SLOTS_PACK_COST} points). "
+            f"Every {SLOTS_JACKPOT_PITY_AT}th spin without a 777 **is** a 777!\n"
             f"Match all 3 to win: {payout_line}\n"
             "`/points` — your balance, rank and spins left\n"
+            f"`/daily` — claim free points every day; a streak makes it bigger (+{DAILY_WEEK_BONUS} bonus every 7th day!)\n"
+            f"`/pay @user amount` — send points to a friend (up to {PAY_DAILY_CAP} a day)\n"
+            "`/gamblinstats` — your Gamblin record + the hall of fame\n"
             f"`/leaderboard` — top 10 all-time earners (earn {LEADERBOARD_MIN_POINTS:,} to join) + top 5 richest right now\n"
-            f"Bonus spins ask for confirmation before spending points\n"
+            f"Bonus packs ask for confirmation before spending points\n"
             "🎲 Managers sometimes run **Gamblin** nights (slots, blackjack, duck race & roulette) — watch for the @everyone ping!"
         ),
         inline=False,
@@ -4020,6 +4286,9 @@ class GPlayer:
     pending: int = 0                 # points locked in bets that haven't resolved yet
     net: int = 0                     # profit/loss this session
     round_net: int = 0
+    played: int = 0                  # bets settled this session (for /gamblinstats)
+    wagered: int = 0
+    best_win: int = 0
     mode: str | None = None          # "full" or "reel" (locked for the round once chosen)
     full: tuple[str, int] | None = None
     reel: dict = field(default_factory=dict)   # stage -> (symbol index, stake)
@@ -4050,6 +4319,8 @@ class GamblinSession:
         for p in self.players.values():
             if p.net > 0:
                 POINTS.add_earned(p.uid, p.net)
+            if p.played:
+                POINTS.record_session(p.uid, self.NAME, p.net, p.best_win, p.wagered)
 
     def __init__(self, channel, started_by: int) -> None:
         self.channel = channel
@@ -4089,6 +4360,9 @@ class GamblinSession:
         """A bet resolved: release the hold and move the real balance. Returns profit."""
         p.pending -= stake
         delta = payout - stake
+        p.played += 1
+        p.wagered += stake
+        p.best_win = max(p.best_win, delta)
         POINTS.apply_gamble(p.uid, delta)
         p.net += delta
         p.round_net += delta
@@ -4455,6 +4729,8 @@ async def handle_gamblin_click(interaction: discord.Interaction, custom_id: str)
             await say("🎰 Gamblin already started — join the next one!")
         elif uid in g.players:
             await say("You're already in! 🎰")
+        elif frozen_block(uid):
+            await say(frozen_block(uid))
         elif len(g.players) >= GAMBLIN_MAX_PLAYERS:
             await say("🎰 The table is full!")
         elif POINTS.points(uid) < GAMBLIN_MIN_BET:
@@ -4660,7 +4936,7 @@ class BlackjackSession(GamblinSession):
         for p in self.players.values():
             if not p.bet:
                 continue
-            tag = f" ⏫" if p.doubled else ""
+            tag = " ⏫" if p.doubled else ""
             line = f"<@{p.uid}> {_bj_fmt(p.cards)} = **{_bj_total(p.cards)}** · bet {p.bet:,}{tag} · {self._badge(p)}"
             if results and p.uid in results:
                 line += f"  →  {results[p.uid]}"
@@ -4894,6 +5170,8 @@ async def handle_bj_click(interaction: discord.Interaction, custom_id: str) -> N
         """Add the clicker to the table. Returns an error text, or None on success."""
         if uid in g.players:
             return None
+        if frozen_block(uid):
+            return frozen_block(uid)
         if len(g.players) >= GAMBLIN_MAX_PLAYERS:
             return "🃏 The table is full!"
         if POINTS.points(uid) < GAMBLIN_MIN_BET:
@@ -5067,6 +5345,8 @@ def _join_table(g: GamblinSession, uid: int, player_cls, emoji: str) -> str | No
     """Add a person to a running table. Returns an error text, or None on success."""
     if uid in g.players:
         return None
+    if frozen_block(uid):
+        return frozen_block(uid)
     if len(g.players) >= GAMBLIN_MAX_PLAYERS:
         return f"{emoji} The table is full!"
     if POINTS.points(uid) < GAMBLIN_MIN_BET:
@@ -5784,9 +6064,10 @@ async def _start_gamblin(kind: str, manager_id: int):
 class GamblinPicker(discord.ui.View):
     """'Which game?' -- only the manager who typed ?gamblin can press it."""
 
-    def __init__(self, owner_id: int) -> None:
+    def __init__(self, owner_id: int, when_ts: int | None = None) -> None:
         super().__init__(timeout=60)
         self.owner_id = owner_id
+        self.when_ts = when_ts                      # set -> schedule the pick instead of starting it now
         self.message: discord.Message | None = None
         for key, (emoji, name, _) in GAMBLIN_GAMES.items():
             button = discord.ui.Button(label=name, emoji=emoji, style=discord.ButtonStyle.success)
@@ -5806,6 +6087,15 @@ class GamblinPicker(discord.ui.View):
         async def callback(interaction: discord.Interaction) -> None:
             self.stop()
             emoji, name, _ = GAMBLIN_GAMES[key]
+            if self.when_ts:
+                await interaction.response.edit_message(content=f"🗓️ Scheduling **{name}**…", view=None)
+                await interaction.edit_original_response(content=await _schedule_gamblin(key, self.when_ts, interaction.user.id))
+                await asyncio.sleep(20)
+                try:
+                    await interaction.delete_original_response()
+                except discord.HTTPException:
+                    pass
+                return
             await interaction.response.edit_message(content=f"{emoji} Starting **{name}**…", view=None)
             channel, err = await _start_gamblin(key, interaction.user.id)
             if err:
@@ -5863,6 +6153,10 @@ async def _handle_gamblin_command(message: discord.Message) -> None:
             await reply(f"{GAMBLIN.EMOJI} Ending {GAMBLIN.NAME}… unresolved bets won't be charged.")
         return
 
+    if arg == "schedule":
+        await _handle_schedule(message, words[2:], reply)
+        return
+
     if arg:
         kind = _GAMBLIN_ALIASES.get(arg)
         if kind is None:
@@ -5878,6 +6172,514 @@ async def _handle_gamblin_command(message: discord.Message) -> None:
         return
     view = GamblinPicker(message.author.id)
     view.message = await message.channel.send("🎲 **Which Gamblin game?** (pick one — I'll ping everyone and start)", view=view)
+
+
+
+# ---------------------------------------------------------------------------
+# 🎁 /daily  ·  💸 /pay  ·  📊 /gamblinstats
+# ---------------------------------------------------------------------------
+DAILY_BASE = _env_int("DAILY_BASE", 15)                  # day-1 reward
+DAILY_STREAK_BONUS = _env_int("DAILY_STREAK_BONUS", 5)   # extra per streak day...
+DAILY_STREAK_CAP = _env_int("DAILY_STREAK_CAP", 7)       # ...up to this many days
+DAILY_WEEK_BONUS = _env_int("DAILY_WEEK_BONUS", 50)      # extra on every 7th day in a row
+PAY_DAILY_CAP = _env_int("PAY_DAILY_CAP", 200)           # most points one person can /pay per day
+
+
+def _daily_reward(streak: int) -> int:
+    reward = DAILY_BASE + DAILY_STREAK_BONUS * (min(streak, DAILY_STREAK_CAP) - 1)
+    if streak % 7 == 0:
+        reward += DAILY_WEEK_BONUS
+    return reward
+
+
+def _day_before(day: str) -> str:
+    return (datetime.strptime(day, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+@bot.tree.command(name="daily", description="Claim your daily Milo points — keep your streak going for bigger rewards!")
+async def daily_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message("This bot is not configured for this server.", ephemeral=True)
+        return
+    if not POINTS.ready:
+        await interaction.response.send_message(_POINTS_UNAVAILABLE, ephemeral=True)
+        return
+    uid = interaction.user.id
+    blocked = frozen_block(uid)
+    if blocked:
+        await interaction.response.send_message(blocked, ephemeral=True)
+        return
+
+    day, secs = _day_info()
+    last, streak = POINTS.daily_state(uid)
+    if last >= day:                                           # instant memory check, no awaits before the claim
+        await interaction.response.send_message(
+            f"🎁 You already claimed today! Streak 🔥 **{streak}**. Come back in {_format_wait(secs)} "
+            f"for **+{_daily_reward(streak + 1)}** points.",
+            ephemeral=True,
+        )
+        return
+    new_streak = streak + 1 if last == _day_before(day) else 1
+    reward = _daily_reward(new_streak)
+    POINTS.claim_daily(uid, day, new_streak, reward)
+
+    lost = streak > 1 and new_streak == 1
+    embed = discord.Embed(title="🎁 Daily reward!", color=discord.Color.green())
+    embed.description = (
+        f"{interaction.user.mention} claimed **+{reward} points**\n"
+        f"🔥 Streak: **{new_streak}** day{'s' if new_streak != 1 else ''}"
+        + (f" *(your {streak}-day streak ended — fresh start!)*" if lost else "")
+    )
+    nxt = new_streak + 1
+    days_to_week = 7 - (new_streak % 7)
+    embed.add_field(
+        name="Tomorrow",
+        value=f"**+{_daily_reward(nxt)}** points" + (f" · a **+{DAILY_WEEK_BONUS} bonus** in {days_to_week} day{'s' if days_to_week != 1 else ''}!" if days_to_week else ""),
+        inline=False,
+    )
+    embed.set_footer(text=f"Balance: {POINTS.points(uid):,} pts · Miss a day and the streak resets")
+    await interaction.response.send_message(embed=embed)
+
+
+def _pay_error(sender_id: int, recipient: discord.abc.User, amount: int) -> str | None:
+    if not POINTS.ready:
+        return _POINTS_UNAVAILABLE
+    blocked = gamblin_block_text("`/pay`")
+    if blocked:
+        return blocked
+    for uid in (sender_id, recipient.id):
+        if uid in POINTS.frozen:
+            return ("🧊 Your points are frozen, so you can't send points right now." if uid == sender_id
+                    else "🧊 That person's points are frozen, so they can't receive points right now.")
+    if recipient.id == sender_id:
+        return "You can't pay yourself 🐾"
+    if recipient.bot:
+        return "Bots don't need points 🐾"
+    if amount < 1:
+        return "Send at least 1 point."
+    day, secs = _day_info()
+    sent = POINTS.sent_today(sender_id, day)
+    if sent + amount > PAY_DAILY_CAP:
+        left = max(0, PAY_DAILY_CAP - sent)
+        return (f"💸 Daily limit: you can send **{PAY_DAILY_CAP}** points a day and you've sent **{sent}**. "
+                f"**{left}** left (resets in {_format_wait(secs)}).")
+    if POINTS.points(sender_id) < amount:
+        return f"You only have {POINTS.points(sender_id):,} points."
+    return None
+
+
+class PayConfirmView(discord.ui.View):
+    """Private 'send it?' step so a typo can't send points to the wrong person."""
+
+    def __init__(self, sender: discord.abc.User, recipient: discord.Member, amount: int) -> None:
+        super().__init__(timeout=30)
+        self.sender, self.recipient, self.amount = sender, recipient, amount
+        self.used = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.sender.id:
+            await interaction.response.send_message("This isn't your payment 🐾", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Send", emoji="💸", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.used:
+            await interaction.response.send_message("Already handled!", ephemeral=True)
+            return
+        self.used = True
+        self.stop()
+        err = _pay_error(self.sender.id, self.recipient, self.amount)      # re-check: things may have changed
+        if err:
+            await interaction.response.edit_message(content=err, view=None)
+            return
+        day = _day_info()[0]
+        POINTS.record_pay(self.sender.id, self.recipient.id, self.amount, day)
+        await interaction.response.edit_message(
+            content=f"✅ Sent {self.amount:,} points to {self.recipient.display_name}.", view=None
+        )
+        try:
+            await interaction.followup.send(
+                f"💸 {self.sender.mention} sent **{self.amount:,}** points to {self.recipient.mention}!",
+                allowed_mentions=discord.AllowedMentions(users=True),
+            )
+        except discord.HTTPException:
+            logger.warning("Couldn't announce a /pay (the points were still sent).")
+        await log_event(f"💸 `/pay` <@{self.sender.id}> → <@{self.recipient.id}> **{self.amount:,}** "
+                        f"({POINTS.sent_today(self.sender.id, day)}/{PAY_DAILY_CAP} sent today)")
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.used = True
+        self.stop()
+        await interaction.response.edit_message(content="Cancelled — nothing sent. 🐾", view=None)
+
+
+@bot.tree.command(name="pay", description="Send some of your points to another member (daily limit applies).")
+@app_commands.describe(user="Who gets the points", amount="How many points to send")
+async def pay_slash(interaction: discord.Interaction, user: discord.Member, amount: app_commands.Range[int, 1, 1_000_000]):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message("This bot is not configured for this server.", ephemeral=True)
+        return
+    err = _pay_error(interaction.user.id, user, amount)
+    if err:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+    day = _day_info()[0]
+    left = PAY_DAILY_CAP - POINTS.sent_today(interaction.user.id, day)
+    view = PayConfirmView(interaction.user, user, amount)
+    await interaction.response.send_message(
+        f"💸 Send **{amount:,}** points to **{user.display_name}**?\n"
+        f"You have {POINTS.points(interaction.user.id):,} · you can still send {left:,} today (limit {PAY_DAILY_CAP}).",
+        view=view, ephemeral=True,
+    )
+
+
+@bot.tree.command(name="gamblinstats", description="See your Gamblin record and the hall of fame.")
+@app_commands.describe(user="Whose stats to show (defaults to you)")
+async def gamblinstats_slash(interaction: discord.Interaction, user: discord.Member | None = None):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message("This bot is not configured for this server.", ephemeral=True)
+        return
+    if not POINTS.ready:
+        await interaction.response.send_message(_POINTS_UNAVAILABLE, ephemeral=True)
+        return
+    target = user or interaction.user
+    st = POINTS.stats.get(target.id)
+    embed = discord.Embed(title=f"🎲 {target.display_name}'s Gamblin record", color=discord.Color.gold())
+    if not st:
+        embed.description = "No Gamblin games yet — join the next one when a manager starts it!"
+    else:
+        fav = max(st["gm"].items(), key=lambda kv: kv[1])[0] if st.get("gm") else "—"
+        embed.add_field(name="Games played", value=f"{st['s']:,}")
+        embed.add_field(name="Total profit", value=f"{st['net']:+,}")
+        embed.add_field(name="Points wagered", value=f"{st['wg']:,}")
+        embed.add_field(name="Biggest single win", value=f"+{st['bw']:,}")
+        embed.add_field(name="Best game", value=f"+{st['bs']:,}")
+        embed.add_field(name="Favourite", value=fav)
+
+    def holder(field: str) -> str:
+        best = max(POINTS.stats.items(), key=lambda kv: kv[1].get(field, 0), default=None)
+        if best is None or best[1].get(field, 0) <= 0:
+            return "—"
+        return f"<@{best[0]}> · **{best[1][field]:,}**" if field != "bw" and field != "bs" else f"<@{best[0]}> · **+{best[1][field]:,}**"
+
+    embed.add_field(
+        name="🏛️ Hall of fame",
+        value=(
+            f"🏅 Biggest single win: {holder('bw')}\n"
+            f"💎 Best single game: {holder('bs')}\n"
+            f"🎲 Most games played: {holder('s')}\n"
+            f"📈 Highest total profit: {holder('net')}"
+        ),
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+
+# ---------------------------------------------------------------------------
+# 💾 Backup / restore, 📢 announce, 🗓️ scheduled Gamblin
+# ---------------------------------------------------------------------------
+def _backup_file(title_day: str | None = None) -> discord.File:
+    blob = json.dumps(POINTS.backup_data(), separators=(",", ":")).encode()
+    return discord.File(io.BytesIO(blob), filename=f"milo-backup-{title_day or _day_info()[0]}.json")
+
+
+async def post_backup(title: str) -> bool:
+    """Post a backup file to the log channel. Returns False if there's nowhere to post."""
+    if not LOG_CHANNEL_ID:
+        return False
+    await log_event(title, file=_backup_file())
+    return True
+
+
+_UID_RE = re.compile(r"^\d{1,20}$")
+_DAILY_VAL_RE = re.compile(r"^\d{4}-\d{2}-\d{2}:\d{1,5}$")
+
+
+def _validate_backup(raw: bytes) -> tuple[dict | None, str | None]:
+    """Parse and sanity-check a backup file. Returns (clean data, None) or (None, why not)."""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None, "That file isn't valid JSON."
+    if not isinstance(data, dict) or data.get("version") != 1:
+        return None, "That doesn't look like a Milo backup (wrong or missing version)."
+    clean: dict = {"version": 1, "created": int(data.get("created", 0)) if str(data.get("created", 0)).isdigit() else 0}
+
+    def ints(name: str, lo: int, hi: int):
+        block = data.get(name, {})
+        if not isinstance(block, dict) or len(block) > 50_000:
+            raise ValueError(f"'{name}' is malformed or too large")
+        out = {}
+        for k, v in block.items():
+            if not _UID_RE.match(str(k)) or isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+                raise ValueError(f"'{name}' has a bad entry ({str(k)[:20]})")
+            out[str(k)] = v
+        return out
+
+    try:
+        clean["balance"] = ints("balance", 0, 10 ** 9)
+        clean["earned"] = ints("earned", 0, 10 ** 10)
+        clean["jackpot"] = ints("jackpot", 0, 10 ** 6)
+        daily = data.get("daily", {})
+        if not isinstance(daily, dict) or len(daily) > 50_000 or any(
+            not _UID_RE.match(str(k)) or not isinstance(v, str) or not _DAILY_VAL_RE.match(v) for k, v in daily.items()
+        ):
+            raise ValueError("'daily' is malformed")
+        clean["daily"] = {str(k): v for k, v in daily.items()}
+        stats = data.get("stats", {})
+        if not isinstance(stats, dict) or len(stats) > 50_000:
+            raise ValueError("'stats' is malformed")
+        clean_stats = {}
+        for k, st in stats.items():
+            if not _UID_RE.match(str(k)) or not isinstance(st, dict):
+                raise ValueError("'stats' has a bad entry")
+            entry = {f: int(st.get(f, 0)) for f in ("s", "net", "bw", "bs", "wg")}
+            gm = st.get("gm", {})
+            entry["gm"] = {str(g)[:30]: int(n) for g, n in gm.items()} if isinstance(gm, dict) else {}
+            clean_stats[str(k)] = entry
+        clean["stats"] = clean_stats
+        frozen = data.get("frozen", [])
+        if not isinstance(frozen, list) or len(frozen) > 10_000 or any(not _UID_RE.match(str(x)) for x in frozen):
+            raise ValueError("'frozen' is malformed")
+        clean["frozen"] = [int(x) for x in frozen]
+    except (ValueError, TypeError) as exc:
+        return None, f"The backup is damaged: {exc}."
+    return clean, None
+
+
+class RestoreView(discord.ui.View):
+    """Confirm / Cancel for ?restore. Only the manager who typed it can press."""
+
+    def __init__(self, owner_id: int, data: dict) -> None:
+        super().__init__(timeout=60)
+        self.owner_id, self.data = owner_id, data
+        self.message: discord.Message | None = None
+        self.done = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Only the manager who typed this can press it 🐾", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Yes, restore it", emoji="⚠️", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.done:
+            return
+        self.done = True
+        self.stop()
+        if GAMBLIN is not None:
+            await interaction.response.edit_message(content="🎰 A Gamblin game started in the meantime — try again when it's over.", view=None)
+            return
+        if not POINTS.ready:
+            await interaction.response.edit_message(content="❌ Points aren't loaded yet — try again in a minute.", view=None)
+            return
+        counts = POINTS.restore_data(self.data)
+        await interaction.response.edit_message(content="✅ Restored in memory. Saving to the database…", view=None)
+        ok, _, detail = await POINTS.flush("restore")
+        if POINTS.store is None:
+            result = "⚠️ No database is configured, so this only lasts until Milo restarts."
+        elif ok:
+            result = "💾 Saved. Safe to redeploy."
+        else:
+            result = f"⚠️ NOT saved yet ({detail}). Run `?updateDB` before redeploying."
+        summary = ", ".join(f"{n} {k}" for k, n in counts.items() if n) or "nothing needed changing"
+        await interaction.edit_original_response(content=f"✅ **Backup restored** — {summary}. {result}")
+        await log_event(f"♻️ `?restore` by <@{interaction.user.id}> — {summary}. {result}")
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.done = True
+        self.stop()
+        await interaction.response.edit_message(content="Cancelled — nothing changed. 🐾", view=None)
+
+    async def on_timeout(self) -> None:
+        if self.message is not None and not self.done:
+            try:
+                await self.message.edit(content="Timed out — nothing changed.", view=None)
+            except discord.HTTPException:
+                pass
+
+
+_ANNOUNCE_RE = re.compile(r"^\?announce\s+(?:(--ping)\s+)?(?:<#(\d+)>\s+)?(?:(--ping)\s+)?(.+)$", re.I | re.S)
+
+
+async def _do_announce(message: discord.Message, reply) -> None:
+    m = _ANNOUNCE_RE.match(message.content.strip())
+    if not m:
+        await reply("Usage: `?announce Title | your message` · optional: `#channel` and `--ping` (pings @everyone), e.g. `?announce --ping #general Movie night | 8pm in voice!`")
+        return
+    ping = bool(m.group(1) or m.group(3))
+    channel = message.channel
+    if m.group(2):
+        channel = message.guild.get_channel(int(m.group(2)))
+    if not isinstance(channel, discord.TextChannel):
+        await reply("❌ I can't post in that channel.")
+        return
+    body = m.group(4).strip()
+    title, _, rest = body.partition("|")
+    if rest.strip():
+        title, body = title.strip()[:250], rest.strip()
+    else:
+        title = "📢 Announcement"
+    if len(body) > 4000:
+        await reply("❌ That's too long for one announcement (4000 characters max).")
+        return
+    embed = discord.Embed(title=title, description=body, color=discord.Color.blurple())
+    embed.set_footer(text=f"Announced by {message.author.display_name}")
+    try:
+        await channel.send(
+            content="@everyone" if ping else None, embed=embed,
+            allowed_mentions=discord.AllowedMentions(everyone=ping),
+        )
+    except discord.HTTPException:
+        await reply("❌ I couldn't post there — check my permissions in that channel.")
+        return
+    if channel.id != message.channel.id:
+        await reply(f"📢 Posted in {channel.mention}.")
+    await log_event(f"📢 `?announce` by <@{message.author.id}> in {channel.mention}: **{title}**")
+
+
+def _parse_when(text: str, now: datetime | None = None) -> tuple[int | None, str | None]:
+    """'in 30m', 'in 1h30m', '8pm', '8:30pm', '20:00' -> (unix timestamp, None) or (None, why not).
+    Clock times are in the reset timezone (LIMIT_RESET_TZ) and mean the NEXT time that clock shows."""
+    text = text.strip().lower()
+    now = (now or datetime.now(_LIMIT_TZ)).astimezone(_LIMIT_TZ)
+    hint = "Try `in 30m`, `in 2h`, `8pm`, `8:30pm` or `20:00`."
+    rel = re.fullmatch(r"in\s+((?:\d+\s*(?:h|hr|hrs|hours?|m|min|mins|minutes?)\s*)+)", text)
+    if rel:
+        total = sum(int(n) * (3600 if u == "h" else 60) for n, u in re.findall(r"(\d+)\s*([hm])", rel.group(1)))
+        target = now + timedelta(seconds=total)
+    else:
+        clock = re.fullmatch(r"(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", text)
+        if not clock or not (clock.group(2) or clock.group(3)):
+            return None, f"I couldn't read that time. {hint}"
+        hour, minute, ampm = int(clock.group(1)), int(clock.group(2) or 0), clock.group(3)
+        if ampm:
+            if not 1 <= hour <= 12:
+                return None, f"That hour doesn't work with am/pm. {hint}"
+            hour = hour % 12 + (12 if ampm == "pm" else 0)
+        if hour > 23 or minute > 59:
+            return None, f"That isn't a real time. {hint}"
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now + timedelta(seconds=60):
+            target += timedelta(days=1)
+    delta = (target - now).total_seconds()
+    if delta < 60:
+        return None, "Schedule at least a minute ahead."
+    if delta > 24 * 3600:
+        return None, "I can only schedule up to 24 hours ahead."
+    return int(target.timestamp()), None
+
+
+async def _gamblin_channel() -> discord.TextChannel | None:
+    if not GAMBLIN_CHANNEL_ID:
+        return None
+    channel = bot.get_channel(GAMBLIN_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(GAMBLIN_CHANNEL_ID)
+        except discord.HTTPException:
+            return None
+    return channel if isinstance(channel, discord.TextChannel) else None
+
+
+async def _schedule_gamblin(kind: str, ts: int, manager_id: int) -> str:
+    """Add a scheduled game and announce it. Returns the reply text for the manager."""
+    emoji, name, _ = GAMBLIN_GAMES[kind]
+    if not POINTS.ready:
+        return "❌ Points haven't loaded from the database yet. Try again in a minute."
+    channel = await _gamblin_channel()
+    if channel is None:
+        return "❌ I can't find the Gamblin channel — check `GAMBLIN_CHANNEL_ID` and my permissions there."
+    if len(POINTS.schedule) >= 5:
+        return "❌ There are already 5 games scheduled. Use `?gamblin schedule cancel` to clear them."
+    POINTS.set_schedule(sorted(POINTS.schedule + [{"ts": ts, "kind": kind, "by": manager_id}], key=lambda x: x["ts"]))
+    embed = discord.Embed(
+        title=f"{emoji} {name} Gamblin is coming!",
+        description=f"Starts <t:{ts}:F> (<t:{ts}:R>) in this channel.\nBring your Milo points — everything is buttons!",
+        color=discord.Color.gold(),
+    )
+    try:
+        await channel.send(content="@everyone", embed=embed, allowed_mentions=discord.AllowedMentions(everyone=True))
+    except discord.HTTPException:
+        logger.warning("Couldn't post the schedule announcement", exc_info=True)
+    await log_event(f"🗓️ {emoji} {name} scheduled for <t:{ts}:F> by <@{manager_id}>.")
+    return f"🗓️ {emoji} **{name}** scheduled for <t:{ts}:F> (<t:{ts}:R>) and announced in {channel.mention}."
+
+
+async def _handle_schedule(message: discord.Message, rest: list[str], reply) -> None:
+    if not rest:
+        await reply(f"Usage: `?gamblin schedule duck 8pm` · `?gamblin schedule 8pm` (pick the game with buttons) · "
+                    f"`?gamblin schedule list` · `?gamblin schedule cancel`. Times are in {LIMIT_RESET_TZ}.")
+        return
+    if rest[0] in ("list", "ls"):
+        if not POINTS.schedule:
+            await reply("🗓️ Nothing is scheduled.")
+        else:
+            lines = [f"{GAMBLIN_GAMES[x['kind']][0]} {GAMBLIN_GAMES[x['kind']][1]} — <t:{x['ts']}:F> (<t:{x['ts']}:R>)"
+                     for x in POINTS.schedule if x.get("kind") in GAMBLIN_GAMES]
+            await reply("🗓️ **Scheduled:**\n" + "\n".join(lines))
+        return
+    if rest[0] in ("cancel", "clear"):
+        n = len(POINTS.schedule)
+        if n:
+            POINTS.set_schedule([])
+            await log_event(f"🗓️ Schedule cleared ({n} game{'s' if n != 1 else ''}) by <@{message.author.id}>.")
+        await reply(f"🗓️ Cleared {n} scheduled game{'s' if n != 1 else ''}.")
+        return
+    kind = _GAMBLIN_ALIASES.get(rest[0])
+    ts, err = _parse_when(" ".join(rest[1:] if kind else rest))
+    if err:
+        await reply(f"⚠️ {err}")
+        return
+    if kind:
+        await reply(await _schedule_gamblin(kind, ts, message.author.id))
+        return
+    view = GamblinPicker(message.author.id, when_ts=ts)
+    view.message = await message.channel.send(
+        f"🗓️ **Which game at <t:{ts}:t>?** (pick one — I'll announce it and start it on time)", view=view
+    )
+
+
+async def _run_due_schedule() -> None:
+    if not POINTS.schedule:
+        return
+    now = time.time()
+    remaining, changed = [], False
+    for item in sorted(POINTS.schedule, key=lambda x: x["ts"]):
+        if item["ts"] > now:
+            remaining.append(item)
+            continue
+        kind = item.get("kind")
+        if kind not in GAMBLIN_GAMES:
+            changed = True
+        elif GAMBLIN is None:
+            channel, err = await _start_gamblin(kind, int(item.get("by", 0)))
+            changed = True
+            await log_event(f"🗓️ Scheduled {GAMBLIN_GAMES[kind][1]} " + (f"couldn't start: {err}" if err else "is starting now."))
+        elif now - item["ts"] > 600:
+            changed = True
+            await log_event(f"🗓️ Scheduled {GAMBLIN_GAMES[kind][1]} was skipped — another game was still running 10 minutes later.")
+        else:
+            remaining.append(item)                         # another game is on: wait for it to finish
+    if changed:
+        POINTS.set_schedule(remaining)
+
+
+async def _gamblin_scheduler() -> None:
+    """Background task: starts scheduled games when their time comes (checked every 20 seconds)."""
+    await bot.wait_until_ready()
+    while not POINTS.ready:
+        await asyncio.sleep(5)
+    while True:
+        await asyncio.sleep(20)
+        try:
+            await _run_due_schedule()
+        except Exception:
+            logger.exception("Gamblin scheduler tick failed")
 
 
 
@@ -5905,11 +6707,12 @@ _GIVE_RE = re.compile(rf"^\?give\s+{_MGR_TARGET}\s+([+-]?[\d,]+)\s*(?:pts?|point
 _SET_RE = re.compile(rf"^\?set\s+{_MGR_TARGET}\s+([\d,]+)\s*(?:pts?|points?)?\s*(.*)$", re.I | re.S)
 _ONLY_TARGET_RE = re.compile(rf"^\?\w+\s+{_MGR_TARGET}\s*$", re.I)
 _MGR_WORDS = {"?give", "?set", "?undo", "?check", "?balances", "?resetspins", "?snapshot", "?mhelp",
-              "?resetleaderboard", "?resetleaderbord"}
+              "?resetleaderboard", "?resetleaderbord", "?freeze", "?unfreeze", "?frozen", "?backup",
+              "?restore", "?announce"}
 _mgr_history: list[dict] = []           # recent balance changes, newest last (memory only)
 
 
-async def log_event(text: str | None = None, embed: discord.Embed | None = None) -> None:
+async def log_event(text: str | None = None, embed: discord.Embed | None = None, file: discord.File | None = None) -> None:
     """Write to the log channel (if LOG_CHANNEL_ID is set). Never raises."""
     if text:
         logger.info("LOG: %s", text.replace("\n", " | "))
@@ -5917,7 +6720,7 @@ async def log_event(text: str | None = None, embed: discord.Embed | None = None)
         return
     try:
         channel = bot.get_channel(LOG_CHANNEL_ID) or await bot.fetch_channel(LOG_CHANNEL_ID)
-        await channel.send(content=text, embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        await channel.send(content=text, embed=embed, file=file, allowed_mentions=discord.AllowedMentions.none())
     except Exception:
         logger.warning("Couldn't write to the log channel (check LOG_CHANNEL_ID and Milo's permissions).", exc_info=True)
 
@@ -5967,6 +6770,7 @@ async def _log_startup_and_daily_snapshots() -> None:
         await asyncio.sleep(secs + 2)
         try:
             await post_snapshot(f"🌙 Daily reset — everyone's points at the end of {day}")
+            await post_backup(f"💾 Nightly backup — {day} (keep this file safe; `?restore` loads it back)")
         except Exception:
             logger.exception("Daily snapshot failed")
 
@@ -6044,6 +6848,12 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
         return False
     if MANAGER_ROLE_ID not in {role.id for role in message.author.roles}:
         return False
+    attachment_bytes = None                    # ?restore needs the file read BEFORE we delete the message
+    if word == "?restore" and message.attachments and message.attachments[0].size <= 3_000_000:
+        try:
+            attachment_bytes = await message.attachments[0].read()
+        except discord.HTTPException:
+            attachment_bytes = None
     try:
         await message.delete()
     except (discord.Forbidden, discord.NotFound, discord.HTTPException):
@@ -6170,7 +6980,10 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
             await reply(
                 f"🔎 **{member.display_name}**\n"
                 f"Balance **{POINTS.points(uid):,}** · earned {POINTS.total_earned(uid):,} · leaderboard {_mgr_rank_text(uid)}\n"
-                f"Spins today: {free}/{SLOTS_FREE_SPINS} free, {bonus}/{SLOTS_PAID_SPINS} bonus · unsaved changes: {unsaved}",
+                f"Spins today: {free}/{SLOTS_FREE_SPINS} free, {bonus}/{SLOTS_PAID_SPINS} bonus · unsaved changes: {unsaved}\n"
+                f"Daily streak {POINTS.daily_state(uid)[1]} (last claim {POINTS.daily_state(uid)[0] or 'never'}) · "
+                f"777 pity {POINTS.jp_count(uid)}/{SLOTS_JACKPOT_PITY_AT} · sent today {POINTS.sent_today(uid, day)}/{PAY_DAILY_CAP} · "
+                f"frozen: {'YES 🧊' if uid in POINTS.frozen else 'no'}",
                 keep=90,
             )
             return
@@ -6242,23 +7055,96 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
         )
         return
 
+    # ---- ?freeze / ?unfreeze / ?frozen ----
+    if word in ("?freeze", "?unfreeze"):
+        m = re.match(rf"^\?(?:un)?freeze\s+{_MGR_TARGET}\s*(.*)$", text, re.I | re.S)
+        if not m:
+            await reply(f"Usage: `{word} @user`" + (" `optional reason`" if word == "?freeze" else ""))
+            return
+        if not POINTS.ready:
+            await reply("❌ Points haven't loaded from the database yet — try again in a minute.")
+            return
+        member = await find_member(m.group(1) or m.group(2))
+        if member is None:
+            return
+        flag = word == "?freeze"
+        reason = m.group(3).strip()
+        if not POINTS.set_frozen(member.id, flag):
+            await reply(f"ℹ️ {member.display_name} is already {'frozen' if flag else 'not frozen'}.")
+            return
+        await reply(f"🧊 **{member.display_name}** is now frozen (no earning, gambling or trading)." if flag
+                    else f"☀️ **{member.display_name}** is unfrozen.")
+        await log_event(f"{'🧊' if flag else '☀️'} `{word}` by <@{mgr.id}>: <@{member.id}>" + (f" — {reason}" if reason else ""))
+        return
+    if word == "?frozen":
+        lines = [f"<@{u}>" for u in sorted(POINTS.frozen)]
+        await reply("🧊 **Frozen:** " + (", ".join(lines) if lines else "nobody"), keep=60)
+        return
+
+    # ---- ?backup / ?restore ----
+    if word == "?backup":
+        if not POINTS.ready:
+            await reply("❌ Points haven't loaded from the database yet — try again in a minute.")
+        elif not LOG_CHANNEL_ID:
+            await reply("⚠️ Set `LOG_CHANNEL_ID` first — backups are posted to the log channel so they stay private.")
+        else:
+            await post_backup(f"💾 Backup requested by <@{mgr.id}>")
+            await reply("💾 Backup posted to the log channel.")
+        return
+    if word == "?restore":
+        blocked = guard()
+        if blocked:
+            await reply(blocked)
+            return
+        if attachment_bytes is None:
+            await reply("Attach the backup `.json` file (under 3 MB) to your `?restore` message.")
+            return
+        data, err = _validate_backup(attachment_bytes)
+        if err:
+            await reply(f"❌ {err}")
+            return
+        view = RestoreView(mgr.id, data)
+        view.message = await message.channel.send(
+            "⚠️ **Restore this backup?**\n"
+            + (f"Made <t:{data['created']}:F>\n" if data["created"] else "")
+            + f"• {len(data['balance'])} balances ({sum(data['balance'].values()):,} pts in the file vs {sum(POINTS.balance.values()):,} now)\n"
+            f"• {len(data['earned'])} leaderboard totals, {len(data['jackpot'])} jackpot counters, {len(data['daily'])} daily streaks, "
+            f"{len(data['stats'])} Gamblin records, {len(data['frozen'])} frozen\n"
+            "Only people **in the file** are changed (everyone else is left alone); the frozen list is set to match the file exactly.\n"
+            "This overwrites current numbers and can't be undone — run `?backup` first if you're unsure.",
+            view=view, allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    # ---- ?announce ----
+    if word == "?announce":
+        await _do_announce(message, reply)
+        return
+
     # ---- ?mhelp ----
     if word == "?mhelp":
-        await reply(
-            "🛠️ **Manager commands** (only you can use these)\n"
+        e = discord.Embed(title="🛠️ Manager commands", description="Only people with the Manager role can use these.", color=discord.Color.dark_teal())
+        e.add_field(name="💰 Points", inline=False, value=(
             "`?give @user +300 pts` / `-40 pts` — add or remove points (optional note after it)\n"
-            "`?set @user 500` — set an exact balance\n"
-            "`?undo` — reverse the last ?give / ?set\n"
-            "`?check @user` — balance, earned, rank, spins today\n"
-            "`?balances` — everyone's points\n"
-            "`?resetspins @user` — restore today's spins\n"
-            "`?snapshot` — post everyone's points to the log channel\n"
-            "`?resetleaderboard` — set the all-time leaderboard to everyone's current points (asks you to confirm)\n"
-            "`?gamblin` — pick a game (slots / blackjack / duck race / roulette), ping everyone and start · `?gamblin stop` ends any game\n"
-            "`?updateDB` — save to Upstash now · `?rolemenu` · `?send`\n"
-            "Changes only move balances (never the all-time leaderboard).",
-            keep=120,
-        )
+            "`?set @user 500` — set an exact balance · `?undo` — reverse the last ?give / ?set\n"
+            "`?check @user` — balance, earned, rank, spins, streak, pity, frozen?\n"
+            "`?balances` — everyone's points · `?resetspins @user` — restore today's spins\n"
+            "`?resetleaderboard` — set the all-time leaderboard to everyone's current points (asks to confirm)\n"
+            "`?freeze @user [reason]` / `?unfreeze @user` / `?frozen` — stop (or allow) earning, gambling and trading"))
+        e.add_field(name="🎲 Games & events", inline=False, value=(
+            "`?gamblin` — pick a game (slots / blackjack / duck race / roulette), ping everyone and start it\n"
+            "`?gamblin duck` (or `slots`, `bj`, `roulette`) — start straight away · `?gamblin stop` — end any game\n"
+            "`?gamblin schedule duck 8pm` — announce + auto-start later (`in 30m`, `8:30pm`, `20:00`)\n"
+            "`?gamblin schedule 8pm` — same, but pick the game with buttons\n"
+            "`?gamblin schedule list` / `cancel` — see or clear what's scheduled"))
+        e.add_field(name="📢 Chat & safety", inline=False, value=(
+            "`?announce Title | message` — fancy embed (add `#channel` and/or `--ping` for @everyone)\n"
+            "`?send` — speak as Milo · `?rolemenu` — post the self-role menu\n"
+            "`?backup` — post a backup file to the log channel (also automatic every night)\n"
+            "`?restore` — attach a backup file to the message, then confirm\n"
+            "`?snapshot` — post everyone's points to the log channel · `?updateDB` — save to Upstash now"))
+        e.set_footer(text="Balance changes never touch the all-time leaderboard (except ?resetleaderboard).")
+        await message.channel.send(embed=e, delete_after=180)
         return
     return True
 

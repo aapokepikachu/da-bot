@@ -3,7 +3,7 @@
 A simple, single-server, **cat-themed** Discord bot built with **Python 3.12+** and **discord.py 2.x**.
 
 Features:
-- 43 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, points & slots, party/social, AI, lookups, and utility — see Section 9 for the full list
+- 46 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, points & slots, party/social, AI, lookups, and utility — see Section 9 for the full list
 - A points economy: win points in `/slots` (25 free spins a day, then bonus spins for points), check them with `/points`, climb `/leaderboard` — kept in memory and saved to Upstash in the background (Section 15)
 - A persistent **✔️ Interested** button on `/join` messages — survives bot restarts, **no database required**
 - A cat-themed welcome message when new members join
@@ -159,7 +159,7 @@ This works exactly like the Interested button — no database. Each role button'
 
 ## 8. The hidden `?send`, `?rolemenu` and `?updateDB` commands
 
-These are the **only three `?`-prefixed commands in the bot** — everything else is a slash command. All three are plain text commands (not slash commands), so neither ever appears in Discord's `/` picker, and neither is listed in `/help`. They have different access levels: `?send` works for the Manager role (`MANAGER_ROLE_ID`) **or** a second, more limited role (`MILO_ROLE_ID`, e.g. a role you name "Milo"), while `?rolemenu` is Manager-only.
+The `?`-prefixed commands are all **hidden, plain-text, Manager-only** (except `?send`, which the Milo role can use too). Everything else is a slash command. The full list, with what each does, is in Sections 16–22; type `?mhelp` in Discord any time for a short version. They are never shown in `/help`, and anyone without the right role just gets silence.
 
 | Command | What it does |
 |---|---|
@@ -220,7 +220,10 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 
 | Command | Description |
 |---|---|
-| `/slots` | Spin a 3-reel slot machine for points. **25 free spins a day**, then up to **10 bonus spins at 5 points each**. Match all three to win: 7️⃣ 100 · ⭐ 50 · 🍇 25 · 🍉 15 · 🍋 10 · 🍒 5. 5-second cooldown. A pity rule guarantees a small win on the 20th spin without one. Can be limited to certain channels with `SLOTS_CHANNEL_IDS`. Bonus spins (the ones that cost points) first show a private **Spin / Cancel** confirmation (30s) — nothing is charged until you press Spin. |
+| `/slots` | Spin a 3-reel slot machine for points. **25 free spins a day**, then up to **20 bonus spins** in packs: **5 points buys a pack of 10 spins**. Match all three to win: 7️⃣ 100 · ⭐ 25 · 🍇 12 · 🍉 8 · 🍋 6 · 🍒 4. Every **200th spin since your last 777 is a guaranteed 777**, and a small win is guaranteed after 19 misses. Buying a pack asks you to confirm first. 5-second cooldown. Can be limited to certain channels with `SLOTS_CHANNEL_IDS`. |
+| `/daily` | Claim free points once a day. Day 1 gives 15 and each consecutive day adds 5 (up to day 7), and **every 7th day in a row adds a +50 bonus**. Miss a day and the streak restarts. Works out to roughly 37 points a day for a perfect streak. |
+| `/pay @user amount` | Send some of your points to another member. You confirm first, and there's a **daily limit of 200 points sent** per person (`PAY_DAILY_CAP`). Not allowed to yourself, to bots, to or from frozen people, or while a Gamblin game runs. |
+| `/gamblinstats [user]` | Your Gamblin record (games, total profit, biggest win, best game, favourite) plus the **hall of fame**: biggest single win, best single game, most games, highest total profit. |
 | `/points user:<member>` | Your balance, total points earned, leaderboard rank (or progress toward it), and spins left today. Private to you. Add a member to peek at theirs (spins hidden). |
 | `/leaderboard` | Two boards: the top 10 by **total points earned** (all-time; you need 1,000 earned via `LEADERBOARD_MIN_POINTS` to appear, until then it shows who's closest) and, below it, the top 5 **richest right now** by current balance (no minimum). Both come from memory — 0 Upstash commands. |
 
@@ -285,7 +288,11 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `MILO_EMOJI` | Optional | The server's `:Milo:` emoji code. Defaults to `<:Milo:1554818642804482078>`. |
 | `ASK_CHANNEL_IDS` | Optional | Channel ID(s) where `/ask` is allowed, comma-separated (e.g. `111111111111111111,222222222222222222`). Anywhere else, `/ask` politely points people to the allowed channel(s) and doesn't use any AI budget. Threads inside an allowed channel count as allowed. Blank = `/ask` works in every channel. To get an ID: Discord Settings → Advanced → Developer Mode on, then right-click the channel → Copy Channel ID. |
 | `SLOTS_CHANNEL_IDS` | Optional | Channel ID(s) where `/slots` is allowed, comma-separated. Anywhere else `/slots` points people to the right channel and spends nothing. Threads inside an allowed channel count. Blank = every channel. |
-| `SLOTS_FREE_SPINS` / `SLOTS_PAID_SPINS` / `SLOTS_SPIN_COST` | Optional | Free spins per person per day (default `25`), bonus spins per day (`10`), and points per bonus spin (`5`). |
+| `SLOTS_FREE_SPINS` / `SLOTS_PAID_SPINS` | Optional | Free spins per person per day (default `25`) and most bonus spins per day (default `20`, rounded down to whole packs). |
+| `SLOTS_PACK_COST` / `SLOTS_PACK_SPINS` | Optional | A bonus pack: points it costs (default `5`) and spins it gives (default `10`). **Replaces the old `SLOTS_SPIN_COST`, which is now ignored.** |
+| `SLOTS_JACKPOT_PITY_AT` | Optional | The spin number (since your last 777) that is guaranteed to be a 777. Default `200`. |
+| `DAILY_BASE` / `DAILY_STREAK_BONUS` / `DAILY_STREAK_CAP` / `DAILY_WEEK_BONUS` | Optional | `/daily`: day-1 reward (default `15`), extra per streak day (`5`), streak days that count (`7`), and the bonus on every 7th day (`50`). |
+| `PAY_DAILY_CAP` | Optional | Most points one person can `/pay` per day. Default `200`. |
 | `LOG_CHANNEL_ID` | Optional | A private staff channel where Milo logs manager actions, Gamblin results, save problems, online/offline notices, and everyone's points at the nightly reset. See Section 17. |
 | `JOIN_GAMES` | Optional | The games `/join` offers: `ROLE_ID\|Name\|Emoji\|Call to action,...` (emoji and call-to-action optional). Unset = VBL + Minecraft as before. See Section 18. |
 | `GAMBLIN_DUCK_ROUNDS` / `GAMBLIN_DUCK_BET_SECONDS` | Optional | Duck Race: races (default `3`) and betting window (`30`). |
@@ -512,10 +519,11 @@ Upstash's free plan is far more than this needs (a button press costs a handful 
 | | |
 |---|---|
 | Free spins | **25 per person per day** (`SLOTS_FREE_SPINS`) |
-| Bonus spins | up to **10 more per day**, **5 points** each (`SLOTS_PAID_SPINS`, `SLOTS_SPIN_COST`) — needs the points in your balance |
+| Bonus spins | up to **20 more per day** in **packs**: **5 points buys 10 spins** (`SLOTS_PACK_COST`, `SLOTS_PACK_SPINS`, `SLOTS_PAID_SPINS`). Only the first spin of each pack costs anything and asks you to confirm; the next 9 are already paid for. Unused spins in a pack expire at the daily reset. |
 | Cooldown | 5 seconds between your spins |
-| Wins (all 3 reels match; each is 1-in-216) | 7️⃣ **100** · ⭐ **50** · 🍇 **25** · 🍉 **15** · 🍋 **10** · 🍒 **5** |
-| Pity | the **20th** spin since your last win is a guaranteed 🍒 or 🍋 triple (low tier only, so jackpots stay rare). Memory only — resets on redeploy. |
+| Wins (all 3 reels match; each is 1-in-216) | 7️⃣ **100** · ⭐ **25** · 🍇 **12** · 🍉 **8** · 🍋 **6** · 🍒 **4** |
+| Pity (small) | the **20th** spin since your last win of any kind is a guaranteed 🍒 or 🍋 triple (low tier only). Memory only, resets on redeploy. |
+| Pity (jackpot) | the **200th** spin since your last 7️⃣7️⃣7️⃣ **is** a 7️⃣7️⃣7️⃣, whatever else you won in between. Free and bonus spins both count. **Saved to the database**, so redeploys don't reset it. A 777 you win naturally resets the count. `/points` shows your progress. |
 | Reset | midnight in `LIMIT_RESET_TZ` (default IST) |
 | Leaderboard | ranked by **total points earned** (spending never lowers it); you need `LEADERBOARD_MIN_POINTS` (default 1,000) to appear |
 
@@ -523,10 +531,10 @@ Points are **virtual only** — they can't be bought or cashed out. Keep it that
 
 ### The numbers (simulated with the real code)
 
-- **Free spins only:** about **30 points per person per day** (≈300 a day across 10 people). Thanks to pity, no day ends with zero wins (without pity, about half would).
-- **7️⃣7️⃣7️⃣** turns up roughly every 9 days at 25 spins a day (about every 6 days if you also use all 10 bonus spins).
-- **A bonus spin is a deliberate points sink:** it costs 5 and pays back about 1.2 on average (≈24%). At most 50 points per person per day (≈500 across 10 people) can be burned this way, and only if they have them. Rule of thumb: every spin returns about 1.2 points on average.
-- **The leaderboard takes a while:** at ~30 points a day, the first person reaches 1,000 earned in about **a month** (≈27 days if they also use bonus spins, since winnings count even when you spent points to get them). If you'd rather have a lively board from the start, set `LEADERBOARD_MIN_POINTS` to 300–500.
+- **Income per spin averages about 1.18 points** (simulated over 1.5 million spins), so free spins give roughly **30 points per person per day**. Adding the 200-spin guarantee would have raised that by about a quarter, so the ⭐🍇🍉🍋🍒 payouts were trimmed to cancel it out: the daily income is the same as before, with the jackpot now landing on average every **133 spins** instead of every 216.
+- **A bonus pack is now a good deal, on purpose:** 10 spins cost 5 and return about 11.8 on average, roughly **+7 points per pack, +14 a day** if someone buys both. The old price (5 per single spin) returned only about 24% and nobody would buy it. If you'd rather make packs break-even, set `SLOTS_PACK_COST=12`; for a sink, raise it more.
+- **Rule of thumb:** a 10-spin pack is worth about 12 points, so any price under 12 is profit for the player and any price over 12 burns points.
+- **The leaderboard is quicker now:** slots winnings (about 30 a day free, plus about 24 from two packs) plus `/daily` (about 37) is roughly 90 points earned a day, so the first person reaches 1,000 in about **11 days** (`LEADERBOARD_MIN_POINTS` changes the target).
 
 ### How saving works: memory first, saved in the background
 
@@ -547,6 +555,8 @@ Two details make this safe:
 |---|---|
 | Balances, total earned, today's spins used | Memory, saved to Upstash (every 5 min / shutdown / `?updateDB`) |
 | 🧠/🔮 daily limits | Upstash immediately (strict limits shouldn't wait for a timer) |
+| `/daily` streaks, 777-pity counters, Gamblin stats, frozen list, scheduled games | Memory, saved to Upstash with the same 5-minute save |
+| What each person has `/pay`'d today | Memory, saved to Upstash (so the daily limit survives restarts) |
 | Pity counter, 5-second cooldown | Memory only — fine to lose |
 | `/points` and `/leaderboard` | Computed from memory (0 Upstash commands) |
 
@@ -568,6 +578,8 @@ Measured by running the actual save and limit code through simulated days. Upsta
 
 A successful 🧠/🔮 press costs about 4.4 commands. Each active member costs roughly 16 commands a day, so the free plan only runs out at around **1,000 daily-active members**. Render usage is unaffected: the save is a tiny background task in the same process, so it uses no extra instance hours.
 
+**Added later (measured the same way, 10 members):** `/daily`, `/pay`, the saved 777 counter, Gamblin stats and the schedule add roughly **60–100 commands a day** on top of the table above (a quiet day measured 77 in total, a busy Gamblin day 222, including 16 for the two startup loads). Everything together stays under about **4%** of the free plan.
+
 ### What can still go wrong (honestly)
 
 - **A hard crash with no warning** loses at most the last save interval (default 5 minutes) of play. Render's normal redeploy/restart sends a stop signal first, which triggers a save.
@@ -586,6 +598,8 @@ A successful 🧠/🔮 press costs about 4.4 commands. Each active member costs 
 ## 16. Gamblin (button-only betting event)
 
 A Manager types **`?gamblin`** (from anywhere). Milo shows a short-lived button picker: **🎰 Slots · 🃏 Blackjack · 🦆 Duck Race · 🎡 Roulette**. Only the manager who typed it can press. Pick one and Milo pings @everyone and starts it in `GAMBLIN_CHANNEL_ID`. **`?gamblin stop`** ends whichever game is running. Shortcuts skip the picker: `?gamblin slots`, `?gamblin bj`, `?gamblin duck`, `?gamblin roulette`. All of it is silent to everyone without the Manager role. (`?gamblinbj` no longer exists; it's now just `?gamblin bj`.)
+
+**Scheduling:** `?gamblin schedule duck 8pm` announces the game with an @everyone ping and **starts it by itself** at that time. `?gamblin schedule 8pm` lets you pick the game with buttons. Times: `in 30m`, `in 1h30m`, `8pm`, `8:30pm`, `20:00` (clock times are in `LIMIT_RESET_TZ`, and mean the *next* time that clock shows; up to 24 hours ahead, up to 5 games). `?gamblin schedule list` shows what's coming and `?gamblin schedule cancel` clears it. The schedule is **saved to the database**, so a redeploy won't lose it. If another game is still running at the start time, the scheduled one waits and is dropped after 10 minutes (and logged).
 
 All four games share the same rules of the house: button-only betting in private panels, stakes held until each result lands, `/slots` + `/ask` + `/grouptrivia` + autosave paused while a game runs (back automatically when it ends or is stopped), one game at a time, and one batched save to Upstash at the end. Sections 16 (Slots), 19 (Blackjack), 20 (Duck Race) and 21 (Roulette) describe each game.
 
@@ -633,6 +647,10 @@ All of these are **hidden** `?` commands: Manager role only, silent to everyone 
 | `?check @user` | Balance, total earned, leaderboard rank, spins used today, and whether they have unsaved changes. |
 | `?balances` | Everyone's current points, richest first. Shows in the channel and disappears after 2 minutes. |
 | `?resetleaderboard` | Sets everyone's all-time **total earned** to their **current points** (balances don't change). Milo shows what will happen (how many people change, who will be on the board afterwards, the current top 5) with **Yes, reset it / Cancel** buttons that only you can press. After you confirm it saves to the database immediately and writes the old top 10 to the log channel. It can't be undone, and it's blocked while a Gamblin game is running. `?resetleaderbord` (typo) works too. |
+| `?freeze @user [reason]` / `?unfreeze @user` / `?frozen` | A frozen person can't earn, gamble or trade: `/slots`, `/daily`, `/pay` (sending or receiving) and joining a Gamblin game are all refused with a friendly note. Saved to the database. Use it for abuse while you sort things out; `?frozen` lists everyone frozen. |
+| `?announce Title \| message` | Posts a tidy embed as Milo. Add `--ping` to ping @everyone and/or a `#channel` to post elsewhere: `?announce --ping #general Movie night \| 8pm in voice!`. Without a `\|` the whole text is the message. Your command is deleted. (`?send` is still there for plain Milo messages.) |
+| `?backup` | Posts a backup file (balances, earned, 777 counters, streaks, Gamblin stats, frozen list) to the **log channel**. Milo also posts one **every night** next to the points snapshot. Needs `LOG_CHANNEL_ID`. |
+| `?restore` | Attach a backup file to your `?restore` message. Milo checks the file, shows what's in it and asks you to confirm. It then sets those numbers, saves immediately and logs it. Only people *in the file* are changed; the frozen list is set to match the file. Blocked while a Gamblin game runs. Run `?backup` first if you're unsure. |
 | `?resetspins @user` | Gives someone today's free + bonus spins back (and clears their cooldown/pity). For when something glitched. |
 | `?snapshot` | Posts everyone's points to the log channel right now. |
 | `?updateDB` · `?gamblin` · `?rolemenu` · `?send` | Existing commands, unchanged. |
@@ -728,3 +746,23 @@ Pick **🎡 Roulette** in `?gamblin`. **4 spins** by default (`GAMBLIN_RL_ROUNDS
 **The odds are the real ones**, not tuned: every bet returns 36/37 = **97.3%** in the long run (the house edge is the green 0, and 0 loses all red/black/odd/even/low/high/dozen bets). I checked all 37 numbers for every bet type.
 
 **Settings:** `GAMBLIN_RL_ROUNDS`, `GAMBLIN_RL_BET_SECONDS`, plus the shared bet limits. The most you can have staked in one spin is limited by your free points (each bet is capped by `GAMBLIN_MAX_BET`, up to 5 bets).
+
+
+## 22. Daily rewards, paying friends, stats, and safety tools
+
+### `/daily`
+Once a day (resets at midnight in `LIMIT_RESET_TZ`). Reward = `DAILY_BASE` + `DAILY_STREAK_BONUS` for each extra streak day up to `DAILY_STREAK_CAP`, and a `DAILY_WEEK_BONUS` on every 7th day in a row. With the defaults the first week pays 15, 20, 25, 30, 35, 40, **95**, then 45 a day with another +50 every 7th day. Skip a day and the streak starts over at 1 (Milo tells you when that happens). Daily points count as **earned**, so they count towards the leaderboard. The streak is saved to the database.
+
+### `/pay @user amount`
+Private confirm step first, then a public "X sent N points to Y" message that pings the receiver. Each person can send up to `PAY_DAILY_CAP` (default 200) a day; the amount sent today is saved, so restarting Milo doesn't reset it. Moving points between people never changes anyone's "total earned". Every payment is written to the log channel. It's refused for frozen people, bots, yourself, and while a Gamblin game is running (balances are held during games).
+
+### `/gamblinstats`
+Gamblin results are tallied when a game ends and saved: games played, total profit, points wagered, biggest single win, best single game, and favourite game. The hall of fame shows the record holders. People with no games yet just see a note.
+
+### The safety net, in order of how often you'll need it
+1. **Mistake with `?give`/`?set`?** `?undo`.
+2. **Someone abusing something?** `?freeze @user`.
+3. **A bad deploy or a data mix-up?** `?restore` with last night's backup file from the log channel. (Upstash's free plan has no backups of its own, so this file is your copy.)
+4. **Want a copy right now?** `?backup`.
+
+Keep the log channel private: backup files contain member IDs and point totals.
