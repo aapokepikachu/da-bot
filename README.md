@@ -292,6 +292,7 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `SLOTS_PACK_COST` / `SLOTS_PACK_SPINS` | Optional | A bonus pack: points it costs (default `5`) and spins it gives (default `10`). **Replaces the old `SLOTS_SPIN_COST`, which is now ignored.** |
 | `SLOTS_JACKPOT_PITY_AT` | Optional | The spin number (since your last 777) that is guaranteed to be a 777. Default `200`. |
 | `DAILY_BASE` / `DAILY_STREAK_BONUS` / `DAILY_STREAK_CAP` / `DAILY_WEEK_BONUS` | Optional | `/daily`: day-1 reward (default `15`), extra per streak day (`5`), streak days that count (`7`), and the bonus on every 7th day (`50`). |
+| `RESET_ANNOUNCE_CHANNEL_ID` | Optional | Your #general (or any channel). At 12:00 AM `LIMIT_RESET_TZ` Milo posts "everything has reset" with an @everyone ping. Off if unset. See Section 23. |
 | `PAY_DAILY_CAP` | Optional | Most points one person can `/pay` per day. Default `200`. |
 | `LOG_CHANNEL_ID` | Optional | A private staff channel where Milo logs manager actions, Gamblin results, save problems, online/offline notices, and everyone's points at the nightly reset. See Section 17. |
 | `JOIN_GAMES` | Optional | The games `/join` offers: `ROLE_ID\|Name\|Emoji\|Call to action,...` (emoji and call-to-action optional). Unset = VBL + Minecraft as before. See Section 18. |
@@ -766,3 +767,22 @@ Gamblin results are tallied when a game ends and saved: games played, total prof
 4. **Want a copy right now?** `?backup`.
 
 Keep the log channel private: backup files contain member IDs and point totals.
+
+
+## 23. The midnight "everything has reset" announcement
+
+Set **`RESET_ANNOUNCE_CHANNEL_ID`** to your #general channel ID and, **at 12:00 AM sharp** (`LIMIT_RESET_TZ`, default India time, the same moment the daily limits actually reset), Milo posts one message that pings `@everyone`:
+
+> 🌅 **New day — everything has reset!**
+> 🎁 `/daily` — claim your free points and keep your streak going 🔥
+> 🎰 `/slots` — your 25 free spins are back (bonus packs too)
+> 🤖 `/ask` — your daily limits are fresh again: 🧠 Think harder ×3 · 🔮 Second opinion ×2
+> 💸 `/pay` — your 200-point sending limit is back
+
+The numbers come from your settings, so it stays correct if you change `SLOTS_FREE_SPINS`, `THINK_USER_DAILY` and so on.
+
+- **Permissions:** Milo needs **Send Messages, Embed Links and Mention Everyone** in that channel. If it can't post, it tells the log channel.
+- **Preview it:** the Manager command **`?resetpreview`** shows the exact message without pinging anyone and deletes itself after a minute.
+- **If Milo is offline at midnight** (for example a redeploy at 11:59 PM), that day's announcement is skipped; it doesn't make up for it later.
+- **It's a lot of pings.** An @everyone every night can annoy people. Members can mute the channel, or tell me and I can switch it to a role ping instead.
+- **Cost:** 0 Upstash commands.

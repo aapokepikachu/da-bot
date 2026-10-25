@@ -415,6 +415,12 @@ class MiloClient(discord.Client):
         sched_task = asyncio.create_task(_gamblin_scheduler())
         _background_tasks.add(sched_task)
         sched_task.add_done_callback(_background_tasks.discard)
+        if RESET_ANNOUNCE_CHANNEL_ID:
+            reset_task = asyncio.create_task(_daily_reset_announcer())
+            _background_tasks.add(reset_task)
+            reset_task.add_done_callback(_background_tasks.discard)
+        else:
+            logger.info("RESET_ANNOUNCE_CHANNEL_ID not set -- the midnight announcement is disabled.")
 
     async def close(self) -> None:
         # Last chance to save: Render gives ~30 seconds after SIGTERM. The save
@@ -6684,6 +6690,61 @@ async def _gamblin_scheduler() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 🌅 Midnight announcement -- "everything has reset!" in your #general
+#
+# At 12:00 AM (LIMIT_RESET_TZ, default IST -- the same moment the daily limits
+# reset) Milo posts one embed with an @everyone ping. Off unless
+# RESET_ANNOUNCE_CHANNEL_ID is set. Memory only: costs 0 Upstash commands.
+# ---------------------------------------------------------------------------
+_raw_reset_channel = os.getenv("RESET_ANNOUNCE_CHANNEL_ID", "").strip()
+RESET_ANNOUNCE_CHANNEL_ID = int(_raw_reset_channel) if _raw_reset_channel.isdigit() else None
+
+
+def _reset_announce_embed() -> discord.Embed:
+    ask = "🤖 `/ask` — your daily limits are fresh again"
+    if THINK_TIERS:
+        ask += ": " + " · ".join(f"{t.emoji} {t.label} ×{t.user_daily}" for t in THINK_TIERS)
+    lines = [
+        "🎁 `/daily` — claim your free points and keep your streak going 🔥",
+        f"🎰 `/slots` — your **{SLOTS_FREE_SPINS} free spins** are back (bonus packs too)",
+        ask,
+        f"💸 `/pay` — your {PAY_DAILY_CAP}-point sending limit is back",
+    ]
+    embed = discord.Embed(title="🌅 New day — everything has reset!", description="\n".join(lines), color=discord.Color.gold())
+    embed.set_footer(text=f"Limits reset every day at 12:00 AM ({LIMIT_RESET_TZ})")
+    return embed
+
+
+async def _post_reset_announcement() -> None:
+    try:
+        channel = bot.get_channel(RESET_ANNOUNCE_CHANNEL_ID) or await bot.fetch_channel(RESET_ANNOUNCE_CHANNEL_ID)
+        await channel.send(
+            content="@everyone", embed=_reset_announce_embed(),
+            allowed_mentions=discord.AllowedMentions(everyone=True),
+        )
+    except Exception:
+        logger.warning("Couldn't post the midnight announcement (check RESET_ANNOUNCE_CHANNEL_ID and "
+                       "Milo's Send Messages + Mention Everyone permissions there).", exc_info=True)
+        await log_event("⚠️ I couldn't post the midnight reset announcement — check my permissions in that channel.")
+        return
+    await log_event("📣 Midnight reset announcement posted.")
+
+
+async def _daily_reset_announcer() -> None:
+    """Background task: posts the moment the day changes. If Milo was offline at
+    midnight (a redeploy right then) that day's announcement is simply skipped."""
+    await bot.wait_until_ready()
+    last = _day_info()[0]
+    while True:
+        day, secs = _day_info()
+        if day != last:
+            last = day
+            await _post_reset_announcement()
+            continue
+        await asyncio.sleep(max(0.5, min(secs, 30)))      # wakes right at midnight, not up to a minute late
+
+
+# ---------------------------------------------------------------------------
 # 🛠️ Manager toolbox -- hidden ?commands (Manager role only, silent to others)
 #
 #   ?give @user +300 pts     add points   (or -40 pts to take some away)
@@ -6708,7 +6769,7 @@ _SET_RE = re.compile(rf"^\?set\s+{_MGR_TARGET}\s+([\d,]+)\s*(?:pts?|points?)?\s*
 _ONLY_TARGET_RE = re.compile(rf"^\?\w+\s+{_MGR_TARGET}\s*$", re.I)
 _MGR_WORDS = {"?give", "?set", "?undo", "?check", "?balances", "?resetspins", "?snapshot", "?mhelp",
               "?resetleaderboard", "?resetleaderbord", "?freeze", "?unfreeze", "?frozen", "?backup",
-              "?restore", "?announce"}
+              "?restore", "?announce", "?resetpreview"}
 _mgr_history: list[dict] = []           # recent balance changes, newest last (memory only)
 
 
@@ -7116,6 +7177,16 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
         )
         return
 
+    # ---- ?resetpreview: see the midnight message without pinging anyone ----
+    if word == "?resetpreview":
+        await message.channel.send(
+            "👀 **Preview** of the midnight announcement (the real one pings @everyone"
+            + ("" if RESET_ANNOUNCE_CHANNEL_ID else " — but `RESET_ANNOUNCE_CHANNEL_ID` isn't set, so it's currently OFF")
+            + "):",
+            embed=_reset_announce_embed(), delete_after=60, allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
     # ---- ?announce ----
     if word == "?announce":
         await _do_announce(message, reply)
@@ -7136,7 +7207,8 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
             "`?gamblin duck` (or `slots`, `bj`, `roulette`) — start straight away · `?gamblin stop` — end any game\n"
             "`?gamblin schedule duck 8pm` — announce + auto-start later (`in 30m`, `8:30pm`, `20:00`)\n"
             "`?gamblin schedule 8pm` — same, but pick the game with buttons\n"
-            "`?gamblin schedule list` / `cancel` — see or clear what's scheduled"))
+            "`?gamblin schedule list` / `cancel` — see or clear what's scheduled\n"
+            "`?resetpreview` — preview the 12:00 AM \"everything has reset\" announcement (no ping)"))
         e.add_field(name="📢 Chat & safety", inline=False, value=(
             "`?announce Title | message` — fancy embed (add `#channel` and/or `--ping` for @everyone)\n"
             "`?send` — speak as Milo · `?rolemenu` — post the self-role menu\n"
