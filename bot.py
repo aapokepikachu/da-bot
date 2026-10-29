@@ -34,6 +34,7 @@ import os
 import random
 import re
 import signal
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -378,6 +379,61 @@ def is_allowed_guild(guild_id: int | None) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Discord "blocked" handling
+#
+# On shared hosts (like Render's free tier) Cloudflare sometimes blocks the host's IP
+# for a while: every Discord REST call then fails with "429 ... blocked from accessing
+# our API temporarily" (error code 0). That is NOT something Milo caused and it clears
+# by itself. What Milo does about it: stay quiet (one short log line, not a traceback),
+# don't fire extra doomed requests, and retry the few IMPORTANT posts with a back-off.
+# ---------------------------------------------------------------------------
+_discord_block_until = 0.0
+
+
+def _is_discord_block(exc: BaseException) -> bool:
+    exc = getattr(exc, "original", exc)
+    return (isinstance(exc, discord.HTTPException) and exc.status == 429
+            and (getattr(exc, "code", 1) == 0 or "blocked from accessing" in str(exc)))
+
+
+def discord_blocked() -> bool:
+    return time.time() < _discord_block_until
+
+
+def _note_discord_block(where: str) -> None:
+    global _discord_block_until
+    now = time.time()
+    if now >= _discord_block_until:
+        logger.warning(
+            "Discord is temporarily blocking this host's IP address (seen in %s). That's a Discord/Cloudflare limit on "
+            "the shared host, not a Milo bug, and it clears on its own. Backing off for 2 minutes.", where)
+    _discord_block_until = now + 120
+
+
+async def _retry_discord(make_call, what: str, delays=(60, 180, 420)) -> bool:
+    """Run an IMPORTANT Discord call. If Discord is blocking us (or having a server error), wait and try again,
+    a few times at most. Returns True once it worked. `make_call` builds a fresh call each attempt."""
+    for attempt in range(len(delays) + 1):
+        try:
+            await make_call()
+            return True
+        except discord.HTTPException as exc:
+            blocked = _is_discord_block(exc)
+            if blocked:
+                _note_discord_block(what)
+            if (blocked or exc.status >= 500) and attempt < len(delays):
+                await asyncio.sleep(delays[attempt])
+                continue
+            logger.warning("Couldn't complete '%s': %s", what, exc)
+            return False
+        except Exception:
+            logger.warning("Couldn't complete '%s'", what, exc_info=True)
+            return False
+    return False
+
+
+
+# ---------------------------------------------------------------------------
 # Discord bot setup
 # ---------------------------------------------------------------------------
 intents = discord.Intents.default()
@@ -393,6 +449,13 @@ intents.members = True
 
 
 class MiloClient(discord.Client):
+    async def on_error(self, event_method: str, *args, **kwargs) -> None:
+        exc = sys.exc_info()[1]
+        if exc is not None and _is_discord_block(exc):
+            _note_discord_block(f"the {event_method} handler")
+            return
+        await super().on_error(event_method, *args, **kwargs)
+
     """discord.Client subclass so we can sync the slash command tree once at
     startup, while still handling the one hidden text command ("?send") via
     a normal on_message listener."""
@@ -460,6 +523,9 @@ class MiloClient(discord.Client):
         sched_task = asyncio.create_task(_gamblin_scheduler())
         _background_tasks.add(sched_task)
         sched_task.add_done_callback(_background_tasks.discard)
+        react_task = asyncio.create_task(_react_refresher())
+        _background_tasks.add(react_task)
+        react_task.add_done_callback(_background_tasks.discard)
         lottery_task = asyncio.create_task(_lottery_loop())
         _background_tasks.add(lottery_task)
         lottery_task.add_done_callback(_background_tasks.discard)
@@ -1343,13 +1409,30 @@ async def grouptrivia_slash(interaction: discord.Interaction):
 
 
 # ---------------------------------------------------------------------------
-# Reactions: /react (every otakugifs.xyz category, via autocomplete)
+# Reactions: /react -- several SFW anime-GIF APIs behind one command
+#
+# For each reaction, Milo picks RANDOMLY among the sources that have it, and if that
+# source fails it quietly tries another (a source that keeps failing is paused for a
+# while). A reaction only one source has still works -- it just uses that source.
+# nekos.best and Gifukai publish their own category lists, which Milo reads at startup
+# and every 6 hours (the lists below are the verified fallback). Nothing NSFW is used.
+#
+#   otakugifs.xyz  keyless   https://api.otakugifs.xyz/gif?reaction=<name>
+#   nekos.best     keyless   https://nekos.best/api/v2/<category>  (needs a real User-Agent)
+#   gifukai.com    keyless   https://api.gifukai.com/v1/<action>
+#   purrbot.site   keyless   https://api.purrbot.site/v2/img/sfw/<category>/<gif|img>
+#   waifu.pics     keyless   https://api.waifu.pics/sfw/<category>
 # ---------------------------------------------------------------------------
-# otakugifs.xyz's full set of reaction categories, confirmed against its own
-# API wrapper docs. Every category goes through /react below via
-# type-to-search autocomplete, since Discord caps a fixed dropdown at 25
-# choices and there are nearly 70 of these.
-ALL_REACTIONS = [
+REACT_DISABLE = {x.strip().lower() for x in os.getenv("REACT_DISABLE", "").split(",") if x.strip()}   # whole sources to switch off
+REACT_BLOCK = {x.strip().lower() for x in os.getenv("REACT_BLOCK", "").split(",") if x.strip()}         # single reactions to hide
+API_USER_AGENT = os.getenv("API_USER_AGENT", "").strip() or (
+    f"MiloCatBot/1.0 (https://discord.com/users/{os.getenv('CREATOR_USER_ID', '1061069702287339590').strip()})"
+)
+_CAT_OK = re.compile(r"^[a-z0-9]{2,24}$")
+# A safety net for names we DISCOVER at runtime (the fixed lists below are already SFW-only):
+_CAT_BAD = re.compile(r"(nsfw|hentai|lewd|ecchi|porn|nude|naked|boob|blowjob|handjob|anal|sex|fuck|kill|trap)")
+
+_OTAKU_CATS = [
     "airkiss", "angrystare", "bite", "bleh", "blush", "brofist", "celebrate",
     "cheers", "clap", "confused", "cool", "cry", "cuddle", "dance", "drool",
     "evillaugh", "facepalm", "handhold", "happy", "headbang", "hug", "huh",
@@ -1360,18 +1443,193 @@ ALL_REACTIONS = [
     "sorry", "stare", "stop", "surprised", "sweat", "thumbsup", "tickle",
     "tired", "wave", "wink", "woah", "yawn", "yay", "yes",
 ]
+_NEKOSBEST_GIFS = [
+    "angry", "baka", "bite", "bleh", "blowkiss", "blush", "bonk", "bored", "carry", "clap", "confused",
+    "cry", "cuddle", "dance", "facepalm", "feed", "handhold", "handshake", "happy", "highfive", "hug",
+    "kabedon", "kick", "kiss", "lappillow", "laugh", "lurk", "nod", "nom", "nope", "nya", "pat", "peck",
+    "poke", "pout", "punch", "run", "salute", "shake", "shoot", "shocked", "shrug", "sip", "slap", "sleep",
+    "smile", "smug", "spin", "stare", "tableflip", "teehee", "think", "thumbsup", "tickle", "wag", "wave",
+    "wink", "yawn", "yeet",
+]
+_NEKOSBEST_IMGS = ["husbando", "kitsune", "neko", "waifu"]
+_GIFUKAI_ACTIONS = ["pat", "hug", "kiss", "cry", "sleep", "blush", "pout"]       # more are discovered at runtime
+_PURRBOT_GIFS = ["angry", "bite", "blush", "comfy", "cry", "cuddle", "dance", "eevee", "fluff", "hug", "kiss",
+                 "lay", "lick", "neko", "pat", "poke", "pout", "slap", "smile", "tickle"]
+_PURRBOT_IMGS = ["holo", "kitsune", "okami", "senko", "shiro"]
+_WAIFUPICS_GIFS = ["bully", "cuddle", "cry", "hug", "kiss", "lick", "pat", "smug", "bonk", "yeet", "blush",
+                   "smile", "wave", "highfive", "handhold", "nom", "bite", "glomp", "slap", "kick", "happy",
+                   "wink", "poke", "dance", "cringe"]
+_WAIFUPICS_IMGS = ["waifu", "neko", "shinobu", "megumin", "awoo"]
+
+# provider -> {"label", "cats": {reaction name: (remote name, "gif" | "img")}}
+REACT_PROVIDERS: dict[str, dict] = {
+    "otakugifs": {"label": "otakugifs.xyz", "cats": {c: (c, "gif") for c in _OTAKU_CATS}},
+    "nekosbest": {"label": "nekos.best", "cats": {**{c: (c, "gif") for c in _NEKOSBEST_GIFS}, **{c: (c, "img") for c in _NEKOSBEST_IMGS}}},
+    "gifukai": {"label": "gifukai.com", "cats": {c: (c, "gif") for c in _GIFUKAI_ACTIONS}},
+    "purrbot": {"label": "purrbot.site", "cats": {**{("wag" if c == "tail" else c): (c, "gif") for c in _PURRBOT_GIFS + ["tail"]},
+                                                  **{c: (c, "img") for c in _PURRBOT_IMGS}}},
+    "waifupics": {"label": "waifu.pics", "cats": {**{c: (c, "gif") for c in _WAIFUPICS_GIFS}, **{c: (c, "img") for c in _WAIFUPICS_IMGS}}},
+}
+REACT_CATALOG: dict[str, list[tuple[str, str, str]]] = {}      # reaction -> [(provider, remote, kind), ...]
+
+
+def _rebuild_react_catalog() -> None:
+    catalog: dict[str, list[tuple[str, str, str]]] = {}
+    for prov, info in REACT_PROVIDERS.items():
+        if prov in REACT_DISABLE:
+            continue
+        for cat, (remote, kind) in info["cats"].items():
+            if cat not in REACT_BLOCK:
+                catalog.setdefault(cat, []).append((prov, remote, kind))
+    REACT_CATALOG.clear()
+    REACT_CATALOG.update(catalog)
+
+
+_rebuild_react_catalog()
+
+
+def _good_url(value) -> str | None:
+    return value if isinstance(value, str) and value.startswith("https://") and len(value) < 500 else None
+
+
+async def _react_get(url: str, ua: bool = False):
+    kwargs = {"timeout": aiohttp.ClientTimeout(total=5)}
+    if ua:
+        kwargs["headers"] = {"User-Agent": API_USER_AGENT}
+    return await _fetch_json(url, retries=0, **kwargs)
+
+
+async def _rf_otakugifs(remote: str, kind: str):
+    data = await _react_get(f"https://api.otakugifs.xyz/gif?reaction={remote}")
+    url = _good_url(data.get("url")) if isinstance(data, dict) else None
+    return {"url": url} if url else None
+
+
+async def _rf_nekosbest(remote: str, kind: str):
+    data = await _react_get(f"https://nekos.best/api/v2/{remote}", ua=True)
+    results = data.get("results") if isinstance(data, dict) else None
+    first = results[0] if isinstance(results, list) and results and isinstance(results[0], dict) else None
+    url = _good_url(first.get("url")) if first else None
+    return {"url": url, "anime": first.get("anime_name"), "artist": first.get("artist_name")} if url else None
+
+
+async def _rf_gifukai(remote: str, kind: str):
+    data = await _react_get(f"https://api.gifukai.com/v1/{remote}", ua=True)
+    url = _good_url(data.get("url")) if isinstance(data, dict) else None
+    return {"url": url, "anime": data.get("anime")} if url else None
+
+
+async def _rf_purrbot(remote: str, kind: str):
+    data = await _react_get(f"https://api.purrbot.site/v2/img/sfw/{remote}/{'gif' if kind == 'gif' else 'img'}", ua=True)
+    url = _good_url(data.get("link")) if isinstance(data, dict) and not data.get("error") else None
+    return {"url": url} if url else None
+
+
+async def _rf_waifupics(remote: str, kind: str):
+    data = await _react_get(f"https://api.waifu.pics/sfw/{remote}")
+    url = _good_url(data.get("url")) if isinstance(data, dict) else None
+    return {"url": url} if url else None
+
+
+REACT_FETCHERS = {"otakugifs": _rf_otakugifs, "nekosbest": _rf_nekosbest, "gifukai": _rf_gifukai,
+                  "purrbot": _rf_purrbot, "waifupics": _rf_waifupics}
+
+# --- circuit breakers: a (source, reaction) pair that fails 3x is paused 30 min; a whole source
+# --- that fails 6x in a row is paused 10 min. If EVERYTHING for a reaction is paused, we try anyway.
+_react_pair_fails: dict[tuple[str, str], int] = {}
+_react_pair_off: dict[tuple[str, str], float] = {}
+_react_prov_fails: dict[str, int] = {}
+_react_prov_off: dict[str, float] = {}
+
+
+def _react_available(prov: str, cat: str) -> bool:
+    now = time.time()
+    return _react_pair_off.get((prov, cat), 0) <= now and _react_prov_off.get(prov, 0) <= now
+
+
+def _react_ok(prov: str, cat: str) -> None:
+    _react_pair_fails.pop((prov, cat), None)
+    _react_prov_fails[prov] = 0
+
+
+def _react_bad(prov: str, cat: str) -> None:
+    now = time.time()
+    n = _react_pair_fails.get((prov, cat), 0) + 1
+    _react_pair_fails[(prov, cat)] = n
+    if n >= 3:
+        _react_pair_off[(prov, cat)] = now + 1800
+        _react_pair_fails.pop((prov, cat), None)
+        logger.warning("/react: pausing %s for '%s' for 30 minutes (3 failures)", prov, cat)
+    pf = _react_prov_fails.get(prov, 0) + 1
+    _react_prov_fails[prov] = pf
+    if pf >= 6:
+        _react_prov_off[prov] = now + 600
+        _react_prov_fails[prov] = 0
+        logger.warning("/react: pausing the whole %s source for 10 minutes (6 failures in a row)", prov)
+
+
+async def _react_fetch(cat: str):
+    """Returns (result dict, provider key, kind) or None. Random source first; up to 3 sources tried."""
+    options = list(REACT_CATALOG.get(cat, []))
+    live = [o for o in options if _react_available(o[0], cat)]
+    options = live or options
+    random.shuffle(options)
+    for prov, remote, kind in options[:3]:
+        result = await REACT_FETCHERS[prov](remote, kind)
+        if result:
+            _react_ok(prov, cat)
+            return result, prov, kind
+        _react_bad(prov, cat)
+    return None
+
+
+async def _react_refresh() -> None:
+    """Read the live category lists from nekos.best and Gifukai (both document an endpoint for it)."""
+    data = await _react_get("https://nekos.best/api/v2/endpoints", ua=True)
+    if isinstance(data, dict):
+        cats = {}
+        for name, info in data.items():
+            if isinstance(name, str) and _CAT_OK.match(name) and not _CAT_BAD.search(name) and isinstance(info, dict):
+                cats[name] = (name, "gif" if info.get("format") == "gif" else "img")
+        if len(cats) >= 10:                                    # ignore anything that looks truncated
+            REACT_PROVIDERS["nekosbest"]["cats"] = dict(list(cats.items())[:200])
+    data = await _react_get("https://api.gifukai.com/v1/actions", ua=True)
+    actions = data.get("actions") if isinstance(data, dict) else None
+    names = list(actions) if isinstance(actions, (dict, list)) else []
+    names = [n for n in names if isinstance(n, str) and _CAT_OK.match(n) and not _CAT_BAD.search(n)]
+    if len(names) >= 3:
+        REACT_PROVIDERS["gifukai"]["cats"] = {n: (n, "gif") for n in names[:200]}
+    _rebuild_react_catalog()
+    logger.info("/react ready: %d reactions across %d sources", len(REACT_CATALOG),
+                len([p for p in REACT_PROVIDERS if p not in REACT_DISABLE]))
+
+
+async def _react_refresher() -> None:
+    """Background task: refresh the category lists now and every 6 hours."""
+    await bot.wait_until_ready()
+    while True:
+        try:
+            await _react_refresh()
+        except Exception:
+            logger.exception("Couldn't refresh the /react category lists (the built-in lists still work)")
+        await asyncio.sleep(6 * 3600)
 
 
 async def _reaction_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
-    current_lower = current.strip().lower()
-    matches = [r for r in ALL_REACTIONS if current_lower in r][:25]
-    return [app_commands.Choice(name=r, value=r) for r in matches]
+    needle = current.strip().lower()
+    cats = sorted(REACT_CATALOG)
+    ordered = [c for c in cats if c.startswith(needle)] + [c for c in cats if needle in c and not c.startswith(needle)]
+    out = []
+    for c in ordered[:25]:
+        pic_only = all(kind == "img" for _, _, kind in REACT_CATALOG[c])
+        out.append(app_commands.Choice(name=f"{c} 🖼️" if pic_only else c, value=c))
+    return out
 
 
-@bot.tree.command(name="react", description="Send any anime reaction gif at someone (start typing to search).")
-@app_commands.describe(reaction="Which reaction (start typing to search all 67)", user="Who to react at")
+@bot.tree.command(name="react", description="Send an anime reaction gif at someone (start typing to search).")
+@app_commands.describe(reaction="Which reaction (start typing to search)", user="Who to react at")
 @app_commands.autocomplete(reaction=_reaction_autocomplete)
 async def react_slash(interaction: discord.Interaction, reaction: str, user: discord.Member):
     if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
@@ -1380,8 +1638,8 @@ async def react_slash(interaction: discord.Interaction, reaction: str, user: dis
         )
         return
 
-    reaction_clean = reaction.strip().lower()
-    if reaction_clean not in ALL_REACTIONS:
+    reaction_clean = reaction.strip().lower().removesuffix("🖼️").strip()
+    if reaction_clean not in REACT_CATALOG:
         await interaction.response.send_message(
             f"`{reaction}` isn't a reaction I know — start typing in the `reaction` "
             "field and pick one of the suggestions.",
@@ -1390,16 +1648,27 @@ async def react_slash(interaction: discord.Interaction, reaction: str, user: dis
         return
 
     await interaction.response.defer()
-    data = await _fetch_json(f"https://api.otakugifs.xyz/gif?reaction={reaction_clean}")
-    gif_url = data.get("url") if data else None
-    text = f"{interaction.user.mention} reacts with **{reaction_clean}** at {user.mention}! {MILO_EMOJI}"
-
-    if gif_url:
-        embed = discord.Embed(description=text, color=discord.Color.green())
-        embed.set_image(url=gif_url)
-        await interaction.followup.send(embed=embed)
+    fetched = await _react_fetch(reaction_clean)
+    if fetched is None:
+        await interaction.followup.send(
+            f"{interaction.user.mention} reacts with **{reaction_clean}** at {user.mention}! {MILO_EMOJI}\n"
+            "*(the gif sites are all being shy right now — try again in a bit)*"
+        )
+        return
+    result, prov, kind = fetched
+    if kind == "img":
+        text = f"{interaction.user.mention} sends a **{reaction_clean}** pic to {user.mention}! {MILO_EMOJI}"
     else:
-        await interaction.followup.send(text)
+        text = f"{interaction.user.mention} reacts with **{reaction_clean}** at {user.mention}! {MILO_EMOJI}"
+    embed = discord.Embed(description=text, color=discord.Color.green())
+    embed.set_image(url=result["url"])
+    credit = [f"via {REACT_PROVIDERS[prov]['label']}"]
+    if isinstance(result.get("anime"), str) and result["anime"].strip():
+        credit.append(result["anime"].strip()[:80])
+    if kind == "img" and isinstance(result.get("artist"), str) and result["artist"].strip():
+        credit.append(f"art by {result['artist'].strip()[:60]}")
+    embed.set_footer(text=" · ".join(credit))
+    await interaction.followup.send(embed=embed)
 
 
 # ---------------------------------------------------------------------------
@@ -2768,6 +3037,8 @@ class PointsManager:
         self._expire_tk: set[str] = set()
         self.lottery: dict = {"carry": LOTTERY_SEED, "drawn": "", "last": None}
         self._p_lstate: str | None = None
+        self.jp_wins: dict[tuple[str, int], int] = {}              # (day, user) -> 777s hit that day (for the midnight shout-out)
+        self._p_jpw: dict[tuple[str, int], int] = {}
         # Memory-only, fine to lose:
         self.pity: dict[int, int] = {}
         self.last_spin: dict[int, float] = {}
@@ -2803,6 +3074,9 @@ class PointsManager:
             self.earned[uid] = self.earned.get(uid, 0) + payout
             self._p_earn[uid] = self._p_earn.get(uid, 0) + payout
         # the 200-spin guarantee counter: +1 per spin, back to 0 on any 777
+        if hit_777:
+            self.jp_wins[key] = self.jp_wins.get(key, 0) + 1
+            self._p_jpw[key] = self._p_jpw.get(key, 0) + 1
         live = self.jp.get(uid, 0)
         change = -live if hit_777 else 1
         if change:
@@ -2835,6 +3109,10 @@ class PointsManager:
         self.add_balance(recipient, amount)
         self.sent[(day, sender)] = self.sent.get((day, sender), 0) + amount
         self._p_sent[(day, sender)] = self._p_sent.get((day, sender), 0) + amount
+
+    def jackpot_winners(self, day: str) -> dict[int, int]:
+        """Who hit 777 on that day, and how many times."""
+        return {u: n for (d, u), n in self.jp_wins.items() if d == day and n > 0}
 
     def jp_count(self, uid: int) -> int:
         return self.jp.get(uid, 0)
@@ -2995,6 +3273,7 @@ class PointsManager:
         users |= set(self._p_daily) | set(self._p_stats) | {u for u, d in self._p_jp.items() if d}
         users |= {u for (_, u), d in self._p_sent.items() if d}
         users |= {u for (_, u, _n) in self._p_tickets}
+        users |= {u for (_, u), n in self._p_jpw.items() if n}
         return users
 
     def _build_flush(self) -> tuple[list[list], list[tuple]]:
@@ -3026,6 +3305,15 @@ class PointsManager:
             if sent:
                 cmds.append(["HINCRBY", key, f"{uid}:s", sent])
                 meta.append(("sent", (day, uid), sent))
+                if day not in self._expire_sent and day not in expire_queued:
+                    cmds.append(["EXPIRE", key, 172800])
+                    meta.append(("expire", day, 0))
+                    expire_queued.add(day)
+        for (day, uid), n in self._p_jpw.items():
+            key = POINTS_KEY_DAY + day
+            if n:
+                cmds.append(["HINCRBY", key, f"{uid}:j", n])
+                meta.append(("jpw", (day, uid), n))
                 if day not in self._expire_sent and day not in expire_queued:
                     cmds.append(["EXPIRE", key, 172800])
                     meta.append(("expire", day, 0))
@@ -3100,6 +3388,13 @@ class PointsManager:
             else:
                 self._p_sent.pop(ref, None)
             self.sent[ref] = _to_int(result) + left
+        elif kind == "jpw":
+            left = self._p_jpw.get(ref, 0) - delta
+            if left:
+                self._p_jpw[ref] = left
+            else:
+                self._p_jpw.pop(ref, None)
+            self.jp_wins[ref] = _to_int(result) + left
         elif kind == "daily":
             if self._p_daily.get(ref) == delta:          # unchanged since we sent it
                 del self._p_daily[ref]
@@ -3127,6 +3422,8 @@ class PointsManager:
             del self.spins[key]
         for key in [k for k in self.sent if k[0] < yesterday and k not in self._p_sent]:
             del self.sent[key]
+        for key in [k for k in self.jp_wins if k[0] < yesterday and k not in self._p_jpw]:
+            del self.jp_wins[key]
 
     async def flush(self, reason: str) -> tuple[bool, int, str]:
         """Save every unsaved change. Returns (ok, people_saved, detail)."""
@@ -3196,12 +3493,15 @@ class PointsManager:
             earn = {int(k): _to_int(v) for k, v in _flat_pairs(results[1].get("result")) if k.isdigit()}
             counts: dict[tuple[int, int], int] = {}
             sent_counts: dict[int, int] = {}
+            jpw_counts: dict[int, int] = {}
             for fld, v in _flat_pairs(results[2].get("result")):
                 uid_s, _, kind = fld.partition(":")
                 if uid_s.isdigit() and kind in ("f", "p"):
                     counts[(int(uid_s), 0 if kind == "f" else 1)] = _to_int(v)
                 elif uid_s.isdigit() and kind == "s":
                     sent_counts[int(uid_s)] = _to_int(v)
+                elif uid_s.isdigit() and kind == "j":
+                    jpw_counts[int(uid_s)] = _to_int(v)
             for uid in set(bal) | set(self._p_bal):
                 self.balance[uid] = bal.get(uid, 0) + self._p_bal.get(uid, 0)
             for uid in set(earn) | set(self._p_earn):
@@ -3213,6 +3513,8 @@ class PointsManager:
                     live[idx] = counts.get((uid, idx), 0) + pend[idx]
             for uid in set(sent_counts) | {u for (d, u) in self._p_sent if d == day}:
                 self.sent[(day, uid)] = sent_counts.get(uid, 0) + self._p_sent.get((day, uid), 0)
+            for uid in set(jpw_counts) | {u for (d, u) in self._p_jpw if d == day}:
+                self.jp_wins[(day, uid)] = jpw_counts.get(uid, 0) + self._p_jpw.get((day, uid), 0)
             for uid, value in _flat_pairs(results[3].get("result")):
                 if uid.isdigit() and int(uid) not in self._p_daily:
                     self.daily[int(uid)] = str(value)
@@ -3380,11 +3682,7 @@ def _spin_precheck(uid: int) -> tuple[str, dict]:
 def _perform_spin(uid: int, *, paid: bool, cost: int, day: str) -> discord.Embed:
     """The actual spin. Instant memory work -- no awaits -- so two quick spins
     can never both sneak under a limit."""
-    POINTS.last_spin[uid] = time.time()
-    since_win = POINTS.pity.get(uid, 0)
-    reels, payout, pity = _roll_slots(since_win, POINTS.jp_count(uid))
-    POINTS.pity[uid] = 0 if payout else since_win + 1
-    POINTS.record_spin(uid, paid=paid, cost=cost, payout=payout, day=day, hit_777=reels == [SLOT_JACKPOT] * 3)
+    reels, payout, pity = _spin_core(uid, paid=paid, cost=cost, day=day)
 
     symbol = reels[0]
     if payout and symbol == SLOT_JACKPOT:
@@ -3430,6 +3728,178 @@ def _perform_spin(uid: int, *, paid: bool, cost: int, day: str) -> discord.Embed
             footer += f" · 🍀 Win guaranteed within {until_pity} spin{'s' if until_pity != 1 else ''}"
     embed.set_footer(text=footer)
     return embed
+
+
+def _spin_core(uid: int, *, paid: bool, cost: int, day: str) -> tuple[list[str], int, str]:
+    """One spin's bookkeeping, no message. Instant memory work (no awaits)."""
+    POINTS.last_spin[uid] = time.time()
+    since_win = POINTS.pity.get(uid, 0)
+    reels, payout, pity = _roll_slots(since_win, POINTS.jp_count(uid))
+    POINTS.pity[uid] = 0 if payout else since_win + 1
+    POINTS.record_spin(uid, paid=paid, cost=cost, payout=payout, day=day, hit_777=reels == [SLOT_JACKPOT] * 3)
+    return reels, payout, pity
+
+
+_BATCH_MAX = 60                      # never more than this many spins in one go
+_SYMBOL_WORD = {"7️⃣": "777", "⭐": "stars", "🍇": "grapes", "🍉": "melons", "🍋": "lemons", "🍒": "cherries"}
+
+
+def _next_spin_kind(free_used: int, bonus_used: int) -> str | None:
+    """What the next spin would be WITHOUT paying for anything: 'free', 'pack' (already paid for), or None."""
+    if free_used < SLOTS_FREE_SPINS:
+        return "free"
+    if bonus_used < SLOTS_PAID_SPINS and bonus_used % SLOTS_PACK_SPINS:
+        return "pack"
+    return None
+
+
+def _batch_count(uid: int, day: str) -> int:
+    """How many spins could be taken in one go right now (free spins + the rest of a pack you already bought)."""
+    free_used, bonus_used = POINTS.used(uid, day)
+    n = 0
+    while n < _BATCH_MAX and (kind := _next_spin_kind(free_used, bonus_used)):
+        free_used, bonus_used = (free_used + 1, bonus_used) if kind == "free" else (free_used, bonus_used + 1)
+        n += 1
+    return n
+
+
+def _batch_spin(uid: int, day: str) -> list[dict]:
+    """Take every spin that's already paid for, back to back. Instant memory work, so it can't be
+    interleaved with anything else. Never buys a new pack by itself."""
+    spins: list[dict] = []
+    while len(spins) < _BATCH_MAX:
+        kind = _next_spin_kind(*POINTS.used(uid, day))
+        if kind is None:
+            break
+        reels, payout, pity = _spin_core(uid, paid=kind == "pack", cost=0, day=day)
+        spins.append({"n": len(spins) + 1, "reels": reels, "payout": payout, "pity": pity, "paid": kind == "pack"})
+    return spins
+
+
+def _batch_embed(uid: int, day: str, spins: list[dict]) -> discord.Embed:
+    total = sum(sp["payout"] for sp in spins)
+    wins = [sp for sp in spins if sp["payout"]]
+    lines = [
+        f"**{sp['n']}.** {' '.join(sp['reels'])}" + (f"  ✅ **+{sp['payout']}**" if sp["payout"] else "")
+        for sp in spins
+    ]
+    embed = discord.Embed(
+        title=f"🎰 Slots — {len(spins)} spins at once",
+        description="\n".join(lines)[:4000],
+        color=discord.Color.gold() if any(sp["payout"] >= SLOT_PAYOUTS[SLOT_JACKPOT] for sp in spins) else (discord.Color.green() if wins else discord.Color.dark_grey()),
+    )
+    best = max(spins, key=lambda sp: sp["payout"])
+    embed.add_field(
+        name="Result", inline=False,
+        value=f"**{len(wins)}** win{'s' if len(wins) != 1 else ''} · total **{pfmt(total)}**"
+              + (f" · best: spin {best['n']} (+{best['payout']})" if wins else " · no wins this time — better luck next spins!"),
+    )
+    free_used, bonus_used = POINTS.used(uid, day)
+    footer = (f"Balance: {pamt(POINTS.points(uid))} · Free spins left: {SLOTS_FREE_SPINS - free_used}/{SLOTS_FREE_SPINS} "
+              f"· Bonus spins left: {SLOTS_PAID_SPINS - bonus_used}/{SLOTS_PAID_SPINS}")
+    to_jackpot = SLOTS_JACKPOT_PITY_AT - POINTS.jp_count(uid)
+    if SLOTS_JACKPOT_PITY_AT and to_jackpot <= 25:
+        footer += f" · 🎯 777 guaranteed in {to_jackpot} spin{'s' if to_jackpot != 1 else ''}"
+    embed.set_footer(text=footer)
+    return embed
+
+
+def _batch_win_messages(mention: str, spins: list[dict]) -> list[str]:
+    """The separate 'X won!' messages: every 777 gets its own, the first few other wins too,
+    and any extra wins are rolled into one message so a lucky batch can't flood the channel."""
+    msgs: list[str] = []
+    others: list[dict] = []
+    for sp in spins:
+        if not sp["payout"]:
+            continue
+        if sp["reels"] == [SLOT_JACKPOT] * 3:
+            note = f" (the {SLOTS_JACKPOT_PITY_AT}-spin guarantee!)" if sp["pity"] == "jackpot" else ""
+            msgs.append(f"💥 **JACKPOT!!!** {mention} hit **7️⃣7️⃣7️⃣** on spin #{sp['n']} and won **{pfmt(sp['payout'])}**{note} 🎉")
+        else:
+            others.append(sp)
+    singles, rest = others[:4], others[4:]
+    for sp in singles:
+        msgs.append(f"🎉 {mention} won **{pfmt(sp['payout'])}** on spin #{sp['n']}: {' '.join(sp['reels'])} "
+                    f"(triple {_SYMBOL_WORD.get(sp['reels'][0], sp['reels'][0])})")
+    if rest:
+        msgs.append(f"🎉 {mention} won on {len(rest)} more spins too: "
+                    + ", ".join(f"#{sp['n']} +{sp['payout']}" for sp in rest) + f" (**{pfmt(sum(sp['payout'] for sp in rest))}** more)")
+    return msgs
+
+
+async def _send_batch(interaction: discord.Interaction, uid: int, day: str, spins: list[dict]) -> None:
+    """Post the one long result message, then the separate win messages. The spins are already
+    applied (in memory) before any of this, so a Discord hiccup can never lose points."""
+    try:
+        await interaction.followup.send(embed=_batch_embed(uid, day, spins))
+        for text in _batch_win_messages(interaction.user.mention, spins):
+            await asyncio.sleep(0.7)                                  # gentle on Discord's rate limits
+            await interaction.followup.send(text, allowed_mentions=discord.AllowedMentions.none())
+    except discord.HTTPException as exc:
+        if _is_discord_block(exc):
+            _note_discord_block("a batch spin")
+        else:
+            logger.warning("Couldn't post a batch spin result (the points were still applied)", exc_info=True)
+
+
+class SlotsChoiceView(discord.ui.View):
+    """'Spin once or spin them all?' -- shown when you have 2+ spins ready. Memory only (60s)."""
+
+    def __init__(self, owner_id: int, n: int) -> None:
+        super().__init__(timeout=60)
+        self.owner_id, self.n, self.used = owner_id, n, False
+        self.all_button.label = f"Spin all {n}"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This isn't your spin 🐾", ephemeral=True)
+            return False
+        return True
+
+    async def _check(self, interaction: discord.Interaction):
+        """Shared re-check at click time. Returns the precheck info if a free/pack spin can go ahead."""
+        if self.used:
+            await interaction.response.send_message("Already handled!", ephemeral=True)
+            return None
+        blocked = gamblin_block_text("`/slots`")
+        if blocked or not POINTS.ready:
+            self.used = True
+            self.stop()
+            await interaction.response.edit_message(content=blocked or _POINTS_UNAVAILABLE, view=None)
+            return None
+        status, info = _spin_precheck(self.owner_id)
+        if status != "ok" or info["cost"]:
+            self.used = True
+            self.stop()
+            await interaction.response.edit_message(
+                content=info["msg"] if status != "ok" else "That was your last paid-for spin — use `/slots` again to buy a new pack.",
+                view=None)
+            return None
+        self.used = True
+        self.stop()
+        return info
+
+    @discord.ui.button(label="Spin once", emoji="🎰", style=discord.ButtonStyle.primary)
+    async def once_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        info = await self._check(interaction)
+        if info is None:
+            return
+        embed = _perform_spin(self.owner_id, paid=info["paid"], cost=0, day=info["day"])
+        await interaction.response.edit_message(content="🎰 Spun!", view=None)
+        try:
+            await interaction.followup.send(embed=embed)
+        except discord.HTTPException as exc:
+            if _is_discord_block(exc):
+                _note_discord_block("a spin result")
+
+    @discord.ui.button(label="Spin all", emoji="⚡", style=discord.ButtonStyle.success)
+    async def all_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        info = await self._check(interaction)
+        if info is None:
+            return
+        spins = _batch_spin(self.owner_id, info["day"])
+        await interaction.response.edit_message(content=f"⚡ Spinning {len(spins)} times…", view=None)
+        await _send_batch(interaction, self.owner_id, info["day"], spins)
 
 
 class BonusSpinConfirmView(discord.ui.View):
@@ -3526,6 +3996,15 @@ async def slots_slash(interaction: discord.Interaction):
         bonus_left = SLOTS_PAID_SPINS - POINTS.used(uid, info["day"])[1]
         view = BonusSpinConfirmView(uid, POINTS.points(uid), bonus_left)
         await interaction.response.send_message(view.summary, view=view, ephemeral=True)
+        return
+
+    ready = _batch_count(uid, info["day"])
+    if ready >= 2:
+        # Several spins are ready: offer to take them all in one go.
+        await interaction.response.send_message(
+            f"🎰 You have **{ready} spins** ready. Spin once, or all {ready} at once?",
+            view=SlotsChoiceView(uid, ready), ephemeral=True,
+        )
         return
 
     embed = _perform_spin(uid, paid=info["paid"], cost=0, day=info["day"])
@@ -4110,8 +4589,8 @@ async def help_slash(interaction: discord.Interaction):
             "`/riddle` — a riddle with the answer hidden behind a button\n"
             "`/yesno` — a random yes/no answer with a reaction gif\n"
             "`/throw user` — throw something at someone (or nearby, if left blank)\n"
-            "`/react reaction:<search> user` — react at someone (hug, slap, wave, cry, "
-            "dance, punch, and ~65 more), type to search"
+            "`/react reaction:<search> user` — react at someone with a random anime gif "
+            "(hug, slap, wave, cry, dance, and 100+ more from 5 sources), type to search"
         ),
         inline=False,
     )
@@ -4121,7 +4600,7 @@ async def help_slash(interaction: discord.Interaction):
         value=(
             f"`/slots` — spin for {PTS_NAME}: **{SLOTS_FREE_SPINS} free spins a day**, then up to "
             f"{SLOTS_PAID_SPINS} bonus spins ({SLOTS_PACK_SPINS}-spin packs for {pfmt(SLOTS_PACK_COST)}). "
-            f"Every {SLOTS_JACKPOT_PITY_AT}th spin without a 777 **is** a 777!\n"
+            f"Every {SLOTS_JACKPOT_PITY_AT}th spin without a 777 **is** a 777! Spin one or all at once.\n"
             f"Match all 3 to win: {payout_line}\n"
             "`/points` — your balance, rank and spins left\n"
             f"`/daily` — claim free {PTS_NAME} every day; a streak makes it bigger (+{DAILY_WEEK_BONUS} bonus every 7th day!)\n"
@@ -4192,7 +4671,11 @@ async def help_slash(interaction: discord.Interaction):
 async def on_app_command_error(
     interaction: discord.Interaction, error: app_commands.AppCommandError
 ):
-    logger.error("Slash command error in '%s': %s", interaction.command, error)
+    name = f"/{interaction.command.qualified_name}" if interaction.command else "a command"
+    if _is_discord_block(error):
+        _note_discord_block(name)          # replying would just be another request that gets blocked
+        return
+    logger.error("Slash command error in %s: %s", name, error)
     try:
         if interaction.response.is_done():
             await interaction.followup.send(
@@ -6534,7 +7017,11 @@ async def post_backup(title: str) -> bool:
     """Post a backup file to the log channel. Returns False if there's nowhere to post."""
     if not LOG_CHANNEL_ID:
         return False
-    await log_event(title, file=_backup_file())
+
+    async def send() -> None:
+        channel = bot.get_channel(LOG_CHANNEL_ID) or await bot.fetch_channel(LOG_CHANNEL_ID)
+        await channel.send(content=title, file=_backup_file(), allowed_mentions=discord.AllowedMentions.none())
+    await _retry_discord(send, "the nightly backup")
     return True
 
 
@@ -6851,23 +7338,26 @@ def _reset_announce_embed() -> discord.Embed:
         f"💸 `/pay` — your {pamt(PAY_DAILY_CAP)} sending limit is back",
     ]
     embed = discord.Embed(title="🌅 New day — everything has reset!", description="\n".join(lines), color=discord.Color.gold())
+    winners = POINTS.jackpot_winners(_day_before(_day_info()[0]))
+    if winners:
+        names = " ".join(f"<@{u}>" + (f" ×{n}" if n > 1 else "") for u, n in sorted(winners.items(), key=lambda kv: (-kv[1], kv[0]))[:25])
+        embed.add_field(name="💥 Yesterday's 777 winners", value=f"{names}\nCongratulations! 🎉", inline=False)
     embed.set_footer(text=f"Limits reset every day at 12:00 AM ({LIMIT_RESET_TZ})")
     return embed
 
 
 async def _post_reset_announcement() -> None:
-    try:
+    async def send() -> None:
         channel = bot.get_channel(RESET_ANNOUNCE_CHANNEL_ID) or await bot.fetch_channel(RESET_ANNOUNCE_CHANNEL_ID)
         await channel.send(
             content="@everyone", embed=_reset_announce_embed(),
             allowed_mentions=discord.AllowedMentions(everyone=True),
         )
-    except Exception:
-        logger.warning("Couldn't post the midnight announcement (check RESET_ANNOUNCE_CHANNEL_ID and "
-                       "Milo's Send Messages + Mention Everyone permissions there).", exc_info=True)
-        await log_event("⚠️ I couldn't post the midnight reset announcement — check my permissions in that channel.")
-        return
-    await log_event("📣 Midnight reset announcement posted.")
+    if await _retry_discord(send, "the midnight announcement"):
+        await log_event("📣 Midnight reset announcement posted.")
+    else:
+        await log_event("⚠️ I couldn't post the midnight reset announcement — check my permissions in that channel "
+                        "(or Discord was blocking this host; see the Render logs).")
 
 
 async def _daily_reset_announcer() -> None:
@@ -7139,11 +7629,10 @@ async def _post_lottery_result(r: dict) -> None:
     embed = _lottery_result_embed(r)
     channel_id = LOTTERY_CHANNEL_ID or RESET_ANNOUNCE_CHANNEL_ID
     if channel_id:
-        try:
+        async def send() -> None:
             channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
             await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-        except Exception:
-            logger.warning("Couldn't post the lottery result", exc_info=True)
+        await _retry_discord(send, "the lottery result post")
     await log_event(f"🎟️ Lottery {r['day']}: numbers {_lottery_nums(r['nums'])}, {r['tickets']} tickets, "
                     f"{r['w3']} jackpot / {r['w2']} two-match / {r['w1']} one-match winners, jackpot now {pamt(r['carry'])}.")
 
@@ -7209,7 +7698,7 @@ async def log_event(text: str | None = None, embed: discord.Embed | None = None,
     """Write to the log channel (if LOG_CHANNEL_ID is set). Never raises."""
     if text:
         logger.info("LOG: %s", text.replace("\n", " | "))
-    if not LOG_CHANNEL_ID:
+    if not LOG_CHANNEL_ID or discord_blocked():
         return
     try:
         channel = bot.get_channel(LOG_CHANNEL_ID) or await bot.fetch_channel(LOG_CHANNEL_ID)
