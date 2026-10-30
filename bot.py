@@ -1421,7 +1421,6 @@ async def grouptrivia_slash(interaction: discord.Interaction):
 #   nekos.best     keyless   https://nekos.best/api/v2/<category>  (needs a real User-Agent)
 #   gifukai.com    keyless   https://api.gifukai.com/v1/<action>
 #   purrbot.site   keyless   https://api.purrbot.site/v2/img/sfw/<category>/<gif|img>
-#   waifu.pics     keyless   https://api.waifu.pics/sfw/<category>
 # ---------------------------------------------------------------------------
 REACT_DISABLE = {x.strip().lower() for x in os.getenv("REACT_DISABLE", "").split(",") if x.strip()}   # whole sources to switch off
 REACT_BLOCK = {x.strip().lower() for x in os.getenv("REACT_BLOCK", "").split(",") if x.strip()}         # single reactions to hide
@@ -1456,10 +1455,6 @@ _GIFUKAI_ACTIONS = ["pat", "hug", "kiss", "cry", "sleep", "blush", "pout"]      
 _PURRBOT_GIFS = ["angry", "bite", "blush", "comfy", "cry", "cuddle", "dance", "eevee", "fluff", "hug", "kiss",
                  "lay", "lick", "neko", "pat", "poke", "pout", "slap", "smile", "tickle"]
 _PURRBOT_IMGS = ["holo", "kitsune", "okami", "senko", "shiro"]
-_WAIFUPICS_GIFS = ["bully", "cuddle", "cry", "hug", "kiss", "lick", "pat", "smug", "bonk", "yeet", "blush",
-                   "smile", "wave", "highfive", "handhold", "nom", "bite", "glomp", "slap", "kick", "happy",
-                   "wink", "poke", "dance", "cringe"]
-_WAIFUPICS_IMGS = ["waifu", "neko", "shinobu", "megumin", "awoo"]
 
 # provider -> {"label", "cats": {reaction name: (remote name, "gif" | "img")}}
 REACT_PROVIDERS: dict[str, dict] = {
@@ -1468,7 +1463,6 @@ REACT_PROVIDERS: dict[str, dict] = {
     "gifukai": {"label": "gifukai.com", "cats": {c: (c, "gif") for c in _GIFUKAI_ACTIONS}},
     "purrbot": {"label": "purrbot.site", "cats": {**{("wag" if c == "tail" else c): (c, "gif") for c in _PURRBOT_GIFS + ["tail"]},
                                                   **{c: (c, "img") for c in _PURRBOT_IMGS}}},
-    "waifupics": {"label": "waifu.pics", "cats": {**{c: (c, "gif") for c in _WAIFUPICS_GIFS}, **{c: (c, "img") for c in _WAIFUPICS_IMGS}}},
 }
 REACT_CATALOG: dict[str, list[tuple[str, str, str]]] = {}      # reaction -> [(provider, remote, kind), ...]
 
@@ -1525,14 +1519,8 @@ async def _rf_purrbot(remote: str, kind: str):
     return {"url": url} if url else None
 
 
-async def _rf_waifupics(remote: str, kind: str):
-    data = await _react_get(f"https://api.waifu.pics/sfw/{remote}")
-    url = _good_url(data.get("url")) if isinstance(data, dict) else None
-    return {"url": url} if url else None
-
-
 REACT_FETCHERS = {"otakugifs": _rf_otakugifs, "nekosbest": _rf_nekosbest, "gifukai": _rf_gifukai,
-                  "purrbot": _rf_purrbot, "waifupics": _rf_waifupics}
+                  "purrbot": _rf_purrbot}
 
 # --- circuit breakers: a (source, reaction) pair that fails 3x is paused 30 min; a whole source
 # --- that fails 6x in a row is paused 10 min. If EVERYTHING for a reaction is paused, we try anyway.
@@ -1615,12 +1603,37 @@ async def _react_refresher() -> None:
         await asyncio.sleep(6 * 3600)
 
 
+_POPULAR_REACTIONS = ["hug", "pat", "kiss", "slap", "cry", "wave", "dance", "cuddle", "poke", "bite", "blush",
+                      "wink", "laugh", "smile", "happy", "nom", "highfive", "handhold", "bonk", "yeet",
+                      "facepalm", "smug", "pout", "sleep", "stare"]
+
+
+@bot.tree.command(name="reactions", description="See every reaction you can use with /react.")
+async def reactions_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message("This bot is not configured for this server.", ephemeral=True)
+        return
+    names = [f"{c} 🖼️" if all(kind == "img" for _, _, kind in REACT_CATALOG[c]) else c for c in sorted(REACT_CATALOG)]
+    embed = discord.Embed(
+        title=f"🎭 {len(names)} reactions for /react",
+        description=" · ".join(names)[:4000],
+        color=discord.Color.green(),
+    )
+    embed.set_footer(text="Use /react, type any of these names, then pick the person · 🖼️ = a still picture, not a gif")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 async def _reaction_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
-    needle = current.strip().lower()
+    needle = current.strip().lower().removesuffix("🖼️").strip()
     cats = sorted(REACT_CATALOG)
-    ordered = [c for c in cats if c.startswith(needle)] + [c for c in cats if needle in c and not c.startswith(needle)]
+    if not needle:
+        # Discord shows at most 25 suggestions, so lead with the popular ones (not just a-z).
+        ordered = [c for c in _POPULAR_REACTIONS if c in REACT_CATALOG]
+        ordered += [c for c in cats if c not in ordered]
+    else:
+        ordered = [c for c in cats if c.startswith(needle)] + [c for c in cats if needle in c and not c.startswith(needle)]
     out = []
     for c in ordered[:25]:
         pic_only = all(kind == "img" for _, _, kind in REACT_CATALOG[c])
@@ -3730,6 +3743,29 @@ def _perform_spin(uid: int, *, paid: bool, cost: int, day: str) -> discord.Embed
     return embed
 
 
+def _announce_jackpot(uid: int, payout: int, pity: str) -> None:
+    """A 777 was just hit: tell RESET_ANNOUNCE_CHANNEL_ID right away (no @everyone). Fire-and-forget, so it
+    never slows down or breaks a spin; if there's no channel set or no event loop running, it does nothing."""
+    if not RESET_ANNOUNCE_CHANNEL_ID:
+        return
+    try:
+        task = asyncio.get_running_loop().create_task(_post_jackpot_announcement(uid, payout, pity))
+    except RuntimeError:
+        return
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _post_jackpot_announcement(uid: int, payout: int, pity: str) -> None:
+    note = f" — the {SLOTS_JACKPOT_PITY_AT}-spin guarantee kicked in!" if pity == "jackpot" else ""
+    text = f"💥 **JACKPOT!** <@{uid}> just hit **7️⃣7️⃣7️⃣** in `/slots` and won **{pfmt(payout)}**{note} 🎉"
+
+    async def send() -> None:
+        channel = bot.get_channel(RESET_ANNOUNCE_CHANNEL_ID) or await bot.fetch_channel(RESET_ANNOUNCE_CHANNEL_ID)
+        await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+    await _retry_discord(send, "the 777 announcement")
+
+
 def _spin_core(uid: int, *, paid: bool, cost: int, day: str) -> tuple[list[str], int, str]:
     """One spin's bookkeeping, no message. Instant memory work (no awaits)."""
     POINTS.last_spin[uid] = time.time()
@@ -3737,6 +3773,8 @@ def _spin_core(uid: int, *, paid: bool, cost: int, day: str) -> tuple[list[str],
     reels, payout, pity = _roll_slots(since_win, POINTS.jp_count(uid))
     POINTS.pity[uid] = 0 if payout else since_win + 1
     POINTS.record_spin(uid, paid=paid, cost=cost, payout=payout, day=day, hit_777=reels == [SLOT_JACKPOT] * 3)
+    if reels == [SLOT_JACKPOT] * 3:
+        _announce_jackpot(uid, payout, pity)
     return reels, payout, pity
 
 
@@ -4590,7 +4628,7 @@ async def help_slash(interaction: discord.Interaction):
             "`/yesno` — a random yes/no answer with a reaction gif\n"
             "`/throw user` — throw something at someone (or nearby, if left blank)\n"
             "`/react reaction:<search> user` — react at someone with a random anime gif "
-            "(hug, slap, wave, cry, dance, and 100+ more from 5 sources), type to search"
+            "(hug, slap, wave, cry, dance, and 100+ more from 4 sources), type to search · `/reactions` lists them all"
         ),
         inline=False,
     )

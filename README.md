@@ -3,7 +3,7 @@
 A simple, single-server, **cat-themed** Discord bot built with **Python 3.12+** and **discord.py 2.x**.
 
 Features:
-- 47 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, points & slots, party/social, AI, lookups, and utility — see Section 9 for the full list
+- 48 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, points & slots, party/social, AI, lookups, and utility — see Section 9 for the full list
 - A points economy: win points in `/slots` (25 free spins a day, then bonus spins for points), check them with `/points`, climb `/leaderboard` — kept in memory and saved to Upstash in the background (Section 15)
 - A persistent **✔️ Interested** button on `/join` messages — survives bot restarts, **no database required**
 - A cat-themed welcome message when new members join
@@ -212,7 +212,8 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `/trivia` | A random trivia question with answer buttons (60s to answer, nothing persisted). |
 | `/riddle` | A random riddle; the answer is hidden behind a "Reveal Answer" button (ephemeral, only you see it). |
 | `/yesno` | A random yes/no answer with a reaction gif, via [yesno.wtf](https://yesno.wtf). |
-| `/react reaction:<search> user:<member>` | An anime reaction gif aimed at someone: hug, slap, pat, wave, handhold, cry, dance, punch, wink and **100+ more**. Milo picks **randomly between 5 sources** (otakugifs, nekos.best, Gifukai, PurrBot, waifu.pics) and quietly switches to another if one is down. Start typing in the `reaction` field to search; a 🖼️ marks reactions that are still pictures. Section 26. |
+| `/reactions` | Shows the full list of every reaction `/react` knows (only you see it), because the dropdown can only show 25 suggestions at a time. |
+| `/react reaction:<search> user:<member>` | An anime reaction gif aimed at someone: hug, slap, pat, wave, handhold, cry, dance, punch, wink and **100+ more** (108 right now). Milo picks **randomly between 4 sources** (otakugifs, nekos.best, Gifukai, PurrBot) and quietly switches to another if one is down. Start typing in the `reaction` field to search (with nothing typed it shows the 25 most popular; Discord can't show more than 25 at once, so use `/reactions` for the full list); a 🖼️ marks reactions that are still pictures. Section 26. |
 | `/throw user:<member>` | Throw a random absurdly-specific item at someone (or a random nearby person if left blank) — a Roomba fighting a cat, a Nokia 3310, a printer jam of biblical proportions, etc. Mirrors YAGPDB's own `/fun throw`: 5% chance of a triple throw, 10% chance of a double, otherwise a single. |
 | `/grouptrivia` | A live group round: everyone in the channel can answer the same question. What each person picked stays secret, but their name appears in a visibly growing "answered so far" list the moment they lock one in. After 60 seconds, the correct answer and everyone who got it right are revealed. No database — all state lives in memory for that 60-second window only. |
 
@@ -299,7 +300,7 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `LOTTERY_TICKET_COST` / `LOTTERY_MAX_TICKETS` / `LOTTERY_JACKPOT_SEED` | Optional | Lottery ticket price (default `10`), most tickets per person per draw (`5`), and the jackpot's starting amount (`50`). |
 | `LOTTERY_CHANNEL_ID` | Optional | Where the nightly lottery results post. Falls back to `RESET_ANNOUNCE_CHANNEL_ID`. If neither is set, results only go to the log channel and `/lottery`. |
 | `API_USER_AGENT` | Optional | The name Milo gives the gif sites when it asks them for a gif (nekos.best insists on a real one). The default is fine; set it to something like `MiloBot/1.0 (https://github.com/you/da-bot)` if you want to be tidy. |
-| `REACT_DISABLE` / `REACT_BLOCK` | Optional | `REACT_DISABLE=purrbot,waifupics` switches whole gif sources off (names: `otakugifs`, `nekosbest`, `gifukai`, `purrbot`, `waifupics`). `REACT_BLOCK=bully,glomp` hides individual reactions you don't want. See Section 26. |
+| `REACT_DISABLE` / `REACT_BLOCK` | Optional | `REACT_DISABLE=purrbot` switches whole gif sources off (names: `otakugifs`, `nekosbest`, `gifukai`, `purrbot`). `REACT_BLOCK=bully,glomp` hides individual reactions you don't want. See Section 26. |
 | `RESET_ANNOUNCE_CHANNEL_ID` | Optional | Your #general (or any channel). At 12:00 AM `LIMIT_RESET_TZ` Milo posts "everything has reset" with an @everyone ping. Off if unset. See Section 23. |
 | `PAY_DAILY_CAP` | Optional | Most points one person can `/pay` per day. Default `200`. |
 | `LOG_CHANNEL_ID` | Optional | A private staff channel where Milo logs manager actions, Gamblin results, save problems, online/offline notices, and everyone's points at the nightly reset. See Section 17. |
@@ -413,7 +414,7 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - `?send` requires at least one of `MANAGER_ROLE_ID` / `MILO_ROLE_ID` to be set, plus the Message Content intent to be enabled — without those, it silently does nothing.
 - Clicking your own **Interested** button is blocked with a friendly ephemeral message — remove that check in `bot.py` if you'd rather allow it.
 - Custom `/join` messages are capped at 300 characters; Discord's own per-message limit is 2000.
-- `/catfact`, `/meow`, `/quote`, `/weather`, `/translate`, `/yesno`, and `/react` all call free, keyless public APIs (catfact.ninja, cataas.com, zenquotes.io, Open-Meteo, Google Translate's web endpoint, yesno.wtf, and for `/react`: otakugifs.xyz, nekos.best, gifukai.com, purrbot.site, waifu.pics). None of them need an API key or env var, but they're third-party services outside your control — if one is briefly down, slow, or rate-limits you, the command replies with a friendly fallback message instead of crashing (and the reaction commands still post as plain text without the gif).
+- `/catfact`, `/meow`, `/quote`, `/weather`, `/translate`, `/yesno`, and `/react` all call free, keyless public APIs (catfact.ninja, cataas.com, zenquotes.io, Open-Meteo, Google Translate's web endpoint, yesno.wtf, and for `/react`: otakugifs.xyz, nekos.best, gifukai.com, purrbot.site). None of them need an API key or env var, but they're third-party services outside your control — if one is briefly down, slow, or rate-limits you, the command replies with a friendly fallback message instead of crashing (and the reaction commands still post as plain text without the gif).
 - **How `/ask`'s rate limit works.** `/ask` uses `openai/gpt-oss-20b` on Groq's free tier, which allows **30 requests/minute, 1,000 requests/day, 8,000 tokens/minute, and 200,000 tokens/day** — and you're held to whichever limit you hit *first*. These belong to your **Groq account, not to individual Discord users**: everyone on the server shares one pool. A "token" is roughly a small piece of a word, and every question spends some on Milo's personality prompt (~170), your question, the model's brief hidden "thinking", and the answer — roughly 350–550 in total. That means the **token limits bite long before the request limits do**: expect about **400–550 questions a day** (not 1,000) and about **10–15 a minute** across the whole server. (These are estimates, not guarantees.) When a limit is hit, Groq replies 429 and `/ask` answers with a friendly in-character message instead of crashing, telling a per-minute limit ("give me a minute") apart from a daily one ("I've used up my brainpower for today"). To protect the shared pool, `/ask` also has a 15-second per-person cooldown (a failed question doesn't count against it) and can be restricted to specific channels with `ASK_CHANNEL_IDS`. Groq's free-tier numbers change over time — see console.groq.com/docs/rate-limits.
 - **Why `/ask` uses `GROQ_MODEL` instead of a hard-coded name.** The first version of `/ask` used `llama-3.1-8b-instant`, which Groq shut down for regular accounts on August 16, 2026 (its model page now lists it as Enterprise-only) — every request then failed with a 404. The model name is now an overridable env var (default `openai/gpt-oss-20b`) so the next retirement is a one-line change in Render, not a code fix. `gpt-oss` models are *reasoning* models whose hidden thinking tokens count against the response budget, so `/ask` requests low reasoning effort and a 500-token budget; if the budget ever runs out, Groq returns an empty answer, which `/ask` detects and logs (`finish_reason=length`) rather than posting a blank embed.
 - `/ask` caps each question at 300 characters and each answer at roughly 300 tokens (and hard-truncates anything over 1000 characters) so one reply can never exceed Discord's embed field limits. It has no memory — every question is answered independently, with no conversation history carried over.
@@ -421,7 +422,7 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - Every `_fetch_json` call (used by every API-backed command) automatically retries once on a timeout before giving up, since free public APIs occasionally drop a single request without actually being down. Other failures (404, 429, connection refused) fail immediately without retrying.
 - **Why `/weather` sometimes said "can't get" (HTTP 429).** Open-Meteo's free API limits by *IP address*, and on shared hosting like Render every app on the same IP shares one quota — so it can answer 429 ("too many requests") even though neither Milo nor Open-Meteo is broken. The same root cause as `/translate`'s old failures. Milo now falls back to MET Norway (Norway's national weather service; free, no key, asks clients to identify themselves — Milo's User-Agent includes your Discord profile link) and caches each place for 10 minutes. Geocoding (turning "Bengaluru" into coordinates) also goes through Open-Meteo and is cached for 24 hours; if *that* is rate-limited Milo says the map service is busy rather than pretending the place doesn't exist. Typos matter: `Banglore` fuzzy-matched somewhere in Pakistan once — use `Bengaluru`.
 - `/weather` properly percent-encodes its input (via aiohttp's `params`) before building the request URL. An earlier version inserted raw user text directly into the URL string, so a city name with a space or accented letter could hang the request instead of cleanly failing.
-- `/react` covers every reaction from all its sources via autocomplete in one command rather than a dedicated slash command per reaction — Discord caps a fixed dropdown at 25 choices and there are 110+ reactions.
+- `/react` covers every reaction from all its sources via autocomplete in one command rather than a dedicated slash command per reaction — Discord caps a fixed dropdown at 25 choices and there are 100+ reactions.
 - `/define` was removed entirely: it depended on dictionaryapi.dev, which had a confirmed, chronic multi-week outage pattern (independently verified via third-party uptime monitoring) rather than an occasional blip. No reliable free, keyless alternative was found — every "no signup" option that turned up was either the same broken service under a different URL, or an unverified hobby project. A paid-free-tier option like Wordnik (free account, no card) would fix this properly if you want dictionary lookups back someday.
 - `/riddle`'s question bank, like `/trivia`'s, is a fixed local list in `bot.py` (`RIDDLES`) — add more by editing it directly.
 - `/emojify` only converts letters a–z and digits 0–9; punctuation and other characters are left as-is. Long input is capped at 80 characters since very long emoji strings render poorly in Discord. Each letter emoji is followed by an invisible zero-width space — without it, two adjacent regional-indicator letters (e.g. "H" + "I") get auto-merged into a country flag by Discord's renderer instead of showing as two separate boxed letters.
@@ -789,7 +790,7 @@ Set **`RESET_ANNOUNCE_CHANNEL_ID`** to your #general channel ID and, **at 12:00 
 
 The numbers come from your settings, so it stays correct if you change `SLOTS_FREE_SPINS`, `THINK_USER_DAILY` and so on.
 
-**777 shout-out:** if anyone hit a 777 in `/slots` the day before, the message gets an extra **💥 Yesterday's 777 winners** line, e.g. "@Archo ×2". (777 wins are counted per day and saved, so a redeploy doesn't lose them.)
+**777 shout-outs:** (1) The moment anyone hits 777 in `/slots`, Milo posts "💥 JACKPOT! @Archo just hit 7️⃣7️⃣7️⃣ and won 100 …" in this same channel (`RESET_ANNOUNCE_CHANNEL_ID`), **without** an @everyone ping. (2) At midnight the announcement also gets a **💥 Yesterday's 777 winners** line, e.g. "@Archo ×2". 777 wins are counted per day and saved, so a redeploy doesn't lose them.
 
 - **Permissions:** Milo needs **Send Messages, Embed Links and Mention Everyone** in that channel. If it can't post, it tells the log channel.
 - **Preview it:** the Manager command **`?resetpreview`** shows the exact message without pinging anyone and deletes itself after a minute.
@@ -845,7 +846,7 @@ If you change `POINTS_NAME` later, just redeploy. Nothing else needs touching.
 
 ## 26. `/react` sources, safety, and what to do if one misbehaves
 
-`/react` now has five sources. For each use, Milo **picks randomly among the sources that have that reaction**; a reaction only one source offers still works (it just always uses that one).
+`/react` has four sources. For each use, Milo **picks randomly among the sources that have that reaction**; a reaction only one source offers still works (it just always uses that one).
 
 | Source | Reactions | Notes |
 |---|---|---|
@@ -853,15 +854,14 @@ If you change `POINTS_NAME` later, just redeploy. Nothing else needs touching.
 | nekos.best | ~63 | `kabedon`, `lappillow`, `blowkiss`, `tableflip`, `teehee`… plus 4 still pictures (`neko`, `waifu`, `husbando`, `kitsune`). Credits the anime / artist. |
 | gifukai.com | 7+ | `pat`, `hug`, `kiss`, `cry`, `sleep`, `blush`, `pout`; the rest are discovered automatically |
 | purrbot.site | ~26 | `comfy`, `fluff`, `lay`, `eevee`, `tail` (shown as `wag`)… plus a few pictures |
-| waifu.pics | ~30 | `glomp`, `bully`, `cringe`… plus a few pictures |
 
-Together that's **114 reactions** and growing: Milo reads nekos.best's and Gifukai's own category lists when it starts and every 6 hours, so new categories appear without a redeploy. Reactions that are still pictures (not gifs) show a 🖼️ in the dropdown and say "sends a *neko* pic to…".
+Together that's **108 reactions** and growing: Milo reads nekos.best's and Gifukai's own category lists when it starts and every 6 hours, so new categories appear without a redeploy. Reactions that are still pictures (not gifs) show a 🖼️ in the dropdown and say "sends a *neko* pic to…".
 
 **If a source fails**, Milo tries up to two others. A source that keeps failing for one reaction is paused for that reaction for 30 minutes, and one that fails 6 times in a row is paused entirely for 10 minutes. If every source is down, the message still posts as plain text.
 
 **Keeping it SFW**
-- Only the *safe-for-work* part of each API is ever used (PurrBot's and waifu.pics's `sfw` paths; nekos.best and Gifukai are SFW-only services). The NSFW parts aren't wired in at all.
-- I left out categories that aren't family-friendly, like waifu.pics's `kill`.
+- Only the *safe-for-work* part of each API is ever used (PurrBot's `sfw` path; nekos.best and Gifukai are SFW-only services). The NSFW parts aren't wired in at all.
+- Any category name Milo discovers at runtime is checked against a blocklist (NSFW and violent words such as `kill`) before it's offered.
 - Any category name Milo *discovers* at runtime is checked against a blocklist of NSFW and violent words before it's offered.
 - Nobody can guarantee a third-party site never serves an odd image. If one does, `REACT_BLOCK=name` hides that reaction immediately and `REACT_DISABLE=source` removes a whole source. Both take effect on the next redeploy.
 
