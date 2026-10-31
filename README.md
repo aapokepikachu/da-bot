@@ -3,7 +3,7 @@
 A simple, single-server, **cat-themed** Discord bot built with **Python 3.12+** and **discord.py 2.x**.
 
 Features:
-- 48 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, points & slots, party/social, AI, lookups, and utility — see Section 9 for the full list
+- 49 slash commands (shown in Discord's `/` picker) across group management, cat-themed fun, games, points & slots, party/social, AI, lookups, and utility — see Section 9 for the full list
 - A points economy: win points in `/slots` (25 free spins a day, then bonus spins for points), check them with `/points`, climb `/leaderboard` — kept in memory and saved to Upstash in the background (Section 15)
 - A persistent **✔️ Interested** button on `/join` messages — survives bot restarts, **no database required**
 - A cat-themed welcome message when new members join
@@ -223,7 +223,8 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 |---|---|
 | `/slots` | Spin a 3-reel slot machine for points. **25 free spins a day**, then up to **20 bonus spins** in packs: **5 points buys a pack of 10 spins**. Match all three to win: 7️⃣ 100 · ⭐ 25 · 🍇 12 · 🍉 8 · 🍋 6 · 🍒 4. Every **200th spin since your last 777 is a guaranteed 777**, and a small win is guaranteed after 19 misses. Buying a pack asks you to confirm first. **With 2+ spins ready, Milo asks "spin once, or all N at once?"**; spinning all posts one long result message and then a separate message for each win (every 777 gets its own). 5-second cooldown. Can be limited to certain channels with `SLOTS_CHANNEL_IDS`. |
 | `/daily` | Claim free points once a day. Day 1 gives 15 and each consecutive day adds 5 (up to day 7), and **every 7th day in a row adds a +50 bonus**. Miss a day and the streak restarts. Works out to roughly 37 points a day for a perfect streak. |
-| `/pay @user amount` | Send some of your points to another member. You confirm first, and there's a **daily limit of 200 points sent** per person (`PAY_DAILY_CAP`). Not allowed to yourself, to bots, to or from frozen people, or while a Gamblin game runs. |
+| `/pay @user amount` | Send some of your points to another member. You confirm first. A **5% fee is burned** on every payment (rounded up, at least 1), so you pay the amount plus the fee and they get the full amount. There's also a **daily limit of 200 points sent** per person (`PAY_DAILY_CAP`, the fee doesn't count towards it). Not allowed to yourself, to bots, to or from frozen people, or while a Gamblin game runs. |
+| `/shop` | **Buy designs for Milo's messages** with your points: 12 designs in 4 independent categories (`/slots` single spin, `/slots` spin-all, `/daily`, Gamblin win card), from 10,000 points. **Preview any of them for free before buying.** Cosmetic only. Section 28. |
 | `/lottery` | **Daily lottery.** Pick 3 numbers from 1–15 (or take a quick pick) for 10 points a ticket, up to 5 tickets a day. The draw is at midnight: 3 matches share the rollover **jackpot**, 2 matches win 4× the ticket, 1 match refunds it. Section 24. |
 | `/gamblinstats [user]` | Your Gamblin record (games, total profit, biggest win, best game, favourite) plus the **hall of fame**: biggest single win, best single game, most games, highest total profit. |
 | `/points user:<member>` | Your balance, total points earned, leaderboard rank (or progress toward it), and spins left today. Private to you. Add a member to peek at theirs (spins hidden). |
@@ -302,6 +303,8 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `API_USER_AGENT` | Optional | The name Milo gives the gif sites when it asks them for a gif (nekos.best insists on a real one). The default is fine; set it to something like `MiloBot/1.0 (https://github.com/you/da-bot)` if you want to be tidy. |
 | `REACT_DISABLE` / `REACT_BLOCK` | Optional | `REACT_DISABLE=purrbot` switches whole gif sources off (names: `otakugifs`, `nekosbest`, `gifukai`, `purrbot`). `REACT_BLOCK=bully,glomp` hides individual reactions you don't want. See Section 26. |
 | `RESET_ANNOUNCE_CHANNEL_ID` | Optional | Your #general (or any channel). At 12:00 AM `LIMIT_RESET_TZ` Milo posts "everything has reset" with an @everyone ping. Off if unset. See Section 23. |
+| `PAY_FEE_PERCENT` | Optional | The fee on every `/pay`, in percent, burned (default `5`; `0` turns it off; max 50). |
+| `SHOP_PRICE_PERCENT` | Optional | Scales every `/shop` price (default `100`). `10` makes the 10,000-point designs cost 1,000, `200` doubles everything. |
 | `PAY_DAILY_CAP` | Optional | Most points one person can `/pay` per day. Default `200`. |
 | `LOG_CHANNEL_ID` | Optional | A private staff channel where Milo logs manager actions, Gamblin results, save problems, online/offline notices, and everyone's points at the nightly reset. See Section 17. |
 | `JOIN_GAMES` | Optional | The games `/join` offers: `ROLE_ID\|Name\|Emoji\|Call to action,...` (emoji and call-to-action optional). Unset = VBL + Minecraft as before. See Section 18. |
@@ -659,8 +662,9 @@ All of these are **hidden** `?` commands: Manager role only, silent to everyone 
 | `?resetleaderboard` | Sets everyone's all-time **total earned** to their **current points** (balances don't change). Milo shows what will happen (how many people change, who will be on the board afterwards, the current top 5) with **Yes, reset it / Cancel** buttons that only you can press. After you confirm it saves to the database immediately and writes the old top 10 to the log channel. It can't be undone, and it's blocked while a Gamblin game is running. `?resetleaderbord` (typo) works too. |
 | `?freeze @user [reason]` / `?unfreeze @user` / `?frozen` | A frozen person can't earn, gamble or trade: `/slots`, `/daily`, `/pay` (sending or receiving) and joining a Gamblin game are all refused with a friendly note. Saved to the database. Use it for abuse while you sort things out; `?frozen` lists everyone frozen. |
 | `?announce Title \| message` | Posts a tidy embed as Milo. Add `--ping` to ping @everyone and/or a `#channel` to post elsewhere: `?announce --ping #general Movie night \| 8pm in voice!`. Without a `\|` the whole text is the message. Your command is deleted. (`?send` is still there for plain Milo messages.) |
-| `?backup` | Posts a backup file (balances, earned, 777 counters, streaks, Gamblin stats, frozen list) to the **log channel**. Milo also posts one **every night** next to the points snapshot. Needs `LOG_CHANNEL_ID`. |
+| `?backup` | Posts a backup file (balances, earned, 777 counters, streaks, Gamblin stats, frozen list, shop designs) to the **log channel**. Milo also posts one **every night** next to the points snapshot. Needs `LOG_CHANNEL_ID`. |
 | `?restore` | Attach a backup file to your `?restore` message. Milo checks the file, shows what's in it and asks you to confirm. It then sets those numbers, saves immediately and logs it. Only people *in the file* are changed; the frozen list is set to match the file. Blocked while a Gamblin game runs. Run `?backup` first if you're unsure. |
+| `?giveitem @user item_id` / `?takeitem @user item_id` | Gives or removes a `/shop` design (for support, refunds or prizes). Type either with no item to see all the item ids. A given design isn't equipped automatically. |
 | `?resetspins @user` | Gives someone today's free + bonus spins back (and clears their cooldown/pity). For when something glitched. |
 | `?snapshot` | Posts everyone's points to the log channel right now. |
 | `?updateDB` · `?gamblin` · `?rolemenu` · `?send` | Existing commands, unchanged. |
@@ -764,7 +768,7 @@ Pick **🎡 Roulette** in `?gamblin`. **4 spins** by default (`GAMBLIN_RL_ROUNDS
 Once a day (resets at midnight in `LIMIT_RESET_TZ`). Reward = `DAILY_BASE` + `DAILY_STREAK_BONUS` for each extra streak day up to `DAILY_STREAK_CAP`, and a `DAILY_WEEK_BONUS` on every 7th day in a row. With the defaults the first week pays 15, 20, 25, 30, 35, 40, **95**, then 45 a day with another +50 every 7th day. Skip a day and the streak starts over at 1 (Milo tells you when that happens). Daily points count as **earned**, so they count towards the leaderboard. The streak is saved to the database.
 
 ### `/pay @user amount`
-Private confirm step first, then a public "X sent N points to Y" message that pings the receiver. Each person can send up to `PAY_DAILY_CAP` (default 200) a day; the amount sent today is saved, so restarting Milo doesn't reset it. Moving points between people never changes anyone's "total earned". Every payment is written to the log channel. It's refused for frozen people, bots, yourself, and while a Gamblin game is running (balances are held during games).
+Private confirm step first, then a public "X sent N points to Y" message that pings the receiver. Each person can send up to `PAY_DAILY_CAP` (default 200) a day; the amount sent today is saved, so restarting Milo doesn't reset it. Moving points between people never changes anyone's "total earned". A **5% fee** (`PAY_FEE_PERCENT`, rounded up, at least 1) is added on top and burned, so friends can't just shuffle points around for free; the receiver always gets the full amount you typed. Every payment is written to the log channel. It's refused for frozen people, bots, yourself, and while a Gamblin game is running (balances are held during games).
 
 ### `/gamblinstats`
 Gamblin results are tallied when a game ends and saved: games played, total profit, points wagered, biggest single win, best single game, and favourite game. The hall of fame shows the record holders. People with no games yet just see a note.
@@ -884,3 +888,26 @@ temporarily due to exceeding global rate limits.
 - Applies slots/lottery/Gamblin changes in memory *before* sending any message, so points are never lost because a message couldn't be sent.
 
 **What can't be fixed in code:** the block itself. It usually clears within minutes to an hour. If it keeps happening, the real fix is a host whose IP address isn't shared with lots of other bots (for example a small always-free cloud VM, a home server or Raspberry Pi). Moving hosts is a bigger job; ask me and I'll help.
+
+
+## 28. The shop (`/shop`)
+
+Instead of roles (Discord caps a server at 250), the shop sells **designs for Milo's own messages**. There are four independent categories, each with three designs plus the free **Classic**. You can own and equip one design per category, mixing them however you like. Designs are **cosmetic only**: they never change odds or payouts.
+
+| Category | Where it shows | Designs (default price) |
+|---|---|---|
+| 🎰 `/slots` single spin | the result when you spin once | **Neon Arcade** 10,000 · **Royal Casino** 20,000 · **Cosmic Milo** 35,000 |
+| ⚡ `/slots` spin all | the long result when you spin everything at once | **Receipt Roll** 12,000 · **Scoreboard** 22,000 · **Galaxy Grid** 40,000 |
+| 🎁 `/daily` | your daily reward card | **Sunrise Card** 10,000 · **Treasure Chest** 18,000 · **Milo's Gift Box** 30,000 |
+| 🏆 Gamblin win card | a separate message when you have the **biggest win of a Gamblin game** | **Champion Banner** 15,000 · **Fireworks** 30,000 · **Hall of Legends** 50,000 |
+
+**How it works**
+- `/shop` is private (only you see it). Pick a category, pick a design from the dropdown, then **👀 Preview** to see exactly how it will look using sample data. It costs nothing and nothing changes.
+- **Buy** asks you to confirm, takes the points and equips it right away. After that you can switch between the designs you own (or back to Classic) for free, any time.
+- **Gamblin win card:** when a Gamblin game ends, the player with the biggest profit gets their own separate card in the design they bought (Classic is a plain card). It's only for the top winner and only if they actually won. **Hall of Legends** also shows your best single win, your games played, and a *new personal record* badge.
+- **Pity wins are always called out**, in every design: the 20th-spin pity win says "Milo felt bad after 19 misses", and the 200-spin guarantee says so too.
+- Buying is blocked while a Gamblin game is running and for frozen people. Every purchase is written to the log channel.
+
+**Prices and your economy.** Prices start at 10,000 on purpose, so they're a long-term goal. For scale: slots and `/daily` bring in roughly 90 points a day per active person, so a 10,000 design is a few months of normal play, and Gamblin wins are what make it faster. If that feels too slow or too fast, change **`SHOP_PRICE_PERCENT`** (for example `25` makes everything a quarter of the price) and redeploy.
+
+**Saved data:** what each person owns and has equipped is saved to the database (one command per purchase or equip, using the normal 5-minute save) and is included in `?backup` / `?restore`. Managers can fix problems with `?giveitem` and `?takeitem` (Section 17).

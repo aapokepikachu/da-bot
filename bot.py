@@ -2977,6 +2977,7 @@ POINTS_KEY_DAILY = "milo:points:daily"       # HASH  user id -> "YYYY-MM-DD:stre
 POINTS_KEY_STATS = "milo:points:stats"       # HASH  user id -> JSON of Gamblin stats
 POINTS_KEY_JP = "milo:points:jackpot"        # HASH  user id -> spins since their last 777 (the 200-spin guarantee)
 POINTS_KEY_FROZEN = "milo:points:frozen"     # SET   user ids a manager has frozen
+POINTS_KEY_SHOP = "milo:points:shop"         # HASH  user id -> JSON {"own": [item ids], "eq": {category: item id}}
 POINTS_KEY_SCHED = "milo:gamblin:schedule"   # STRING JSON list of scheduled Gamblin games
 LOTTERY_KEY_STATE = "milo:lottery:state"     # STRING JSON {"carry": jackpot, "drawn": last drawn day, "last": last result}
 LOTTERY_KEY_TICKETS = "milo:lottery:t:"      # + YYYY-MM-DD, HASH "<id>:<n>" -> "a,b,c" (that day's tickets)
@@ -3052,6 +3053,8 @@ class PointsManager:
         self._p_lstate: str | None = None
         self.jp_wins: dict[tuple[str, int], int] = {}              # (day, user) -> 777s hit that day (for the midnight shout-out)
         self._p_jpw: dict[tuple[str, int], int] = {}
+        self.shop: dict[int, dict] = {}                            # user -> {"own": [ids], "eq": {category: id}} (cosmetics they bought)
+        self._p_shop: set[int] = set()
         # Memory-only, fine to lose:
         self.pity: dict[int, int] = {}
         self.last_spin: dict[int, float] = {}
@@ -3117,8 +3120,8 @@ class PointsManager:
     def sent_today(self, uid: int, day: str | None = None) -> int:
         return self.sent.get((day or _day_info()[0], uid), 0)
 
-    def record_pay(self, sender: int, recipient: int, amount: int, day: str) -> None:
-        self.add_balance(sender, -amount)
+    def record_pay(self, sender: int, recipient: int, amount: int, day: str, fee: int = 0) -> None:
+        self.add_balance(sender, -(amount + fee))          # the fee is burned: nobody receives it
         self.add_balance(recipient, amount)
         self.sent[(day, sender)] = self.sent.get((day, sender), 0) + amount
         self._p_sent[(day, sender)] = self._p_sent.get((day, sender), 0) + amount
@@ -3165,6 +3168,47 @@ class PointsManager:
             self.lottery["last"] = last
         self._mark_lottery()
 
+    # ---- shop (cosmetic designs) ----------------------------------------------
+    def shop_state(self, uid: int) -> dict:
+        return self.shop.get(uid) or {"own": [], "eq": {}}
+
+    def owns(self, uid: int, item_id: str) -> bool:
+        return item_id in self.shop_state(uid)["own"]
+
+    def _shop_edit(self, uid: int) -> dict:
+        st = self.shop.setdefault(uid, {"own": [], "eq": {}})
+        self._p_shop.add(uid)
+        return st
+
+    def buy_item(self, uid: int, item_id: str, price: int) -> None:
+        """Take the price, add the item, and equip it. Saved with the normal autosave."""
+        self.add_balance(uid, -price)
+        self.grant_item(uid, item_id, equip=True)
+
+    def grant_item(self, uid: int, item_id: str, equip: bool = False) -> None:
+        st = self._shop_edit(uid)
+        if item_id not in st["own"]:
+            st["own"] = sorted(st["own"] + [item_id])
+        if equip:
+            st["eq"][SHOP_ITEMS[item_id]["cat"]] = item_id
+
+    def revoke_item(self, uid: int, item_id: str) -> bool:
+        st = self.shop_state(uid)
+        if item_id not in st["own"]:
+            return False
+        st = self._shop_edit(uid)
+        st["own"] = [i for i in st["own"] if i != item_id]
+        st["eq"] = {c: i for c, i in st["eq"].items() if i != item_id}
+        return True
+
+    def equip(self, uid: int, cat: str, item_id: str | None) -> None:
+        """Equip a design you own, or None to go back to Classic."""
+        st = self._shop_edit(uid)
+        if item_id is None:
+            st["eq"].pop(cat, None)
+        else:
+            st["eq"][cat] = item_id
+
     def set_frozen(self, uid: int, flag: bool) -> bool:
         """Returns False if nothing changed."""
         if (uid in self.frozen) == flag:
@@ -3186,12 +3230,13 @@ class PointsManager:
             "daily": dict((str(u), v) for u, v in self.daily.items()),
             "stats": {str(u): st for u, st in self.stats.items()},
             "frozen": sorted(self.frozen),
+            "shop": {str(u): st for u, st in self.shop.items() if st.get("own")},
         }
 
     def restore_data(self, data: dict) -> dict[str, int]:
         """Apply a (validated) backup. Only people IN the file are touched, except the
         frozen list, which is set exactly. Saved as ordinary deltas. Returns counts."""
-        counts = {"balance": 0, "earned": 0, "jackpot": 0, "daily": 0, "stats": 0, "frozen": 0}
+        counts = {"balance": 0, "earned": 0, "jackpot": 0, "daily": 0, "stats": 0, "frozen": 0, "shop": 0}
         for uid_s, value in data.get("balance", {}).items():
             uid, target = int(uid_s), max(0, int(value))
             d = target - self.balance.get(uid, 0)
@@ -3224,6 +3269,12 @@ class PointsManager:
                 self.stats[uid] = st
                 self._p_stats.add(uid)
                 counts["stats"] += 1
+        for uid_s, st in data.get("shop", {}).items():
+            uid = int(uid_s)
+            if self.shop.get(uid) != st:
+                self.shop[uid] = st
+                self._p_shop.add(uid)
+                counts["shop"] += 1
         wanted = {int(x) for x in data.get("frozen", [])}
         for uid in wanted - self.frozen:
             counts["frozen"] += self.set_frozen(uid, True)
@@ -3287,6 +3338,7 @@ class PointsManager:
         users |= {u for (_, u), d in self._p_sent.items() if d}
         users |= {u for (_, u, _n) in self._p_tickets}
         users |= {u for (_, u), n in self._p_jpw.items() if n}
+        users |= set(self._p_shop)
         return users
 
     def _build_flush(self) -> tuple[list[list], list[tuple]]:
@@ -3345,6 +3397,10 @@ class PointsManager:
         for uid, flag in self._p_frozen.items():
             cmds.append(["SADD" if flag else "SREM", POINTS_KEY_FROZEN, str(uid)])
             meta.append(("frozen", uid, flag))
+        for uid in self._p_shop:
+            blob = json.dumps(self.shop.get(uid, {}), separators=(",", ":"))
+            cmds.append(["HSET", POINTS_KEY_SHOP, str(uid), blob])
+            meta.append(("shop", uid, blob))
         if self._p_sched is not None:
             cmds.append(["SET", POINTS_KEY_SCHED, self._p_sched])
             meta.append(("sched", None, self._p_sched))
@@ -3417,6 +3473,9 @@ class PointsManager:
         elif kind == "frozen":
             if self._p_frozen.get(ref) == delta:
                 del self._p_frozen[ref]
+        elif kind == "shop":
+            if json.dumps(self.shop.get(ref, {}), separators=(",", ":")) == delta:
+                self._p_shop.discard(ref)
         elif kind == "sched":
             if self._p_sched == delta:
                 self._p_sched = None
@@ -3498,6 +3557,7 @@ class PointsManager:
                 ["HGETALL", LOTTERY_KEY_TICKETS + _day_before(day)],
                 ["HGETALL", LOTTERY_KEY_TICKETS + _day_before(_day_before(day))],
                 ["GET", LOTTERY_KEY_STATE],
+                ["HGETALL", POINTS_KEY_SHOP],
             ])
             for item in results:
                 if not isinstance(item, dict) or "error" in item:
@@ -3569,6 +3629,14 @@ class PointsManager:
                         by_user.setdefault(u, {})[i] = picks
                 if by_user or tday in self.tickets:
                     self.tickets[tday] = by_user
+            for uid, blob in _flat_pairs(results[12].get("result")):
+                if uid.isdigit() and int(uid) not in self._p_shop:
+                    try:
+                        cleaned = _clean_shop_state(json.loads(blob))
+                    except (TypeError, ValueError):
+                        cleaned = None
+                    if cleaned:
+                        self.shop[int(uid)] = cleaned
             raw_state = results[11].get("result")
             if self._p_lstate is None and raw_state:
                 try:
@@ -3721,11 +3789,6 @@ def _perform_spin(uid: int, *, paid: bool, cost: int, day: str) -> discord.Embed
         spin_line = "🎁 Bonus pack spin"
     else:
         spin_line = "🆓 Free spin"
-    embed = discord.Embed(
-        title="🎰 Slots",
-        description=f"**[ {' | '.join(reels)} ]**\n{headline}\n{spin_line}",
-        color=color,
-    )
     footer = (
         f"Balance: {pamt(POINTS.points(uid))} · Free spins left: {SLOTS_FREE_SPINS - free_used}/{SLOTS_FREE_SPINS} "
         f"· Bonus spins left: {SLOTS_PAID_SPINS - bonus_used}/{SLOTS_PAID_SPINS}"
@@ -3739,8 +3802,7 @@ def _perform_spin(uid: int, *, paid: bool, cost: int, day: str) -> discord.Embed
         until_pity = SLOTS_PITY_AT - POINTS.pity.get(uid, 0)
         if SLOTS_PITY_AT and not payout and until_pity <= 5:
             footer += f" · 🍀 Win guaranteed within {until_pity} spin{'s' if until_pity != 1 else ''}"
-    embed.set_footer(text=footer)
-    return embed
+    return _render_spin(style_of(uid, "slots"), reels, headline, spin_line, footer, color, bool(payout))
 
 
 def _announce_jackpot(uid: int, payout: int, pity: str) -> None:
@@ -3817,29 +3879,16 @@ def _batch_spin(uid: int, day: str) -> list[dict]:
 def _batch_embed(uid: int, day: str, spins: list[dict]) -> discord.Embed:
     total = sum(sp["payout"] for sp in spins)
     wins = [sp for sp in spins if sp["payout"]]
-    lines = [
-        f"**{sp['n']}.** {' '.join(sp['reels'])}" + (f"  ✅ **+{sp['payout']}**" if sp["payout"] else "")
-        for sp in spins
-    ]
-    embed = discord.Embed(
-        title=f"🎰 Slots — {len(spins)} spins at once",
-        description="\n".join(lines)[:4000],
-        color=discord.Color.gold() if any(sp["payout"] >= SLOT_PAYOUTS[SLOT_JACKPOT] for sp in spins) else (discord.Color.green() if wins else discord.Color.dark_grey()),
-    )
     best = max(spins, key=lambda sp: sp["payout"])
-    embed.add_field(
-        name="Result", inline=False,
-        value=f"**{len(wins)}** win{'s' if len(wins) != 1 else ''} · total **{pfmt(total)}**"
-              + (f" · best: spin {best['n']} (+{best['payout']})" if wins else " · no wins this time — better luck next spins!"),
-    )
+    result = (f"**{len(wins)}** win{'s' if len(wins) != 1 else ''} · total **{pfmt(total)}**"
+              + (f" · best: spin {best['n']} (+{best['payout']})" if wins else " · no wins this time — better luck next spins!"))
     free_used, bonus_used = POINTS.used(uid, day)
     footer = (f"Balance: {pamt(POINTS.points(uid))} · Free spins left: {SLOTS_FREE_SPINS - free_used}/{SLOTS_FREE_SPINS} "
               f"· Bonus spins left: {SLOTS_PAID_SPINS - bonus_used}/{SLOTS_PAID_SPINS}")
     to_jackpot = SLOTS_JACKPOT_PITY_AT - POINTS.jp_count(uid)
     if SLOTS_JACKPOT_PITY_AT and to_jackpot <= 25:
         footer += f" · 🎯 777 guaranteed in {to_jackpot} spin{'s' if to_jackpot != 1 else ''}"
-    embed.set_footer(text=footer)
-    return embed
+    return _render_batch(style_of(uid, "quick"), spins, result, footer)
 
 
 def _batch_win_messages(mention: str, spins: list[dict]) -> list[str]:
@@ -3858,10 +3907,11 @@ def _batch_win_messages(mention: str, spins: list[dict]) -> list[str]:
     singles, rest = others[:4], others[4:]
     for sp in singles:
         msgs.append(f"🎉 {mention} won **{pfmt(sp['payout'])}** on spin #{sp['n']}: {' '.join(sp['reels'])} "
-                    f"(triple {_SYMBOL_WORD.get(sp['reels'][0], sp['reels'][0])})")
+                    f"(triple {_SYMBOL_WORD.get(sp['reels'][0], sp['reels'][0])})"
+                    + (f"\n🍀 *Pity win! Milo felt bad after {SLOTS_PITY_AT - 1} misses.* {MILO_EMOJI}" if sp["pity"] == "soft" else ""))
     if rest:
         msgs.append(f"🎉 {mention} won on {len(rest)} more spins too: "
-                    + ", ".join(f"#{sp['n']} +{sp['payout']}" for sp in rest) + f" (**{pfmt(sum(sp['payout'] for sp in rest))}** more)")
+                    + ", ".join(f"#{sp['n']} +{sp['payout']}" + (" 🍀 pity" if sp["pity"] == "soft" else "") for sp in rest) + f" (**{pfmt(sum(sp['payout'] for sp in rest))}** more)")
     return msgs
 
 
@@ -4642,10 +4692,18 @@ async def help_slash(interaction: discord.Interaction):
             f"Match all 3 to win: {payout_line}\n"
             "`/points` — your balance, rank and spins left\n"
             f"`/daily` — claim free {PTS_NAME} every day; a streak makes it bigger (+{DAILY_WEEK_BONUS} bonus every 7th day!)\n"
-            f"`/pay @user amount` — send {PTS_NAME} to a friend (up to {pamt(PAY_DAILY_CAP)} a day)\n"
+            f"`/pay @user amount` — send {PTS_NAME} to a friend (up to {pamt(PAY_DAILY_CAP)} a day"
+            + (f", {PAY_FEE_PERCENT}% fee" if PAY_FEE_PERCENT else "") + ")\n"
+            f"`/leaderboard` — top 10 all-time earners (earn {LEADERBOARD_MIN_POINTS:,} to join) + top 5 richest right now"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🎲 Gamblin, Lottery & Shop",
+        value=(
             "`/gamblinstats` — your Gamblin record + the hall of fame\n"
-            f"`/lottery` — pick 3 numbers for the daily draw (rollover jackpot)\n"
-            f"`/leaderboard` — top 10 all-time earners (earn {LEADERBOARD_MIN_POINTS:,} to join) + top 5 richest right now\n"
+            "`/lottery` — pick 3 numbers for the daily draw (rollover jackpot)\n"
+            f"`/shop` — buy designs for Milo's messages with {PTS_NAME} (preview first!)\n"
             f"Bonus packs ask for confirmation before spending {PTS_NAME}\n"
             "🎲 Managers sometimes run **Gamblin** nights (slots, blackjack, duck race & roulette) — watch for the @everyone ping!"
         ),
@@ -5049,6 +5107,7 @@ class GamblinSession:
                     if r < self.total_rounds:
                         await asyncio.sleep(8)
                 await self._finish()
+                await self._winner_card()
         except asyncio.CancelledError:
             self.aborted = True
             self.phase = "ending"
@@ -5227,6 +5286,18 @@ class GamblinSession:
             lines = ["No Reel Rush bets on this reel."]
         embed = discord.Embed(title=title, description="\n".join(lines)[:4000], color=discord.Color.gold())
         await self._send(embed=embed)
+
+    async def _winner_card(self) -> None:
+        """A separate, specially designed message for the biggest winner (in the design they bought)."""
+        if not self.players:
+            return
+        top = max(self.players.values(), key=lambda p: (p.net, -p.uid))
+        if top.net <= 0:
+            return
+        stats = POINTS.stats.get(top.uid, {})
+        await self._send(embed=_render_win_card(
+            style_of(top.uid, "win"), top.uid, f"{self.EMOJI} {self.NAME}", top.net, top.best_win,
+            top.best_win > stats.get("bw", 0), stats.get("s", 0) + 1))
 
     async def _finish(self) -> None:
         self.phase = "ending"
@@ -6849,6 +6920,16 @@ DAILY_STREAK_BONUS = _env_int("DAILY_STREAK_BONUS", 5)   # extra per streak day.
 DAILY_STREAK_CAP = _env_int("DAILY_STREAK_CAP", 7)       # ...up to this many days
 DAILY_WEEK_BONUS = _env_int("DAILY_WEEK_BONUS", 50)      # extra on every 7th day in a row
 PAY_DAILY_CAP = _env_int("PAY_DAILY_CAP", 200)           # most points one person can /pay per day
+try:                                                      # a fee (in %) on every /pay that is BURNED; 0 turns it off
+    PAY_FEE_PERCENT = min(50, max(0, int(os.getenv("PAY_FEE_PERCENT", "5").strip() or 5)))
+except ValueError:
+    PAY_FEE_PERCENT = 5
+
+
+def pay_fee(amount: int) -> int:
+    """The fee on a /pay, rounded UP, at least 1 when the fee is on. The sender pays amount + fee; the
+    receiver gets the full amount; the fee just disappears (it's burned, which shrinks the economy a little)."""
+    return 0 if PAY_FEE_PERCENT == 0 else max(1, -(-amount * PAY_FEE_PERCENT // 100))
 
 
 def _daily_reward(streak: int) -> int:
@@ -6890,20 +6971,11 @@ async def daily_slash(interaction: discord.Interaction):
     POINTS.claim_daily(uid, day, new_streak, reward)
 
     lost = streak > 1 and new_streak == 1
-    embed = discord.Embed(title="🎁 Daily reward!", color=discord.Color.green())
-    embed.description = (
-        f"{interaction.user.mention} claimed **+{pfmt(reward)}**\n"
-        f"🔥 Streak: **{new_streak}** day{'s' if new_streak != 1 else ''}"
-        + (f" *(your {streak}-day streak ended — fresh start!)*" if lost else "")
-    )
-    nxt = new_streak + 1
     days_to_week = 7 - (new_streak % 7)
-    embed.add_field(
-        name="Tomorrow",
-        value=f"**+{pfmt(_daily_reward(nxt))}**" + (f" · a **+{DAILY_WEEK_BONUS} bonus** in {days_to_week} day{'s' if days_to_week != 1 else ''}!" if days_to_week else ""),
-        inline=False,
-    )
-    embed.set_footer(text=f"Balance: {pamt(POINTS.points(uid))} · Miss a day and the streak resets")
+    tomorrow = (f"**+{pfmt(_daily_reward(new_streak + 1))}**"
+                + (f" · a **+{DAILY_WEEK_BONUS} bonus** in {days_to_week} day{'s' if days_to_week != 1 else ''}!" if days_to_week else ""))
+    embed = _render_daily(style_of(uid, "daily"), interaction.user.mention, reward, new_streak, lost, streak, tomorrow,
+                          f"Balance: {pamt(POINTS.points(uid))} · Miss a day and the streak resets")
     await interaction.response.send_message(embed=embed)
 
 
@@ -6929,7 +7001,11 @@ def _pay_error(sender_id: int, recipient: discord.abc.User, amount: int) -> str 
         left = max(0, PAY_DAILY_CAP - sent)
         return (f"💸 Daily limit: you can send {pcompact(PAY_DAILY_CAP, True)} a day and you've sent **{sent}**. "
                 f"**{left}** left (resets in {_format_wait(secs)}).")
-    if POINTS.points(sender_id) < amount:
+    fee = pay_fee(amount)
+    if POINTS.points(sender_id) < amount + fee:
+        if fee:
+            return (f"You need {pfmt(amount + fee)} to send {pamt(amount)} (that includes a {pamt(fee)} fee) "
+                    f"and you have {pfmt(POINTS.points(sender_id))}.")
         return f"You only have {pfmt(POINTS.points(sender_id))}."
     return None
 
@@ -6960,9 +7036,11 @@ class PayConfirmView(discord.ui.View):
             await interaction.response.edit_message(content=err, view=None)
             return
         day = _day_info()[0]
-        POINTS.record_pay(self.sender.id, self.recipient.id, self.amount, day)
+        fee = pay_fee(self.amount)
+        POINTS.record_pay(self.sender.id, self.recipient.id, self.amount, day, fee)
         await interaction.response.edit_message(
-            content=f"✅ Sent {pfmt(self.amount)} to {self.recipient.display_name}.", view=None
+            content=f"✅ Sent {pfmt(self.amount)} to {self.recipient.display_name}."
+                    + (f" (fee: {pamt(fee)})" if fee else ""), view=None
         )
         try:
             await interaction.followup.send(
@@ -6972,7 +7050,7 @@ class PayConfirmView(discord.ui.View):
         except discord.HTTPException:
             logger.warning("Couldn't announce a /pay (the points were still sent).")
         await log_event(f"💸 `/pay` <@{self.sender.id}> → <@{self.recipient.id}> **{self.amount:,}** "
-                        f"({POINTS.sent_today(self.sender.id, day)}/{PAY_DAILY_CAP} sent today)")
+                        f"(+{fee:,} fee burned, {POINTS.sent_today(self.sender.id, day)}/{PAY_DAILY_CAP} sent today)")
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -6994,8 +7072,11 @@ async def pay_slash(interaction: discord.Interaction, user: discord.Member, amou
     day = _day_info()[0]
     left = PAY_DAILY_CAP - POINTS.sent_today(interaction.user.id, day)
     view = PayConfirmView(interaction.user, user, amount)
+    fee = pay_fee(amount)
+    cost = (f"A **{PAY_FEE_PERCENT}%** fee ({pamt(fee)}) is burned, so you pay **{pamt(amount + fee)}** and they get the full amount.\n"
+            if fee else "")
     await interaction.response.send_message(
-        f"💸 Send {pcompact(amount, True)} to **{user.display_name}**?\n"
+        f"💸 Send {pcompact(amount, True)} to **{user.display_name}**?\n{cost}"
         f"You have {POINTS.points(interaction.user.id):,} · you can still send {left:,} today (limit {PAY_DAILY_CAP}).",
         view=view, ephemeral=True,
     )
@@ -7114,6 +7195,16 @@ def _validate_backup(raw: bytes) -> tuple[dict | None, str | None]:
         if not isinstance(frozen, list) or len(frozen) > 10_000 or any(not _UID_RE.match(str(x)) for x in frozen):
             raise ValueError("'frozen' is malformed")
         clean["frozen"] = [int(x) for x in frozen]
+        shop = data.get("shop", {})
+        if not isinstance(shop, dict) or len(shop) > 50_000:
+            raise ValueError("'shop' is malformed")
+        clean["shop"] = {}
+        for k, st in shop.items():
+            if not _UID_RE.match(str(k)):
+                raise ValueError("'shop' has a bad entry")
+            cleaned = _clean_shop_state(st)
+            if cleaned:
+                clean["shop"][str(k)] = cleaned
     except (ValueError, TypeError) as exc:
         return None, f"The backup is damaged: {exc}."
     return clean, None
@@ -7704,6 +7795,404 @@ async def _lottery_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 🛍️ /shop -- cosmetic DESIGNS for Milo's messages (no Discord roles, so no 250-role limit)
+#
+# Four independent categories, each with 3 designs + the free "Classic":
+#   slots  -> how /slots looks when you spin once
+#   quick  -> how the long result looks when you spin all at once
+#   daily  -> how your /daily card looks
+#   win    -> the special card Milo posts when you have the BIGGEST win of a Gamblin game
+# Designs are purely cosmetic (never odds or payouts). Everything can be previewed for free first.
+# What you own + what you've equipped is saved to the database. SHOP_PRICE_PERCENT scales all prices.
+# ---------------------------------------------------------------------------
+SHOP_PRICE_PERCENT = _env_int("SHOP_PRICE_PERCENT", 100)
+
+SHOP_CATEGORIES = {
+    "slots": ("🎰", "/slots — single spin", "How your result looks when you spin once."),
+    "quick": ("⚡", "/slots — spin all", "How the long result looks when you spin everything at once."),
+    "daily": ("🎁", "/daily", "How your daily reward card looks."),
+    "win": ("🏆", "Gamblin win card", "The card Milo posts when you have the biggest win of a Gamblin game."),
+}
+SHOP_ITEMS: dict[str, dict] = {
+    "slots_neon": {"cat": "slots", "name": "Neon Arcade", "price": 10_000, "blurb": "Electric colours and a glowing machine."},
+    "slots_royal": {"cat": "slots", "name": "Royal Casino", "price": 20_000, "blurb": "Gold, crowns and a boxed-in machine."},
+    "slots_cosmic": {"cat": "slots", "name": "Cosmic Milo", "price": 35_000, "blurb": "Stars, sparkles and Milo himself."},
+    "quick_receipt": {"cat": "quick", "name": "Receipt Roll", "price": 12_000, "blurb": "Your spins printed like a shop receipt."},
+    "quick_score": {"cat": "quick", "name": "Scoreboard", "price": 22_000, "blurb": "Green and black tiles, easy to scan."},
+    "quick_galaxy": {"cat": "quick", "name": "Galaxy Grid", "price": 40_000, "blurb": "A compact grid, wins sparkle."},
+    "daily_sunrise": {"cat": "daily", "name": "Sunrise Card", "price": 10_000, "blurb": "A warm morning card with a streak bar."},
+    "daily_treasure": {"cat": "daily", "name": "Treasure Chest", "price": 18_000, "blurb": "Open the chest, tick off the week."},
+    "daily_gift": {"cat": "daily", "name": "Milo's Gift Box", "price": 30_000, "blurb": "Confetti, a bow and Milo."},
+    "win_champion": {"cat": "win", "name": "Champion Banner", "price": 15_000, "blurb": "A golden banner for the winner."},
+    "win_fireworks": {"cat": "win", "name": "Fireworks", "price": 30_000, "blurb": "Light up the whole channel."},
+    "win_legend": {"cat": "win", "name": "Hall of Legends", "price": 50_000, "blurb": "Your stats and records, in gold."},
+}
+
+
+def shop_price(item_id: str) -> int:
+    return max(1, SHOP_ITEMS[item_id]["price"] * SHOP_PRICE_PERCENT // 100)
+
+
+def _clean_shop_state(raw) -> dict | None:
+    """Keep only things we know about (so an old or odd saved value can't break anything)."""
+    if not isinstance(raw, dict):
+        return None
+    own = sorted({i for i in raw.get("own", []) if isinstance(i, str) and i in SHOP_ITEMS}) if isinstance(raw.get("own"), list) else []
+    eq_raw = raw.get("eq", {}) if isinstance(raw.get("eq"), dict) else {}
+    eq = {c: i for c, i in eq_raw.items() if i in own and SHOP_ITEMS[i]["cat"] == c}
+    return {"own": own, "eq": eq} if own else None
+
+
+def style_of(uid: int, cat: str) -> str:
+    """The design id this person has equipped for a category ('classic' if none or not owned)."""
+    st = POINTS.shop.get(uid)
+    if not st:
+        return "classic"
+    item = st.get("eq", {}).get(cat)
+    return item if item in SHOP_ITEMS and item in st.get("own", []) and SHOP_ITEMS[item]["cat"] == cat else "classic"
+
+
+def _rgb(r: int, g: int, b: int) -> discord.Color:
+    return discord.Color.from_rgb(r, g, b)
+
+
+# ---- /slots (single spin) ----------------------------------------------------------------
+def _render_spin(style: str, reels: list[str], headline: str, spin_line: str, footer: str,
+                 color: discord.Color, won: bool) -> discord.Embed:
+    r0, r1, r2 = reels
+    if style == "slots_neon":
+        e = discord.Embed(title="🎰 ✦ NEON ARCADE ✦ 🎰",
+                          description=f"```\n┃ {r0} ┃ {r1} ┃ {r2} ┃\n```\n{headline}\n{spin_line}",
+                          color=_rgb(0, 240, 255) if won else _rgb(255, 43, 214))
+    elif style == "slots_royal":
+        e = discord.Embed(title="👑 ROYAL SLOTS 👑",
+                          description=f"```\n╔════╦════╦════╗\n║ {r0} ║ {r1} ║ {r2} ║\n╚════╩════╩════╝\n```\n{headline}\n{spin_line}",
+                          color=_rgb(255, 200, 0) if won else _rgb(140, 20, 40))
+    elif style == "slots_cosmic":
+        e = discord.Embed(title="🌌 COSMIC MILO SLOTS 🌌",
+                          description=f"✧･ﾟ: *✧･ﾟ:*  {MILO_EMOJI}  **[ {r0} | {r1} | {r2} ]**  {MILO_EMOJI}  *:･ﾟ✧*:･ﾟ✧\n{headline}\n{spin_line}",
+                          color=_rgb(150, 80, 255) if won else _rgb(60, 40, 120))
+    else:
+        e = discord.Embed(title="🎰 Slots", description=f"**[ {' | '.join(reels)} ]**\n{headline}\n{spin_line}", color=color)
+    e.set_footer(text=footer)
+    return e
+
+
+# ---- /slots (spin all) -------------------------------------------------------------------
+def _spin_mark(sp: dict) -> str:
+    """Pity wins are always called out, in every design."""
+    if sp["pity"] == "soft":
+        return f" 🍀 pity win (Milo felt bad after {SLOTS_PITY_AT - 1} misses)"
+    if sp["pity"] == "jackpot":
+        return f" 🎯 {SLOTS_JACKPOT_PITY_AT}-spin guarantee"
+    return ""
+
+
+def _render_batch(style: str, spins: list[dict], result: str, footer: str) -> discord.Embed:
+    total = sum(sp["payout"] for sp in spins)
+    wins = [sp for sp in spins if sp["payout"]]
+    n = len(spins)
+    big = any(sp["payout"] >= SLOT_PAYOUTS[SLOT_JACKPOT] for sp in spins)
+    if style == "quick_receipt":
+        rows = [f"#{sp['n']:02d}  {' '.join(sp['reels'])}" + (f"  +{sp['payout']}" if sp["payout"] else "") + (" *" if sp["pity"] else "")
+                for sp in spins]
+        body = "═══ MILO SLOTS ═══\n" + "\n".join(rows) + f"\n──────────────────\nSPINS {n}   WINS {len(wins)}\nTOTAL +{total}\n═══════════════════"
+        if any(sp["pity"] for sp in spins):
+            body += "\n* = pity win"
+        e = discord.Embed(title="🧾 Milo Slots receipt", description=f"```\n{body}\n```"[:4000], color=_rgb(235, 232, 210))
+    elif style == "quick_score":
+        rows = [f"{'🟩' if sp['payout'] else '⬛'} `{sp['n']:>2}` {' '.join(sp['reels'])}"
+                + (f" **+{sp['payout']}**" if sp["payout"] else "") + _spin_mark(sp) for sp in spins]
+        e = discord.Embed(title=f"📊 Scoreboard — {n} spins", description="\n".join(rows)[:4000], color=_rgb(0, 200, 150))
+    elif style == "quick_galaxy":
+        cells = [(f"✨[{''.join(sp['reels'])}]✨" if sp["payout"] else f"[{''.join(sp['reels'])}]") + ("🍀" if sp["pity"] == "soft" else "🎯" if sp["pity"] == "jackpot" else "")
+                 for sp in spins]
+        rows = [f"`{i + 1:02d}-{min(i + 3, n):02d}` " + "  ".join(cells[i:i + 3]) for i in range(0, n, 3)]
+        e = discord.Embed(title=f"🌌 Galaxy spin — {n} spins", description="\n".join(rows)[:4000], color=_rgb(120, 60, 220))
+    else:
+        rows = [f"**{sp['n']}.** {' '.join(sp['reels'])}" + (f"  ✅ **+{sp['payout']}**" if sp["payout"] else "") + _spin_mark(sp) for sp in spins]
+        e = discord.Embed(title=f"🎰 Slots — {n} spins at once", description="\n".join(rows)[:4000],
+                          color=discord.Color.gold() if big else (discord.Color.green() if wins else discord.Color.dark_grey()))
+    e.add_field(name="Result", value=result, inline=False)
+    e.set_footer(text=footer)
+    return e
+
+
+# ---- /daily -------------------------------------------------------------------------------
+def _render_daily(style: str, mention: str, reward: int, streak: int, lost: bool, old_streak: int,
+                  tomorrow: str, footer: str) -> discord.Embed:
+    day_in_week = ((streak - 1) % 7) + 1
+    streak_line = f"🔥 Streak: **{streak}** day{'s' if streak != 1 else ''}" + (f" *(your {old_streak}-day streak ended — fresh start!)*" if lost else "")
+    if style == "daily_sunrise":
+        bar = "🟧" * day_in_week + "⬜" * (7 - day_in_week) + f"  day {day_in_week}/7"
+        e = discord.Embed(title="🌅 Good morning!", description=f"{mention} claimed **+{pfmt(reward)}**\n{bar}\n{streak_line}", color=_rgb(255, 150, 60))
+    elif style == "daily_treasure":
+        cal = "".join("✅" if i < day_in_week else ("🎁" if i == 6 else "⬜") for i in range(7))
+        e = discord.Embed(title="🪙 Daily Treasure", description=f"🧰 {mention} opened the chest: **+{pfmt(reward)}**\n{cal}\n{streak_line}", color=_rgb(255, 200, 0))
+    elif style == "daily_gift":
+        e = discord.Embed(title="🎀 Milo's Gift Box 🎁",
+                          description=f"🎊🎉🎊🎉🎊\n{MILO_EMOJI} {mention} unwrapped **+{pfmt(reward)}**!\n{streak_line}\n🎊🎉🎊🎉🎊", color=_rgb(255, 120, 190))
+    else:
+        e = discord.Embed(title="🎁 Daily reward!", description=f"{mention} claimed **+{pfmt(reward)}**\n{streak_line}", color=discord.Color.green())
+    e.add_field(name="Tomorrow", value=tomorrow, inline=False)
+    e.set_footer(text=footer)
+    return e
+
+
+# ---- Gamblin win card ------------------------------------------------------------------------
+def _render_win_card(style: str, uid: int, game: str, net: int, best_win: int, record: bool, games: int) -> discord.Embed:
+    who = f"<@{uid}>"
+    if style == "win_champion":
+        e = discord.Embed(title="🏆━━━ CHAMPION ━━━🏆", description=f"{who}\n**{game}**\n💰 **+{pfmt(net)}**", color=_rgb(255, 200, 0))
+    elif style == "win_fireworks":
+        e = discord.Embed(title="🎆 THE TABLE IS ON FIRE 🎆",
+                          description=f"🎇✨ {who} ✨🎇\nlit up **{game}** with\n💥 **+{pfmt(net)}** 💥", color=_rgb(255, 90, 60))
+    elif style == "win_legend":
+        lines = [f"{who} conquered **{game}**", f"💎 Profit: **+{pfmt(net)}**", f"🔥 Best single win: **+{best_win:,}**", f"🎲 Games played: **{games:,}**"]
+        if record:
+            lines.append("🏅 **NEW PERSONAL RECORD!**")
+        e = discord.Embed(title="👑 LEGENDARY WIN 👑", description="\n".join(lines), color=_rgb(212, 175, 55))
+    else:
+        e = discord.Embed(title=f"🏆 {game} — biggest win", description=f"{who} won the most this game: **+{pfmt(net)}**", color=discord.Color.gold())
+    return e
+
+
+# ---- previews (free, sample data) -------------------------------------------------------------
+def _shop_preview(uid: int, style: str) -> discord.Embed:
+    """What this design looks like, using sample data. Nothing is spent or changed."""
+    cat = SHOP_ITEMS[style]["cat"] if style in SHOP_ITEMS else None
+    note = "👀 Demo — sample data, nothing was spent"
+    if cat == "slots" or style == "classic_slots":
+        reels = ["7️⃣"] * 3
+        return _render_spin(style, reels, f"💥 **JACKPOT!!!** Triple 7️⃣ — **+{pfmt(100)}!**", "🆓 Free spin", note, discord.Color.gold(), True)
+    if cat == "quick" or style == "classic_quick":
+        spins = [{"n": i + 1, "reels": r, "payout": p, "pity": pt, "paid": False} for i, (r, p, pt) in enumerate([
+            (["🍒", "🍋", "🍇"], 0, ""), (["⭐", "⭐", "🍉"], 0, ""), (["🍇", "🍇", "🍇"], 12, ""), (["🍋", "🍒", "🍋"], 0, ""),
+            (["🍉", "🍋", "🍒"], 0, ""), (["⭐", "⭐", "⭐"], 25, ""), (["🍒", "🍒", "🍒"], 4, "soft"), (["🍇", "🍋", "🍉"], 0, ""), (["🍒", "⭐", "🍇"], 0, "")])]
+        result = f"**3** wins · total **{pfmt(41)}** · best: spin 6 (+25)"
+        return _render_batch(style, spins, result, note)
+    if cat == "daily" or style == "classic_daily":
+        return _render_daily(style, "@you", 35, 5, False, 0, f"**+{pfmt(40)}** · a **+{DAILY_WEEK_BONUS} bonus** in 2 days!", note)
+    return _render_win_card(style, uid, "Roulette", 2400, 1800, True, 12)
+
+
+_CLASSIC_PREVIEW = {"slots": "classic_slots", "quick": "classic_quick", "daily": "classic_daily", "win": "classic_win"}
+
+
+def _status_text(uid: int, item_id: str) -> str:
+    if item_id == "classic":
+        return "free"
+    if style_of(uid, SHOP_ITEMS[item_id]["cat"]) == item_id:
+        return "✅ equipped"
+    return "🔓 owned" if POINTS.owns(uid, item_id) else f"🔒 {pamt(shop_price(item_id))}"
+
+
+def _shop_home_embed(uid: int) -> discord.Embed:
+    e = discord.Embed(
+        title="🛍️ Milo Shop",
+        description=(f"Change how Milo's messages look. Pick a category, **preview any design for free**, then buy it with your {PTS_NAME}.\n"
+                     f"Your balance: **{pfmt(POINTS.points(uid))}**"),
+        color=discord.Color.gold(),
+    )
+    owned = POINTS.shop_state(uid)["own"]
+    for cat, (emoji, label, blurb) in SHOP_CATEGORIES.items():
+        eq = style_of(uid, cat)
+        name = "Classic" if eq == "classic" else SHOP_ITEMS[eq]["name"]
+        mine = sum(1 for i in owned if SHOP_ITEMS[i]["cat"] == cat)
+        e.add_field(name=f"{emoji} {label}", inline=False, value=f"{blurb}\nEquipped: **{name}** · you own {mine}/3")
+    e.set_footer(text="Designs are cosmetic only — they never change odds or payouts.")
+    return e
+
+
+def _shop_cat_embed(uid: int, cat: str, sel: str | None) -> discord.Embed:
+    emoji, label, blurb = SHOP_CATEGORIES[cat]
+    e = discord.Embed(title=f"{emoji} {label}", description=f"{blurb}\nYour balance: **{pfmt(POINTS.points(uid))}**", color=discord.Color.gold())
+    items = ["classic"] + [i for i, v in SHOP_ITEMS.items() if v["cat"] == cat]
+    for i in items:
+        name = "Classic" if i == "classic" else SHOP_ITEMS[i]["name"]
+        desc = "The normal Milo look." if i == "classic" else SHOP_ITEMS[i]["blurb"]
+        eq = style_of(uid, cat)
+        status = "✅ equipped" if (i == eq) else _status_text(uid, i)
+        e.add_field(name=f"{'▶ ' if i == sel else ''}{name} — {status}", value=desc, inline=False)
+    e.set_footer(text="Pick a design below, press Preview to see it, then Buy / Equip.")
+    return e
+
+
+def _shop_buy_error(uid: int, item_id: str) -> str | None:
+    if not POINTS.ready:
+        return _POINTS_UNAVAILABLE
+    blocked = frozen_block(uid) or gamblin_block_text("`/shop`")
+    if blocked:
+        return blocked
+    if POINTS.owns(uid, item_id):
+        return "You already own that one! Equip it from the shop."
+    price = shop_price(item_id)
+    if POINTS.points(uid) < price:
+        return f"🛍️ **{SHOP_ITEMS[item_id]['name']}** costs {pfmt(price)} and you have {pfmt(POINTS.points(uid))}. Keep grinding! 💪"
+    return None
+
+
+class ShopHomeView(discord.ui.View):
+    def __init__(self, owner_id: int) -> None:
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        for cat, (emoji, label, _) in SHOP_CATEGORIES.items():
+            b = discord.ui.Button(label=label[:40], emoji=emoji, style=discord.ButtonStyle.primary)
+            b.callback = self._open(cat)
+            self.add_item(b)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Open your own with `/shop` 🐾", ephemeral=True)
+            return False
+        return True
+
+    def _open(self, cat: str):
+        async def callback(interaction: discord.Interaction) -> None:
+            view = ShopCategoryView(self.owner_id, cat)
+            await interaction.response.edit_message(embed=_shop_cat_embed(self.owner_id, cat, view.sel), view=view)
+        return callback
+
+
+class ShopCategoryView(discord.ui.View):
+    def __init__(self, owner_id: int, cat: str, sel: str | None = None) -> None:
+        super().__init__(timeout=300)
+        self.owner_id, self.cat, self.sel = owner_id, cat, sel
+        self.select = discord.ui.Select(placeholder="Pick a design…", options=self._options())
+        self.select.callback = self._picked
+        self.add_item(self.select)
+        self.preview_btn = discord.ui.Button(label="Preview", emoji="👀", style=discord.ButtonStyle.secondary)
+        self.preview_btn.callback = self._preview
+        self.action_btn = discord.ui.Button(label="Pick a design", style=discord.ButtonStyle.success, disabled=True)
+        self.action_btn.callback = self._action
+        self.back_btn = discord.ui.Button(label="Back", emoji="↩️", style=discord.ButtonStyle.secondary)
+        self.back_btn.callback = self._back
+        for b in (self.preview_btn, self.action_btn, self.back_btn):
+            self.add_item(b)
+        self._sync()
+
+    def _options(self) -> list[discord.SelectOption]:
+        opts = [discord.SelectOption(label="Classic", value="classic", description="Free — the normal Milo look", default=self.sel == "classic")]
+        for i, v in SHOP_ITEMS.items():
+            if v["cat"] == self.cat:
+                opts.append(discord.SelectOption(label=v["name"], value=i, default=self.sel == i,
+                                                 description=_status_text(self.owner_id, i)[:100]))
+        return opts
+
+    def _sync(self) -> None:
+        for o in self.select.options:
+            o.default = o.value == self.sel
+        b, uid = self.action_btn, self.owner_id
+        if self.sel is None:
+            b.label, b.disabled, b.style = "Pick a design", True, discord.ButtonStyle.secondary
+        elif style_of(uid, self.cat) == (self.sel if self.sel != "classic" else "classic"):
+            b.label, b.disabled, b.style = "Equipped ✓", True, discord.ButtonStyle.secondary
+        elif self.sel == "classic" or POINTS.owns(uid, self.sel):
+            b.label, b.disabled, b.style = "Equip", False, discord.ButtonStyle.success
+        else:
+            b.label, b.disabled, b.style = f"Buy · {pamt(shop_price(self.sel))}", False, discord.ButtonStyle.success
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Open your own with `/shop` 🐾", ephemeral=True)
+            return False
+        return True
+
+    async def _refresh(self, interaction: discord.Interaction, content: str | None = None) -> None:
+        self.select.options = self._options()
+        self._sync()
+        await interaction.response.edit_message(content=content, embed=_shop_cat_embed(self.owner_id, self.cat, self.sel), view=self)
+
+    async def _picked(self, interaction: discord.Interaction) -> None:
+        self.sel = self.select.values[0]
+        await self._refresh(interaction)
+
+    async def _preview(self, interaction: discord.Interaction) -> None:
+        if self.sel is None:
+            await interaction.response.send_message("Pick a design from the dropdown first.", ephemeral=True)
+            return
+        style = _CLASSIC_PREVIEW[self.cat] if self.sel == "classic" else self.sel
+        await interaction.response.send_message(f"👀 **{'Classic' if self.sel == 'classic' else SHOP_ITEMS[self.sel]['name']}** — this is how it looks:",
+                                                embed=_shop_preview(self.owner_id, style), ephemeral=True)
+
+    async def _action(self, interaction: discord.Interaction) -> None:
+        uid = self.owner_id
+        if self.sel is None:
+            return
+        if self.sel == "classic":
+            POINTS.equip(uid, self.cat, None)
+            await self._refresh(interaction, "✅ Back to the Classic look.")
+        elif POINTS.owns(uid, self.sel):
+            POINTS.equip(uid, self.cat, self.sel)
+            await self._refresh(interaction, f"✅ **{SHOP_ITEMS[self.sel]['name']}** equipped.")
+        else:
+            err = _shop_buy_error(uid, self.sel)
+            if err:
+                await interaction.response.send_message(err, ephemeral=True)
+                return
+            price = shop_price(self.sel)
+            await interaction.response.edit_message(
+                content=(f"🛍️ Buy **{SHOP_ITEMS[self.sel]['name']}** for **{pfmt(price)}**?\n"
+                         f"You have {pfmt(POINTS.points(uid))}. It's yours forever and gets equipped right away."),
+                embed=None, view=ShopConfirmView(uid, self.cat, self.sel))
+
+    async def _back(self, interaction: discord.Interaction) -> None:
+        await interaction.response.edit_message(content=None, embed=_shop_home_embed(self.owner_id), view=ShopHomeView(self.owner_id))
+
+
+class ShopConfirmView(discord.ui.View):
+    def __init__(self, owner_id: int, cat: str, item_id: str) -> None:
+        super().__init__(timeout=60)
+        self.owner_id, self.cat, self.item_id, self.used = owner_id, cat, item_id, False
+        self.confirm_btn.label = f"Buy ({pamt(shop_price(item_id))})"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Open your own with `/shop` 🐾", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Buy", emoji="🛒", style=discord.ButtonStyle.success)
+    async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.used:
+            await interaction.response.send_message("Already handled!", ephemeral=True)
+            return
+        self.used = True
+        self.stop()
+        err = _shop_buy_error(self.owner_id, self.item_id)           # re-check: things may have changed
+        if err:
+            back = ShopCategoryView(self.owner_id, self.cat, self.item_id)
+            await interaction.response.edit_message(content=err, embed=_shop_cat_embed(self.owner_id, self.cat, self.item_id), view=back)
+            return
+        price = shop_price(self.item_id)
+        POINTS.buy_item(self.owner_id, self.item_id, price)
+        name = SHOP_ITEMS[self.item_id]["name"]
+        back = ShopCategoryView(self.owner_id, self.cat, self.item_id)
+        await interaction.response.edit_message(content=f"🎉 You bought **{name}** for {pfmt(price)} and it's equipped!",
+                                                embed=_shop_cat_embed(self.owner_id, self.cat, self.item_id), view=back)
+        await log_event(f"🛍️ `/shop` <@{self.owner_id}> bought **{name}** for {price:,}")
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.used = True
+        self.stop()
+        back = ShopCategoryView(self.owner_id, self.cat, self.item_id)
+        await interaction.response.edit_message(content="Cancelled — nothing bought. 🐾", embed=_shop_cat_embed(self.owner_id, self.cat, self.item_id), view=back)
+
+
+@bot.tree.command(name="shop", description=f"Buy designs for Milo's messages with your {PTS_NAME} (preview first!).")
+async def shop_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message("This bot is not configured for this server.", ephemeral=True)
+        return
+    if not POINTS.ready:
+        await interaction.response.send_message(_POINTS_UNAVAILABLE, ephemeral=True)
+        return
+    await interaction.response.send_message(embed=_shop_home_embed(interaction.user.id), view=ShopHomeView(interaction.user.id), ephemeral=True)
+
+
+
+# ---------------------------------------------------------------------------
 # 🛠️ Manager toolbox -- hidden ?commands (Manager role only, silent to others)
 #
 #   ?give @user +300 pts     add points   (or -40 pts to take some away)
@@ -7728,7 +8217,7 @@ _SET_RE = re.compile(rf"^\?set\s+{_MGR_TARGET}\s+([\d,]+)\s*(?:pts?|points?)?\s*
 _ONLY_TARGET_RE = re.compile(rf"^\?\w+\s+{_MGR_TARGET}\s*$", re.I)
 _MGR_WORDS = {"?give", "?set", "?undo", "?check", "?balances", "?resetspins", "?snapshot", "?mhelp",
               "?resetleaderboard", "?resetleaderbord", "?freeze", "?unfreeze", "?frozen", "?backup",
-              "?restore", "?announce", "?resetpreview"}
+              "?restore", "?announce", "?resetpreview", "?giveitem", "?takeitem"}
 _mgr_history: list[dict] = []           # recent balance changes, newest last (memory only)
 
 
@@ -8129,11 +8618,35 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
             + (f"Made <t:{data['created']}:F>\n" if data["created"] else "")
             + f"• {len(data['balance'])} balances ({pfmt(sum(data['balance'].values()))} in the file vs {sum(POINTS.balance.values()):,} now)\n"
             f"• {len(data['earned'])} leaderboard totals, {len(data['jackpot'])} jackpot counters, {len(data['daily'])} daily streaks, "
-            f"{len(data['stats'])} Gamblin records, {len(data['frozen'])} frozen\n"
+            f"{len(data['stats'])} Gamblin records, {len(data['frozen'])} frozen, {len(data['shop'])} shop inventories\n"
             "Only people **in the file** are changed (everyone else is left alone); the frozen list is set to match the file exactly.\n"
             "This overwrites current numbers and can't be undone — run `?backup` first if you're unsure.",
             view=view, allowed_mentions=discord.AllowedMentions.none(),
         )
+        return
+
+    # ---- ?giveitem / ?takeitem (shop designs) ----
+    if word in ("?giveitem", "?takeitem"):
+        m = re.match(rf"^\?(?:give|take)item\s+{_MGR_TARGET}\s+(\w+)\s*$", text, re.I)
+        if not m or m.group(3).lower() not in SHOP_ITEMS:
+            await reply(f"Usage: `{word} @user item_id`\nItems: " + ", ".join(f"`{i}`" for i in SHOP_ITEMS), keep=90)
+            return
+        if not POINTS.ready:
+            await reply("❌ Points haven't loaded from the database yet — try again in a minute.")
+            return
+        member = await find_member(m.group(1) or m.group(2))
+        if member is None:
+            return
+        item = m.group(3).lower()
+        if word == "?giveitem":
+            POINTS.grant_item(member.id, item, equip=False)
+            await reply(f"🎁 Gave **{SHOP_ITEMS[item]['name']}** to {member.display_name}.")
+        elif POINTS.revoke_item(member.id, item):
+            await reply(f"↩️ Took **{SHOP_ITEMS[item]['name']}** from {member.display_name}.")
+        else:
+            await reply(f"ℹ️ {member.display_name} doesn't own that design.")
+            return
+        await log_event(f"🛍️ `{word}` by <@{mgr.id}>: <@{member.id}> — {SHOP_ITEMS[item]['name']} (`{item}`)")
         return
 
     # ---- ?resetpreview: see the midnight message without pinging anyone ----
@@ -8160,7 +8673,8 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
             "`?check @user` — balance, earned, rank, spins, streak, pity, frozen?\n"
             f"`?balances` — everyone's {PTS_NAME} · `?resetspins @user` — restore today's spins\n"
             f"`?resetleaderboard` — set the all-time leaderboard to everyone's current {PTS_NAME} (asks to confirm)\n"
-            "`?freeze @user [reason]` / `?unfreeze @user` / `?frozen` — stop (or allow) earning, gambling and trading"))
+            "`?freeze @user [reason]` / `?unfreeze @user` / `?frozen` — stop (or allow) earning, gambling and trading\n"
+            "`?giveitem @user item_id` / `?takeitem @user item_id` — give or remove a shop design (type it with no item to see the ids)"))
         e.add_field(name="🎲 Games & events", inline=False, value=(
             "`?gamblin` — pick a game (slots / blackjack / duck race / roulette), ping everyone and start it\n"
             "`?gamblin duck` (or `slots`, `bj`, `roulette`) — start straight away · `?gamblin stop` — end any game\n"
