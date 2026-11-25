@@ -8,7 +8,7 @@ Features:
 - A persistent **✔️ Interested** button on `/join` messages — survives bot restarts, **no database required**
 - A cat-themed welcome message when new members join
 - Self-assign roles (button-based, no database), posted via the hidden `?rolemenu` command
-- Hidden text commands — `?send` (Manager role **or** Milo role), `?rolemenu`, `?updateDB`, `?gamblin` (slots, blackjack, duck race, roulette) and the Manager toolbox (`?give`, `?set`, `?undo`, `?check`, `?balances`, `?resetspins`, `?resetleaderboard`, `?snapshot`, `?mhelp`). All Manager role only, silent to everyone else; see Sections 16 and 17. — the **only** `?`-prefixed commands in the whole bot. None shows up in Discord's `/` picker and none is listed in `/help`; they're documented here in the README only.
+- Hidden text commands — `?send` (Manager role only), `?rolemenu`, `?updateDB`, `?gamblin` (slots, blackjack, duck race, roulette) and the Manager toolbox (`?give`, `?set`, `?undo`, `?check`, `?balances`, `?resetspins`, `?resetleaderboard`, `?snapshot`, `?mhelp`, `?mmhelp`, `?addredeem`, `?limitedshop`, `?customid`). All Manager role only, silent to everyone else; see Sections 16 and 17. — the **only** `?`-prefixed commands in the whole bot. None shows up in Discord's `/` picker and none is listed in `/help`; they're documented here in the README only.
 - Several commands call free, keyless public APIs (cat facts/photos, quotes, dictionary, weather, translation, reaction gifs) — every call has a graceful fallback message if the API is briefly down or slow
 - Runs as a **Render Free Web Service** (Discord Gateway + a tiny HTTP health server in one process)
 - Secrets stay in environment variables, never in code
@@ -159,7 +159,7 @@ This works exactly like the Interested button — no database. Each role button'
 
 ## 8. The hidden `?send`, `?rolemenu` and `?updateDB` commands
 
-The `?`-prefixed commands are all **hidden, plain-text, Manager-only** (except `?send`, which the Milo role can use too). Everything else is a slash command. The full list, with what each does, is in Sections 16–22; type `?mhelp` in Discord any time for a short version. They are never shown in `/help`, and anyone without the right role just gets silence.
+The `?`-prefixed commands are all **hidden, plain-text, Manager-only** (except five read/announce commands the Milo role can use: `?announce`, `?snapshot`, `?check`, `?balances`, `?gamblin schedule list` — see `?mmhelp`). Everything else is a slash command. The full list, with what each does, is in Sections 16–22; type `?mhelp` in Discord any time for a short version. They are never shown in `/help`, and anyone without the right role just gets silence.
 
 | Command | What it does |
 |---|---|
@@ -172,7 +172,7 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | Role | `?send` | `?rolemenu` | `?updateDB` |
 |---|---|---|---|
 | Manager (`MANAGER_ROLE_ID`) | ✅ | ✅ | ✅ |
-| Milo (`MILO_ROLE_ID`) | ✅ | ❌ | ❌ |
+| Milo (`MILO_ROLE_ID`) | ❌ (use `?announce`) | ❌ | ❌ |
 | Everyone else | ❌ | ❌ | ❌ |
 
 ---
@@ -224,7 +224,7 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `/slots` | Spin a 3-reel slot machine for points. **25 free spins a day**, then up to **20 bonus spins** in packs: **5 points buys a pack of 10 spins**. Match all three to win: 7️⃣ 100 · ⭐ 25 · 🍇 12 · 🍉 8 · 🍋 6 · 🍒 4. Every **200th spin since your last 777 is a guaranteed 777**, and a small win is guaranteed after 19 misses. Buying a pack asks you to confirm first. **With 2+ spins ready, Milo asks "spin once, or all N at once?"**; spinning all posts one long result message and then a separate message for each win (every 777 gets its own). 5-second cooldown. Can be limited to certain channels with `SLOTS_CHANNEL_IDS`. |
 | `/daily` | Claim free points once a day. Day 1 gives 15 and each consecutive day adds 5 (up to day 7), and **every 7th day in a row adds a +50 bonus**. Miss a day and the streak restarts. Works out to roughly 37 points a day for a perfect streak. |
 | `/pay @user amount` | Send some of your points to another member. You confirm first. A **5% fee is burned** on every payment (rounded up, at least 1), so you pay the amount plus the fee and they get the full amount. There's also a **daily limit of 200 points sent** per person (`PAY_DAILY_CAP`, the fee doesn't count towards it). Not allowed to yourself, to bots, to or from frozen people, or while a Gamblin game runs. |
-| `/shop` | **Buy designs for Milo's messages** with your points: 12 designs in 4 independent categories (`/slots` single spin, `/slots` spin-all, `/daily`, Gamblin win card), from 10,000 points. **Preview any of them for free before buying.** Cosmetic only. Section 28. |
+| `/shop` | **Buy designs for Milo's messages** with your points: designs, 777 announcement styles and profile titles in 7 independent categories, from 2,500 points. Seasonal items appear only during a limited-time listing. **Preview any of them for free before buying.** Cosmetic only. Section 28. |
 | `/lottery` | **Daily lottery.** Pick 3 numbers from 1–15 (or take a quick pick) for 10 points a ticket, up to 5 tickets a day. The draw is at midnight: 3 matches share the rollover **jackpot**, 2 matches win 4× the ticket, 1 match refunds it. Section 24. |
 | `/gamblinstats [user]` | Your Gamblin record (games, total profit, biggest win, best game, favourite) plus the **hall of fame**: biggest single win, best single game, most games, highest total profit. |
 | `/points user:<member>` | Your balance, total points earned, leaderboard rank (or progress toward it), and spins left today. Private to you. Add a member to peek at theirs (spins hidden). |
@@ -242,13 +242,12 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `/tableflip` | `(╯°□°)╯︵ ┻━┻` |
 | `/unflip` | `┬─┬ ノ( ゜-゜ノ)` |
 
-### Lookups (free public APIs)
+### Lookups (free public APIs) — `/translate` was removed: its free, keyless providers were unreliable from shared hosting and could not be tested, so it is gone from the bot and the help menus
 
 | Command | Description |
 |---|---|
 | `/quote` | A random inspirational quote, via [zenquotes.io](https://zenquotes.io). |
 | `/weather location:<place>` | Current temperature & wind speed. Add a country after a comma to be precise — `Bengaluru, India`. Tries [Open-Meteo](https://open-meteo.com) first, then [MET Norway](https://api.met.no) if Open-Meteo is rate-limiting Milo's shared IP; results are cached for 10 minutes. The footer says which one answered. |
-| `/translate text:<text> to:<lang>` | Translates text using a language code (`es`, `fr`, `hi`, ...). Tries Google Translate, then MyMemory, then LibreTranslate, in order, so one being rate-limited doesn't take the whole command down. |
 | `/joke` | A random dad joke, via [icanhazdadjoke.com](https://icanhazdadjoke.com). |
 | `/advice` | A random piece of life advice, via [api.adviceslip.com](https://api.adviceslip.com). |
 | `/comic` | A random xkcd comic, via xkcd's own official API. |
@@ -277,7 +276,7 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `?rolemenu` | **Hidden.** Manager-role-only. Posts the self-assign roles menu. Not in `/help`, not a slash command. |
 | `?updateDB` | **Hidden.** Manager-role-only. Saves all points to Upstash now and confirms. Not in `/help`, not a slash command. |
 | `?gamblin` / `?gamblin stop` | **Hidden.** Manager-role-only. Shows a button picker (Slots / Blackjack / Duck Race / Roulette), pings everyone and starts the one you choose in `GAMBLIN_CHANNEL_ID`. `?gamblin stop` ends whichever game is running (Section 16). |
-| `?resetleaderboard` | **Hidden.** Manager-role-only. Sets the all-time leaderboard to everyone's current points, after a confirm button (Section 17). |
+| `?resetleaderboard sname:<name> snum:<number>` | **Hidden.** Manager-only. Archives the current leaderboard season and starts a fresh one (Section 29). Balances and lifetime stats don't change. |
 
 ---
 
@@ -329,7 +328,7 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `CAT_API_KEY` | Optional | Free key from [thecatapi.com/signup](https://thecatapi.com/signup), needed for `/catbreed`. Command is disabled with a clear message if blank. |
 | `WELCOME_CHANNEL_ID` | Optional | Channel where new-member welcome messages post. Welcome feature is skipped if blank. |
 | `MANAGER_ROLE_ID` | Optional | The Manager role. Can use `?send` **and** `?rolemenu`. `?rolemenu` is disabled if blank. |
-| `MILO_ROLE_ID` | Optional | A second, more limited role (e.g. one you name "Milo"). Can use `?send` **only** — not `?rolemenu`. Leave blank if only Managers should use `?send`. |
+| `MILO_ROLE_ID` | Optional | A limited role. Can use only `?announce`, `?snapshot`, `?check`, `?balances` and `?gamblin schedule list` (`?mmhelp`). Everything that changes data needs `MANAGER_ROLE_ID`. |
 | `SELF_ROLES` | Optional | Self-assignable roles for `?rolemenu`, as `ROLE_ID\|Label\|Emoji,...`. `?rolemenu` has nothing to post if blank. |
 | `PORT` | Managed by Render | HTTP port for the health server. Don't set this yourself on Render. |
 
@@ -354,7 +353,7 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - [ ] Restart the bot process, then click **Interested** on an *old* message — it still works correctly.
 - [ ] A new member joining posts a cat-themed welcome message in `WELCOME_CHANNEL_ID`.
 - [ ] `?send Hello everyone` from a Manager-role member deletes their message and posts "Hello everyone" as Milo.
-- [ ] `?send Hello everyone` from a member with **only** the Milo role (`MILO_ROLE_ID`) does the same.
+- [ ] `?send Hello everyone` from a member with **only** the Milo role (`MILO_ROLE_ID`) does nothing (use `?announce` / `?mmhelp`).
 - [ ] `?rolemenu` from a member with **only** the Milo role does nothing at all (it's Manager-only).
 - [ ] `?send Hello everyone` from a non-Manager does nothing at all (no reply, no error).
 - [ ] `/help` lists every command **except** `?send`.
@@ -371,7 +370,7 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - [ ] `/trivia` posts a question with 4 answer buttons; clicking one gives an ephemeral correct/incorrect reply.
 - [ ] `/react reaction:hug user:<someone>` posts a reaction gif (or falls back to text-only if the gif API is briefly down).
 - [ ] `/react` — typing a few letters in the `reaction` field (e.g. `cr`) shows matching suggestions (e.g. `cry`, `celebrate`); picking one and a user posts that reaction's gif.
-- [ ] `/quote`, `/weather location:London`, and `/translate text:Hello to:es` each return live results.
+- [ ] `/quote` and `/weather location:London` each return live results.
 - [ ] With `GROQ_THINK_MODEL` set, an `/ask` answer shows a 🧠 **Think harder** button. Pressing it as the asker posts a longer answer as a reply (footer shows the model and `1/3 used today`), and the button disappears from the original.
 - [ ] Someone **else** pressing the button gets a private "only <@asker> can use this" message. Pressing a button on an answer older than 10 minutes gets a private "too old" message. Pressing twice on the same answer gets "already got its…".
 - [ ] After your daily tries are spent, the button says so privately and tells you how long until it resets.
@@ -382,7 +381,6 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - [ ] `/slots` spins and gives a jackpot, near-miss, or no-match result.
 - [ ] `/emojify text:hi 5` shows individual boxed letters (🇭 🇮) followed by a keycap 5️⃣ — **not** a country flag. If you see an actual flag, the zero-width-space fix didn't make it into your deployed copy.
 - [ ] `/emojify text:hi <:Milo:1554818642804482078>` (or any custom emoji/mention your server has) leaves the `<...>` part completely untouched instead of shredding its letters and digits into more emoji.
-- [ ] `/translate text:Hello to:fr` returns an actual French translation, not the "couldn't translate" fallback message. Check Render's logs for an `Translated via <provider>` line to see which of the three actually succeeded.
 - [ ] `/yesno` returns a yes/no/maybe answer with an image.
 - [ ] With `GROQ_API_KEY` set, `/ask question:Why is the sky blue?` returns a short answer in an embed. Without it set, `/ask` gives a clear "needs a free Groq API key" message.
 - [ ] `/ask question:Are you Milo?` answers in a cat-like voice and confirms it's Milo. `/ask question:When is your birthday?` gives the date from `MILO_BIRTHDAY`; `/ask question:Are you a boy or a girl?` answers male.
@@ -412,18 +410,18 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 
 - Discord only renders `[text](url)` markdown as a clickable link **inside embeds**, not in plain message content, so `/aboutme` sends a small embed to make "AAPoke" clickable.
 - `/poll` supports up to 5 options because Discord slash commands need fixed, named parameters rather than an open-ended list — `option3`–`option5` are optional.
-- `?send` accepts either `MANAGER_ROLE_ID` or `MILO_ROLE_ID`; `?rolemenu` accepts only `MANAGER_ROLE_ID`. A member holding both roles can use both commands.
+- `?send` and `?rolemenu` accept only `MANAGER_ROLE_ID`. `MILO_ROLE_ID` members get exactly five commands (Section 29).
 - `?rolemenu` can offer at most 25 roles (Discord's hard limit on buttons in one message); if `SELF_ROLES` has more, the extras are dropped with a log warning.
-- `?send` requires at least one of `MANAGER_ROLE_ID` / `MILO_ROLE_ID` to be set, plus the Message Content intent to be enabled — without those, it silently does nothing.
+- `?send` requires `MANAGER_ROLE_ID` to be set, plus the Message Content intent to be enabled — without those, it silently does nothing.
 - Clicking your own **Interested** button is blocked with a friendly ephemeral message — remove that check in `bot.py` if you'd rather allow it.
 - Custom `/join` messages are capped at 300 characters; Discord's own per-message limit is 2000.
-- `/catfact`, `/meow`, `/quote`, `/weather`, `/translate`, `/yesno`, and `/react` all call free, keyless public APIs (catfact.ninja, cataas.com, zenquotes.io, Open-Meteo, Google Translate's web endpoint, yesno.wtf, and for `/react`: otakugifs.xyz, nekos.best, gifukai.com, purrbot.site). None of them need an API key or env var, but they're third-party services outside your control — if one is briefly down, slow, or rate-limits you, the command replies with a friendly fallback message instead of crashing (and the reaction commands still post as plain text without the gif).
+- `/catfact`, `/meow`, `/quote`, `/weather`, `/yesno`, and `/react` all call free, keyless public APIs (catfact.ninja, cataas.com, zenquotes.io, Open-Meteo, yesno.wtf, and for `/react`: otakugifs.xyz, nekos.best, gifukai.com, purrbot.site). None of them need an API key or env var, but they're third-party services outside your control — if one is briefly down, slow, or rate-limits you, the command replies with a friendly fallback message instead of crashing (and the reaction commands still post as plain text without the gif).
 - **How `/ask`'s rate limit works.** `/ask` uses `openai/gpt-oss-20b` on Groq's free tier, which allows **30 requests/minute, 1,000 requests/day, 8,000 tokens/minute, and 200,000 tokens/day** — and you're held to whichever limit you hit *first*. These belong to your **Groq account, not to individual Discord users**: everyone on the server shares one pool. A "token" is roughly a small piece of a word, and every question spends some on Milo's personality prompt (~170), your question, the model's brief hidden "thinking", and the answer — roughly 350–550 in total. That means the **token limits bite long before the request limits do**: expect about **400–550 questions a day** (not 1,000) and about **10–15 a minute** across the whole server. (These are estimates, not guarantees.) When a limit is hit, Groq replies 429 and `/ask` answers with a friendly in-character message instead of crashing, telling a per-minute limit ("give me a minute") apart from a daily one ("I've used up my brainpower for today"). To protect the shared pool, `/ask` also has a 15-second per-person cooldown (a failed question doesn't count against it) and can be restricted to specific channels with `ASK_CHANNEL_IDS`. Groq's free-tier numbers change over time — see console.groq.com/docs/rate-limits.
 - **Why `/ask` uses `GROQ_MODEL` instead of a hard-coded name.** The first version of `/ask` used `llama-3.1-8b-instant`, which Groq shut down for regular accounts on August 16, 2026 (its model page now lists it as Enterprise-only) — every request then failed with a 404. The model name is now an overridable env var (default `openai/gpt-oss-20b`) so the next retirement is a one-line change in Render, not a code fix. `gpt-oss` models are *reasoning* models whose hidden thinking tokens count against the response budget, so `/ask` requests low reasoning effort and a 500-token budget; if the budget ever runs out, Groq returns an empty answer, which `/ask` detects and logs (`finish_reason=length`) rather than posting a blank embed.
 - `/ask` caps each question at 300 characters and each answer at roughly 300 tokens (and hard-truncates anything over 1000 characters) so one reply can never exceed Discord's embed field limits. It has no memory — every question is answered independently, with no conversation history carried over.
 - `/catbreed` is the one exception that **does** need a key: TheCatAPI started requiring `x-api-key` on its breeds endpoint in late September 2026 (previously it worked unauthenticated). A free account at thecatapi.com/signup gives you one. If TheCatAPI changes its policy again in the future, this is the place in `bot.py` to look (`CAT_API_KEY` and the `catbreed_slash` function).
 - Every `_fetch_json` call (used by every API-backed command) automatically retries once on a timeout before giving up, since free public APIs occasionally drop a single request without actually being down. Other failures (404, 429, connection refused) fail immediately without retrying.
-- **Why `/weather` sometimes said "can't get" (HTTP 429).** Open-Meteo's free API limits by *IP address*, and on shared hosting like Render every app on the same IP shares one quota — so it can answer 429 ("too many requests") even though neither Milo nor Open-Meteo is broken. The same root cause as `/translate`'s old failures. Milo now falls back to MET Norway (Norway's national weather service; free, no key, asks clients to identify themselves — Milo's User-Agent includes your Discord profile link) and caches each place for 10 minutes. Geocoding (turning "Bengaluru" into coordinates) also goes through Open-Meteo and is cached for 24 hours; if *that* is rate-limited Milo says the map service is busy rather than pretending the place doesn't exist. Typos matter: `Banglore` fuzzy-matched somewhere in Pakistan once — use `Bengaluru`.
+- **Why `/weather` sometimes said "can't get" (HTTP 429).** Open-Meteo's free API limits by *IP address*, and on shared hosting like Render every app on the same IP shares one quota — so it can answer 429 ("too many requests") even though neither Milo nor Open-Meteo is broken. Milo now falls back to MET Norway (Norway's national weather service; free, no key, asks clients to identify themselves — Milo's User-Agent includes your Discord profile link) and caches each place for 10 minutes. Geocoding (turning "Bengaluru" into coordinates) also goes through Open-Meteo and is cached for 24 hours; if *that* is rate-limited Milo says the map service is busy rather than pretending the place doesn't exist. Typos matter: `Banglore` fuzzy-matched somewhere in Pakistan once — use `Bengaluru`.
 - `/weather` properly percent-encodes its input (via aiohttp's `params`) before building the request URL. An earlier version inserted raw user text directly into the URL string, so a city name with a space or accented letter could hang the request instead of cleanly failing.
 - `/react` covers every reaction from all its sources via autocomplete in one command rather than a dedicated slash command per reaction — Discord caps a fixed dropdown at 25 choices and there are 100+ reactions.
 - `/define` was removed entirely: it depended on dictionaryapi.dev, which had a confirmed, chronic multi-week outage pattern (independently verified via third-party uptime monitoring) rather than an occasional blip. No reliable free, keyless alternative was found — every "no signup" option that turned up was either the same broken service under a different URL, or an unverified hobby project. A paid-free-tier option like Wordnik (free account, no card) would fix this properly if you want dictionary lookups back someday.
@@ -434,8 +432,6 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - `/numberfact` was removed for the same reason as `/define`: `numbersapi.com` is confirmed dead (TLS certificate mismatch on HTTPS, and independent automated link-checkers from unrelated projects confirming a hard 404 on the bare domain as recently as 13 days before this was written). Not fixable by changing the request format -- the root domain itself is down.
 - `/grouptrivia`'s per-round state (who answered, what they picked) lives only in memory for the duration of that one 60-second round, scoped to that specific message's View object. It is **not** shared between rounds and does not survive a bot restart mid-round -- if Milo restarts while a group trivia round is in progress, that round's buttons stop working and it never reveals a winner. This matches the same tradeoff `/trivia` and `/riddle` already make for their own short-lived views.
 - `/fortune`, `/compliment`, `/icebreaker`, `/mock`, `/tableflip`, and `/unflip` are pure local logic with no network calls at all, so none of them can ever fail the way an external API can.
-- `/translate` tries three free, keyless providers in order — Google Translate's web endpoint, then MyMemory, then LibreTranslate — falling through to the next one if a provider is rate-limited, down, or errors. This matters specifically because of Render's shared hosting IPs: lots of different apps on Render (and other free platforms) hit the same handful of free translate APIs, so any one of them can end up rate-limiting the whole IP range regardless of how little *this* bot calls it. None of the three need an API key or env var. If all three ever fail at once, the command says so plainly rather than showing a generic error — check Render's logs (`logger.warning` lines mentioning "translate providers failed") to see which ones were tried.
-- None of the three translate providers are officially documented, supported APIs with an SLA — they're free community/unofficial endpoints that could change or disappear without notice. If translation stops working entirely someday, that's the most likely reason, and the fix is swapping in a real provider (e.g. DeepL's free tier, which gives each account its own quota instead of a shared one) in `bot.py`.
 - `/trivia`'s question bank is a fixed local list in `bot.py` — add more by editing the `TRIVIA_QUESTIONS` list.
 - `/firstmessage` needs the **Read Message History** permission; without it, it replies with a clear "I don't have permission" message rather than failing silently.
 - The `/join` cooldown (30s per user) and `?send`'s message-delete step both need no persistence — they're either in-memory or one-shot actions.
@@ -659,7 +655,7 @@ All of these are **hidden** `?` commands: Manager role only, silent to everyone 
 | `?undo` | Reverses the most recent `?give` / `?set`. Run it again to step back further. Remembers the last 25 changes since Milo started. |
 | `?check @user` | Balance, total earned, leaderboard rank, spins used today, and whether they have unsaved changes. |
 | `?balances` | Everyone's current points, richest first. Shows in the channel and disappears after 2 minutes. |
-| `?resetleaderboard` | Sets everyone's all-time **total earned** to their **current points** (balances don't change). Milo shows what will happen (how many people change, who will be on the board afterwards, the current top 5) with **Yes, reset it / Cancel** buttons that only you can press. After you confirm it saves to the database immediately and writes the old top 10 to the log channel. It can't be undone, and it's blocked while a Gamblin game is running. `?resetleaderbord` (typo) works too. |
+| `?resetleaderboard sname:Christmas snum:Season 01` | Archives the current season (kept for `/leaderboard season:`) and starts a fresh board named "Christmas · Season 01", after a confirm button. Nobody's points, lifetime earnings or stats change. Blocked while a Gamblin game runs. |
 | `?freeze @user [reason]` / `?unfreeze @user` / `?frozen` | A frozen person can't earn, gamble or trade: `/slots`, `/daily`, `/pay` (sending or receiving) and joining a Gamblin game are all refused with a friendly note. Saved to the database. Use it for abuse while you sort things out; `?frozen` lists everyone frozen. |
 | `?announce Title \| message` | Posts a tidy embed as Milo. Add `--ping` to ping @everyone and/or a `#channel` to post elsewhere: `?announce --ping #general Movie night \| 8pm in voice!`. Without a `\|` the whole text is the message. Your command is deleted. (`?send` is still there for plain Milo messages.) |
 | `?backup` | Posts a backup file (balances, earned, 777 counters, streaks, Gamblin stats, frozen list, shop designs) to the **log channel**. Milo also posts one **every night** next to the points snapshot. Needs `LOG_CHANNEL_ID`. |
@@ -911,3 +907,35 @@ Instead of roles (Discord caps a server at 250), the shop sells **designs for Mi
 **Prices and your economy.** Prices start at 10,000 on purpose, so they're a long-term goal. For scale: slots and `/daily` bring in roughly 90 points a day per active person, so a 10,000 design is a few months of normal play, and Gamblin wins are what make it faster. If that feels too slow or too fast, change **`SHOP_PRICE_PERCENT`** (for example `25` makes everything a quarter of the price) and redeploy.
 
 **Saved data:** what each person owns and has equipped is saved to the database (one command per purchase or equip, using the normal 5-minute save) and is included in `?backup` / `?restore`. Managers can fix problems with `?giveitem` and `?takeitem` (Section 17).
+
+
+---
+
+## 29. What's new: redeem codes, seasons, limited shop, daily games, profiles
+
+**Where data lives.** Everything persistent is in the same Upstash Redis as the points (no second database, no SQL — so "migrations" are just new keys, created on first use; nothing existing was altered):
+
+| Key | What |
+|---|---|
+| `milo:redeem:codes` (hash) / `milo:redeem:used:<CODE>` (set) | custom codes / who redeemed each (written with an atomic `SADD`, so a code can only ever be redeemed once per person, even with two Milo instances) |
+| `milo:shop:limited` (hash) | limited-time listings (item id → price, start, end) |
+| `milo:gamblin:daily` | today's game schedule and each game's status |
+| `milo:season:state` / `milo:season:history` | current leaderboard season and archived seasons |
+
+All of it is loaded into memory at startup; manager changes write to Upstash first and then re-read it, so the cache always matches the database. Designs themselves (the catalog) live in `bot.py` under `CATALOG`; players only own **IDs**, so editing a design updates it for every owner.
+
+**Player commands:** `/redeem code:<code>` (default codes: `MILO_GIFTS` = +50, `MILO_TAG` = the ❤️‍🔥 Zealous tag) · `/inspect [user]` (profile card) · `/leaderboard [season]` · `/daily` (streak insurance) · `/shop` (now also 777 announcements, titles, tags).
+
+**Manager commands** (`?mhelp`): `?addredeem CODE +50,daily_christmas [expires:2026-12-31]` · `?removeredeem CODE` · `?redeems` · `?customid` · `?limitedshop add|price|time|remove|list` · `?resetleaderboard sname:Christmas snum:Season 01`. **Milo role** (`?mmhelp`): `?announce`, `?snapshot`, `?check`, `?balances`, `?gamblin schedule list`.
+
+**Streak insurance.** Miss a day and `/daily` shows a private offer: the exact fee (`STREAK_INSURANCE_PERCENT`% of your current balance, rounded up, at least 1) and what you get. Nothing is charged unless you press **Restore**. **Start fresh** (or ignoring it) resets the streak with no charge. The fee is re-checked when you press the button; if your balance changed it shows the new fee instead of charging. Gaps longer than `STREAK_INSURANCE_MAX_MISSED_DAYS` can't be insured.
+
+**Limited shop.** Seasonal designs (`daily_christmas`, `daily_newyear`, `slots_christmas`, `slots_newyear`) exist in the catalog but are **not sold** until you list them: `?limitedshop add slots_christmas 250 2026-12-01 2026-12-31`. Dates are `YYYY-MM-DD` or `YYYY-MM-DD HH:MM` in `LIMIT_RESET_TZ` (IST by default); an end date with no time lasts to the end of that day. When the end passes, the item disappears from `/shop` by itself; owners keep it.
+
+**Daily Gamblin games.** Each day Milo schedules `DAILY_RANDOM_GAMES` random games between `DAILY_GAMES_START_TIME` and `DAILY_GAMES_END_TIME`, at least 25 minutes apart, plus one guaranteed game at `DAILY_FIXED_GAME_TIME`. The schedule is saved, shown in the midnight and lottery messages, survives restarts, and a game more than 10 minutes late is skipped. When one ends, Milo announces the next (no @everyone; only the real game start pings). Changed env values apply from the **next** day's schedule.
+
+**Seasons.** The leaderboard ranks "earned since the season started" (lifetime earned minus a snapshot taken at the reset). Lifetime earnings, balances and stats are never touched. The first season is called `SEASON 0`.
+
+**Shop discounts.** `SHOP_DISCOUNT=5, Happy New Year` and `SHOP_DISCOUNT_IDS=0` (all items) or `slots_cosmic,daily_sunrise` (just those). The price shown and the price charged come from the same function.
+
+**Tests.** `DISCORD_TOKEN=x python -m pytest tests -q` runs the offline test-suite (`tests/test_milo.py`).
