@@ -2894,13 +2894,10 @@ POINTS_KEY_SHOP = "milo:points:shop"         # HASH  user id -> JSON {"own": [it
 POINTS_KEY_SCHED = "milo:gamblin:schedule"   # STRING JSON list of scheduled Gamblin games
 LOTTERY_KEY_STATE = "milo:lottery:state"     # STRING JSON {"carry": jackpot, "drawn": last drawn day, "last": last result}
 LOTTERY_KEY_TICKETS = "milo:lottery:t:"      # + YYYY-MM-DD, HASH "<id>:<n>" -> "a,b,c" (that day's tickets)
-LOTTERY_RANGE = 15                            # numbers 1-15 (15 buttons fit Discord's 5x5 limit)
-LOTTERY_PICKS = 3
+LOTTERY_PICKS = 3                             # only the saved ticket format: a ticket is stored as 3 numbers (0,0,0 now; old tickets keep theirs)
 LOTTERY_COST = _env_int("LOTTERY_TICKET_COST", 10)
 LOTTERY_MAX_TICKETS = _env_int("LOTTERY_MAX_TICKETS", 5)
-LOTTERY_SEED = _env_int("LOTTERY_JACKPOT_SEED", 50)      # the jackpot restarts here after a win
-LOTTERY_PRIZE_2 = LOTTERY_COST * 4                       # 2 matches pays 4x a ticket; 1 match refunds the ticket
-LOTTERY_CUT = max(1, (LOTTERY_COST * 3 + 10) // 20)     # ~15% of each ticket feeds the jackpot (rounded to nearest)
+LOTTERY_SEED = _env_int("LOTTERY_JACKPOT_SEED", 0)       # the rolled-over pot restarts here after a win
 _raw_lottery_channel = os.getenv("LOTTERY_CHANNEL_ID", "").strip()
 LOTTERY_CHANNEL_ID = int(_raw_lottery_channel) if _raw_lottery_channel.isdigit() else None
 
@@ -3661,11 +3658,48 @@ def _roll_slots(since_win: int, since_jp: int) -> tuple[list[str], int, str]:
     return reels, (SLOT_PAYOUTS[reels[0]] if won else 0), ""
 
 
+# ---- bonus packs: you BUY spins first (they're banked for the day), then spin when you like ----
+def _packs_bought(uid: int, day: str) -> int:
+    """Bonus spins bought today. Never less than the spins already used (covers a pack that was part-used before this
+    bank existed), so nobody loses a pack they paid for."""
+    used = POINTS.used(uid, day)[1]
+    stored = EXTRAS.packs.get("bought", {}).get(str(uid), 0) if EXTRAS.packs.get("day") == day else 0
+    return max(stored, -(-used // SLOTS_PACK_SPINS) * SLOTS_PACK_SPINS)
+
+
+def _bonus_banked(uid: int, day: str) -> int:
+    return max(0, _packs_bought(uid, day) - POINTS.used(uid, day)[1])
+
+
+def _packs_left(uid: int, day: str) -> int:
+    return max(0, (SLOTS_PAID_SPINS - _packs_bought(uid, day)) // SLOTS_PACK_SPINS)
+
+
+def _pack_buy_error(uid: int, day: str) -> str | None:
+    if not POINTS.ready:
+        return _POINTS_UNAVAILABLE
+    blocked = frozen_block(uid) or gamblin_block_text("`/slots`")
+    if blocked:
+        return blocked
+    if _packs_left(uid, day) <= 0:
+        return f"🎰 You've bought all {SLOTS_PAID_SPINS} bonus spins for today. They come back in {_format_wait(_day_info()[1])}!"
+    if POINTS.points(uid) < SLOTS_PACK_COST:
+        return f"🎰 A bonus pack ({SLOTS_PACK_SPINS} spins) costs {pfmt(SLOTS_PACK_COST)} and you have {pamt(POINTS.points(uid))}."
+    return None
+
+
+def _buy_pack(uid: int, day: str) -> None:
+    """Charge for a pack and bank its spins. Instant memory work (no awaits) -- the caller checks _pack_buy_error first."""
+    bought = _packs_bought(uid, day)
+    POINTS.add_balance(uid, -SLOTS_PACK_COST)
+    EXTRAS.set_bought(uid, day, bought + SLOTS_PACK_SPINS)
+
+
 def _spin_precheck(uid: int) -> tuple[str, dict]:
     """Instant memory check for a spin. Returns (status, info):
-    "frozen" / "cooldown" / "broke" / "exhausted" -> info["msg"] is the private reply;
-    "ok" -> info has paid, cost (points charged by THIS spin: the pack price on a
-    pack's first spin, 0 for the rest), day."""
+    "frozen" / "cooldown" / "exhausted" -> info["msg"] is the private reply;
+    "empty" -> nothing ready, but a bonus pack can still be bought (info["msg"] says so);
+    "ok" -> info has paid (a bonus-pack spin), cost (always 0: packs are paid when bought) and day."""
     blocked = frozen_block(uid)
     if blocked:
         return "frozen", {"msg": blocked}
@@ -3676,22 +3710,15 @@ def _spin_precheck(uid: int) -> tuple[str, dict]:
         return "cooldown", {"msg": f"🎰 The reels are still spinning! Try again in {wait}s."}
 
     day, secs_to_reset = _day_info()
-    free_used, bonus_used = POINTS.used(uid, day)
+    free_used, _ = POINTS.used(uid, day)
     if free_used < SLOTS_FREE_SPINS:
         return "ok", {"paid": False, "cost": 0, "day": day}
-    if bonus_used < SLOTS_PAID_SPINS:
-        if bonus_used % SLOTS_PACK_SPINS:                    # inside a pack you already paid for
-            return "ok", {"paid": True, "cost": 0, "day": day}
-        balance = POINTS.points(uid)
-        if balance < SLOTS_PACK_COST:
-            return "broke", {"msg": (
-                f"🎰 You've used all {SLOTS_FREE_SPINS} free spins today. A bonus pack ({SLOTS_PACK_SPINS} spins) "
-                f"costs {pfmt(SLOTS_PACK_COST)} and you have {pamt(balance)}. Fresh free spins in "
-                f"{_format_wait(secs_to_reset)}!"
-            )}
-        return "ok", {"paid": True, "cost": SLOTS_PACK_COST, "day": day}
+    if _bonus_banked(uid, day) > 0:
+        return "ok", {"paid": True, "cost": 0, "day": day}
+    if _packs_left(uid, day) > 0:
+        return "empty", {"day": day, "msg": f"🎰 You've used all {SLOTS_FREE_SPINS} free spins today. Buy a bonus pack to get {SLOTS_PACK_SPINS} more."}
     return "exhausted", {"msg": (
-        f"🎰 You've used all {SLOTS_FREE_SPINS} free spins and {SLOTS_PAID_SPINS} bonus spins "
+        f"🎰 You've used all {SLOTS_FREE_SPINS} free spins and all {SLOTS_PAID_SPINS} bonus spins "
         f"for today. They come back in {_format_wait(secs_to_reset)}!"
     )}
 
@@ -3717,20 +3744,12 @@ def _perform_spin(uid: int, *, paid: bool, cost: int, day: str) -> discord.Embed
     elif pity == "soft":
         headline += f"\n🍀 *Pity win! Milo felt bad after {SLOTS_PITY_AT - 1} misses.* {MILO_EMOJI}"
 
-    free_used, bonus_used = POINTS.used(uid, day)
-    pack_left = (-bonus_used) % SLOTS_PACK_SPINS if paid else 0
-    if paid and cost:
-        spin_line = f"💰 Bonus pack bought (−{pfmt(cost)}) — {SLOTS_PACK_SPINS} spins"
-    elif paid:
-        spin_line = "🎁 Bonus pack spin"
-    else:
-        spin_line = "🆓 Free spin"
+    free_used, _ = POINTS.used(uid, day)
+    spin_line = "🎁 Bonus pack spin" if paid else "🆓 Free spin"
     footer = (
         f"Balance: {pamt(POINTS.points(uid))} · Free spins left: {SLOTS_FREE_SPINS - free_used}/{SLOTS_FREE_SPINS} "
-        f"· Bonus spins left: {SLOTS_PAID_SPINS - bonus_used}/{SLOTS_PAID_SPINS}"
+        f"· Bonus spins ready: {_bonus_banked(uid, day)}"
     )
-    if pack_left:
-        footer += f" ({pack_left} left in your pack)"
     to_jackpot = SLOTS_JACKPOT_PITY_AT - POINTS.jp_count(uid)
     if SLOTS_JACKPOT_PITY_AT and to_jackpot <= 25:
         footer += f" · 🎯 777 guaranteed in {to_jackpot} spin{'s' if to_jackpot != 1 else ''}"
@@ -3783,31 +3802,34 @@ _BATCH_MAX = 60                      # never more than this many spins in one go
 _SYMBOL_WORD = {"7️⃣": "777", "⭐": "stars", "🍇": "grapes", "🍉": "melons", "🍋": "lemons", "🍒": "cherries"}
 
 
-def _next_spin_kind(free_used: int, bonus_used: int) -> str | None:
-    """What the next spin would be WITHOUT paying for anything: 'free', 'pack' (already paid for), or None."""
+def _next_spin_kind(free_used: int, banked: int) -> str | None:
+    """What the next spin would be WITHOUT paying for anything: 'free', 'pack' (a bonus spin already bought), or None."""
     if free_used < SLOTS_FREE_SPINS:
         return "free"
-    if bonus_used < SLOTS_PAID_SPINS and bonus_used % SLOTS_PACK_SPINS:
+    if banked > 0:
         return "pack"
     return None
 
 
 def _batch_count(uid: int, day: str) -> int:
-    """How many spins could be taken in one go right now (free spins + the rest of a pack you already bought)."""
-    free_used, bonus_used = POINTS.used(uid, day)
+    """How many spins could be taken in one go right now (free spins + bonus spins already bought)."""
+    free_used, banked = POINTS.used(uid, day)[0], _bonus_banked(uid, day)
     n = 0
-    while n < _BATCH_MAX and (kind := _next_spin_kind(free_used, bonus_used)):
-        free_used, bonus_used = (free_used + 1, bonus_used) if kind == "free" else (free_used, bonus_used + 1)
+    while n < _BATCH_MAX and (kind := _next_spin_kind(free_used, banked)):
+        if kind == "free":
+            free_used += 1
+        else:
+            banked -= 1
         n += 1
     return n
 
 
 def _batch_spin(uid: int, day: str) -> list[dict]:
-    """Take every spin that's already paid for, back to back. Instant memory work, so it can't be
-    interleaved with anything else. Never buys a new pack by itself."""
+    """Take every spin that's already available, back to back. Instant memory work, so it can't be
+    interleaved with anything else. Never buys a pack by itself."""
     spins: list[dict] = []
     while len(spins) < _BATCH_MAX:
-        kind = _next_spin_kind(*POINTS.used(uid, day))
+        kind = _next_spin_kind(POINTS.used(uid, day)[0], _bonus_banked(uid, day))
         if kind is None:
             break
         reels, payout, pity = _spin_core(uid, paid=kind == "pack", cost=0, day=day)
@@ -3821,9 +3843,9 @@ def _batch_embed(uid: int, day: str, spins: list[dict]) -> discord.Embed:
     best = max(spins, key=lambda sp: sp["payout"])
     result = (f"**{len(wins)}** win{'s' if len(wins) != 1 else ''} · total **{pfmt(total)}**"
               + (f" · best: spin {best['n']} (+{best['payout']})" if wins else " · no wins this time — better luck next spins!"))
-    free_used, bonus_used = POINTS.used(uid, day)
+    free_used, _ = POINTS.used(uid, day)
     footer = (f"Balance: {pamt(POINTS.points(uid))} · Free spins left: {SLOTS_FREE_SPINS - free_used}/{SLOTS_FREE_SPINS} "
-              f"· Bonus spins left: {SLOTS_PAID_SPINS - bonus_used}/{SLOTS_PAID_SPINS}")
+              f"· Bonus spins ready: {_bonus_banked(uid, day)}")
     to_jackpot = SLOTS_JACKPOT_PITY_AT - POINTS.jp_count(uid)
     if SLOTS_JACKPOT_PITY_AT and to_jackpot <= 25:
         footer += f" · 🎯 777 guaranteed in {to_jackpot} spin{'s' if to_jackpot != 1 else ''}"
@@ -3869,13 +3891,43 @@ async def _send_batch(interaction: discord.Interaction, uid: int, day: str, spin
             logger.warning("Couldn't post a batch spin result (the points were still applied)", exc_info=True)
 
 
-class SlotsChoiceView(discord.ui.View):
-    """'Spin once or spin them all?' -- shown when you have 2+ spins ready. Memory only (60s)."""
+def _slots_panel_text(uid: int, day: str, note: str = "") -> str:
+    free_left = SLOTS_FREE_SPINS - POINTS.used(uid, day)[0]
+    banked, left = _bonus_banked(uid, day), _packs_left(uid, day)
+    ready = free_left + banked
+    lines = [note] if note else []
+    lines.append(f"🎰 **{ready} spin{'s' if ready != 1 else ''} ready** — {free_left} free + {banked} bonus")
+    if left:
+        lines.append(f"💰 Bonus pack: **{SLOTS_PACK_SPINS} spins for {pfmt(SLOTS_PACK_COST)}** · {left} pack{'s' if left != 1 else ''} left today "
+                     f"· you have {pcompact(POINTS.points(uid), True)}")
+    else:
+        lines.append("💰 You've bought all your bonus packs for today.")
+    return "\n".join(lines)
 
-    def __init__(self, owner_id: int, n: int) -> None:
-        super().__init__(timeout=60)
-        self.owner_id, self.n, self.used = owner_id, n, False
-        self.all_button.label = f"Spin all {n}"
+
+class SlotsPanelView(discord.ui.View):
+    """Your spins: Spin once · Spin all · Buy a bonus pack. Buying only ADDS spins; nothing spins until you press a spin
+    button. The panel refreshes after every action, so a second pack (if one is left) is one tap away."""
+
+    def __init__(self, owner_id: int) -> None:
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+        day = _day_info()[0]
+        ready, left = _batch_count(owner_id, day), _packs_left(owner_id, day)
+        if ready >= 1:
+            b = discord.ui.Button(label="Spin once", emoji="🎰", style=discord.ButtonStyle.primary)
+            b.callback = self._spin_once
+            self.add_item(b)
+        if ready >= 2:
+            b = discord.ui.Button(label=f"Spin all {ready}", emoji="⚡", style=discord.ButtonStyle.success)
+            b.callback = self._spin_all
+            self.add_item(b)
+        if left > 0:
+            again = _packs_bought(owner_id, day) > 0
+            b = discord.ui.Button(label=f"{'Buy another pack' if again else 'Buy bonus pack'} · {pamt(SLOTS_PACK_COST)}", emoji="💰",
+                                  style=discord.ButtonStyle.secondary, disabled=POINTS.points(owner_id) < SLOTS_PACK_COST)
+            b.callback = self._buy
+            self.add_item(b)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
@@ -3883,108 +3935,55 @@ class SlotsChoiceView(discord.ui.View):
             return False
         return True
 
-    async def _check(self, interaction: discord.Interaction):
-        """Shared re-check at click time. Returns the precheck info if a free/pack spin can go ahead."""
-        if self.used:
-            await interaction.response.send_message("Already handled!", ephemeral=True)
-            return None
+    def _after(self, note: str) -> tuple[str, "SlotsPanelView | None"]:
+        day = _day_info()[0]
+        view = SlotsPanelView(self.owner_id)
+        return _slots_panel_text(self.owner_id, day, note), (view if view.children else None)
+
+    async def _blocked(self, interaction: discord.Interaction) -> bool:
         blocked = gamblin_block_text("`/slots`")
         if blocked or not POINTS.ready:
-            self.used = True
-            self.stop()
             await interaction.response.edit_message(content=blocked or _POINTS_UNAVAILABLE, view=None)
-            return None
-        status, info = _spin_precheck(self.owner_id)
-        if status != "ok" or info["cost"]:
-            self.used = True
-            self.stop()
-            await interaction.response.edit_message(
-                content=info["msg"] if status != "ok" else "That was your last paid-for spin — use `/slots` again to buy a new pack.",
-                view=None)
-            return None
-        self.used = True
-        self.stop()
-        return info
+            return True
+        return False
 
-    @discord.ui.button(label="Spin once", emoji="🎰", style=discord.ButtonStyle.primary)
-    async def once_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        info = await self._check(interaction)
-        if info is None:
+    async def _spin_once(self, interaction: discord.Interaction) -> None:
+        if await self._blocked(interaction):
+            return
+        status, info = _spin_precheck(self.owner_id)
+        if status != "ok":
+            await interaction.response.send_message(info["msg"], ephemeral=True)
             return
         embed = _perform_spin(self.owner_id, paid=info["paid"], cost=0, day=info["day"])
-        await interaction.response.edit_message(content="🎰 Spun!", view=None)
+        content, view = self._after("🎰 Spun!")
+        await interaction.response.edit_message(content=content, view=view)
         try:
             await interaction.followup.send(embed=embed)
         except discord.HTTPException as exc:
             if _is_discord_block(exc):
                 _note_discord_block("a spin result")
 
-    @discord.ui.button(label="Spin all", emoji="⚡", style=discord.ButtonStyle.success)
-    async def all_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        info = await self._check(interaction)
-        if info is None:
+    async def _spin_all(self, interaction: discord.Interaction) -> None:
+        if await self._blocked(interaction):
             return
-        spins = _batch_spin(self.owner_id, info["day"])
-        await interaction.response.edit_message(content=f"⚡ Spinning {len(spins)} times…", view=None)
-        await _send_batch(interaction, self.owner_id, info["day"], spins)
-
-
-class BonusSpinConfirmView(discord.ui.View):
-    """Private 'are you sure?' shown before a bonus PACK costs points.
-    Lives in memory only (30s) -- if it expires, nothing is charged."""
-
-    def __init__(self, owner_id: int, balance: int, bonus_left: int) -> None:
-        super().__init__(timeout=30)
-        self.owner_id = owner_id
-        self.used = False
-        self.summary = (
-            f"💰 **Bonus pack** — **{SLOTS_PACK_SPINS} spins for {pfmt(SLOTS_PACK_COST)}**.\n"
-            f"You have {pcompact(balance, True)} · **{bonus_left}/{SLOTS_PAID_SPINS}** bonus spins left today.\n"
-            f"Buy the pack and take your first spin?"
-        )
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("This isn't your spin 🐾", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(label=f"Buy pack ({pamt(SLOTS_PACK_COST)})", emoji="🎰", style=discord.ButtonStyle.success)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.used:
-            await interaction.response.send_message("Already handled!", ephemeral=True)
-            return
-        self.used = True
-        self.stop()
-        blocked = gamblin_block_text("`/slots`")
-        if blocked:
-            await interaction.response.edit_message(content=blocked, view=None)
-            return
-        if not POINTS.ready:
-            await interaction.response.edit_message(content=_POINTS_UNAVAILABLE, view=None)
-            return
-        # Re-check everything: things may have changed while the prompt was open.
         status, info = _spin_precheck(self.owner_id)
         if status != "ok":
-            await interaction.response.edit_message(content=info["msg"], view=None)
+            await interaction.response.send_message(info["msg"], ephemeral=True)
             return
-        embed = _perform_spin(self.owner_id, paid=info["paid"], cost=info["cost"], day=info["day"])
-        await interaction.response.edit_message(content="🎰 Spun!", view=None)
-        try:
-            await interaction.followup.send(embed=embed)
-        except discord.HTTPException:
-            logger.warning("Couldn't post the confirmed spin result (points were still applied).")
+        spins = _batch_spin(self.owner_id, info["day"])
+        content, view = self._after(f"⚡ Spun {len(spins)} times!")
+        await interaction.response.edit_message(content=content, view=view)
+        await _send_batch(interaction, self.owner_id, info["day"], spins)
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.used = True
-        self.stop()
-        await interaction.response.edit_message(
-            content=f"Cancelled — no {PTS_NAME} spent. 🐾", view=None
-        )
-
-    async def on_timeout(self) -> None:
-        self.used = True  # nothing charged; the buttons just go dead
+    async def _buy(self, interaction: discord.Interaction) -> None:
+        day = _day_info()[0]
+        err = _pack_buy_error(self.owner_id, day)                       # re-checked now: things may have changed since the panel was shown
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        _buy_pack(self.owner_id, day)                                   # adds the spins; nothing is spun yet
+        content, view = self._after(f"✅ Bonus pack bought: **+{SLOTS_PACK_SPINS} spins** (−{pfmt(SLOTS_PACK_COST)}).")
+        await interaction.response.edit_message(content=content, view=view)
 
 
 @bot.tree.command(name="slots", description=f"Spin the slot machine and win {PTS_NAME}.")
@@ -4014,24 +4013,18 @@ async def slots_slash(interaction: discord.Interaction):
 
     uid = interaction.user.id
     status, info = _spin_precheck(uid)
+    if status == "empty":
+        # Out of spins but a pack can be bought: show the panel. Buying only adds spins; they spin them when they choose.
+        await interaction.response.send_message(_slots_panel_text(uid, info["day"], info["msg"]), view=SlotsPanelView(uid), ephemeral=True)
+        return
     if status != "ok":
         await interaction.response.send_message(info["msg"], ephemeral=True)
         return
 
-    if info["cost"]:
-        # Buying a pack costs points -> ask first. Nothing is charged until they confirm.
-        bonus_left = SLOTS_PAID_SPINS - POINTS.used(uid, info["day"])[1]
-        view = BonusSpinConfirmView(uid, POINTS.points(uid), bonus_left)
-        await interaction.response.send_message(view.summary, view=view, ephemeral=True)
-        return
-
     ready = _batch_count(uid, info["day"])
     if ready >= 2:
-        # Several spins are ready: offer to take them all in one go.
-        await interaction.response.send_message(
-            f"🎰 You have **{ready} spins** ready. Spin once, or all {ready} at once?",
-            view=SlotsChoiceView(uid, ready), ephemeral=True,
-        )
+        # Several spins are ready: spin once, spin all, or buy another pack.
+        await interaction.response.send_message(_slots_panel_text(uid, info["day"]), view=SlotsPanelView(uid), ephemeral=True)
         return
 
     embed = _perform_spin(uid, paid=info["paid"], cost=0, day=info["day"])
@@ -4076,7 +4069,7 @@ async def points_slash(interaction: discord.Interaction, user: discord.Member | 
             name="🎰 Spins today",
             value=(
                 f"Free: **{SLOTS_FREE_SPINS - free_used}/{SLOTS_FREE_SPINS}** left · "
-                f"Bonus ({SLOTS_PACK_SPINS}-spin pack for {pfmt(SLOTS_PACK_COST)}): **{SLOTS_PAID_SPINS - bonus_used}/{SLOTS_PAID_SPINS}** left\n"
+                f"Bonus: **{_bonus_banked(uid, day)}** ready · {_packs_left(uid, day)} pack{'s' if _packs_left(uid, day) != 1 else ''} left to buy ({SLOTS_PACK_SPINS} spins for {pfmt(SLOTS_PACK_COST)})\n"
                 f"Resets in {_format_wait(secs)}."
             ),
             inline=False,
@@ -4647,10 +4640,10 @@ async def help_slash(interaction: discord.Interaction):
         name=f"🎰 Slots & {PTS_CAP}",
         value=(
             f"`/slots` — spin for {PTS_NAME}: **{SLOTS_FREE_SPINS} free spins a day**, then up to "
-            f"{SLOTS_PAID_SPINS} bonus spins ({SLOTS_PACK_SPINS}-spin packs for {pfmt(SLOTS_PACK_COST)}). "
+            f"{SLOTS_PAID_SPINS} bonus spins ({SLOTS_PACK_SPINS}-spin packs for {pfmt(SLOTS_PACK_COST)}; buying a pack only adds the spins). "
             f"Every {SLOTS_JACKPOT_PITY_AT}th spin without a 777 **is** a 777! Spin one or all at once.\n"
             f"Match all 3 to win: {payout_line}\n"
-            "`/points` — your balance, rank and spins left · `/inspect user:<member>` — a profile card (yours by default) · `/customize` — pick your favourite game for it\n"
+            "`/points` — your balance, rank and spins left · `/inspect user:<member>` — a profile card (yours by default) · `/customize` — pick your favourite game and card colour\n"
             f"`/daily` — claim free {PTS_NAME} every day; a streak makes it bigger (+{DAILY_WEEK_BONUS} bonus every 7th day!)"
             + (f" Missed a day? Streak insurance can restore it for {STREAK_INSURANCE_PERCENT}% of your balance (you always see the fee first).\n" if STREAK_INSURANCE_PERCENT else "\n")
             + "`/redeem code:<code>` — redeem a code for a reward (once per person)\n"
@@ -4664,9 +4657,9 @@ async def help_slash(interaction: discord.Interaction):
         name="🎲 Gamblin, Lottery & Shop",
         value=(
             "`/gamblinstats` — your Gamblin record + the hall of fame\n"
-            "`/lottery` — pick 3 numbers for the daily draw (rollover jackpot)\n"
+            f"`/lottery` — buy tickets for the nightly draw: one winner takes the whole pot ({pamt(LOTTERY_COST)} a ticket)\n"
             f"`/shop` — buy daily cards, slot machines, 777 announcements, titles & more with {PTS_NAME} (preview first!)\n"
-            f"Bonus packs ask for confirmation before spending {PTS_NAME}\n"
+            "Bonus packs: buy them in `/slots`, then spin when you like\n"
             "🎲 Managers sometimes run **Gamblin** nights (slots, blackjack, duck race & roulette) — watch for the @everyone ping!"
         ),
         inline=False,
@@ -7787,7 +7780,7 @@ def _reset_announce_embed() -> discord.Embed:
     lines = [
         f"🎁 `/daily` — claim your free {PTS_NAME} and keep your streak going 🔥",
         f"🎰 `/slots` — your **{SLOTS_FREE_SPINS} free spins** are back (bonus packs too)",
-        "🎟️ `/lottery` — a fresh draw is open: pick 3 numbers and chase the jackpot",
+        "🎟️ `/lottery` — a new draw is open: buy tickets, one winner takes the whole pot",
         ask,
         f"💸 `/pay` — your {pamt(PAY_DAILY_CAP)} sending limit is back",
     ]
@@ -7837,78 +7830,107 @@ async def _daily_reset_announcer() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 🎟️ DAILY LOTTERY -- /lottery
+# 🎟️ DAILY LOTTERY -- /lottery  (a raffle: everybody buys tickets, ONE winner takes the whole pot)
 #
-# Pick 3 numbers from 1-15. Tickets for "today" are drawn at the daily reset (12:00 AM,
-# LIMIT_RESET_TZ). Matches: 3 = the (rollover) JACKPOT, split between winners;
-# 2 = LOTTERY_PRIZE_2; 1 = your ticket back. Tickets + the jackpot are saved to the
-# database; if Milo is offline at midnight the draw happens when it comes back.
-# Lottery prizes move balances only (they don't count for the leaderboard).
+# Every ticket is one entry in tonight's draw (12:00 AM, LIMIT_RESET_TZ). The pot is every ticket sold
+# (tickets x LOTTERY_TICKET_COST) plus anything rolled over from earlier draws. One ticket is drawn at
+# random, so more tickets = better odds. To keep it a gamble, 2 or 3 EMPTY tickets are mixed into every
+# draw; if one of them comes up, nobody wins and the pot rolls over to tomorrow. That chance is capped
+# (LOTTERY_NOWIN_MAX_PERCENT, default 15%), so it stays rare. With fewer than LOTTERY_MIN_PLAYERS players
+# there is no draw and everybody is refunded. Tickets + the pot are saved to the database; if Milo is
+# offline at midnight the draw happens when it comes back. Prizes move balances only (not the leaderboard).
 # ---------------------------------------------------------------------------
-def _lottery_nums(nums) -> str:
-    return " · ".join(f"{n:02d}" for n in sorted(nums))
+LOTTERY_EMPTY_TICKETS = (2, 3)                               # how many empty tickets are mixed in (picked at random per draw)
+LOTTERY_NOWIN_MAX = min(50, max(0, _env_int("LOTTERY_NOWIN_MAX_PERCENT", 15))) / 100
+LOTTERY_MIN_PLAYERS = max(1, _env_int("LOTTERY_MIN_PLAYERS", 2))
 
 
-def _lottery_chance(k: int) -> float:
-    """Chance a single ticket matches exactly k of the 3 drawn numbers."""
-    return math.comb(LOTTERY_PICKS, k) * math.comb(LOTTERY_RANGE - LOTTERY_PICKS, LOTTERY_PICKS - k) / math.comb(LOTTERY_RANGE, LOTTERY_PICKS)
+def _lottery_pot(day: str) -> int:
+    return POINTS.tickets_sold(day) * LOTTERY_COST + POINTS.lottery["carry"]
+
+
+def _lottery_nowin_chance(sold: int, ghosts: float = sum(LOTTERY_EMPTY_TICKETS) / len(LOTTERY_EMPTY_TICKETS)) -> float:
+    """Chance that an EMPTY ticket comes up (so nobody wins), for a draw with `sold` real tickets."""
+    return min(LOTTERY_NOWIN_MAX, ghosts / (sold + ghosts)) if sold else 0.0
 
 
 def _lottery_embed(uid: int) -> discord.Embed:
     day = _day_info()[0]
-    mine = POINTS.tickets.get(day, {}).get(uid, {})
+    sold, players = POINTS.tickets_sold(day), len(POINTS.tickets.get(day, {}))
+    mine = POINTS.ticket_count(uid, day)
     e = discord.Embed(
-        title="🎟️ Daily Lottery",
+        title="🎟️ Daily Lottery", color=discord.Color.gold(),
         description=(
-            f"Pick **{LOTTERY_PICKS} numbers from 1–{LOTTERY_RANGE}**. The draw is every night at 12:00 AM ({LIMIT_RESET_TZ}).\n"
-            f"A ticket costs {pfmt(LOTTERY_COST)} · up to **{LOTTERY_MAX_TICKETS}** per person per draw."
-        ),
-        color=discord.Color.gold(),
-    )
-    e.add_field(name=f"💰 Jackpot ({LOTTERY_PICKS} matches)", inline=False,
-                value=f"**{pfmt(POINTS.lottery['carry'])}** — split between winners. Nobody wins? It keeps growing!")
-    e.add_field(name="🏅 Other prizes", inline=False,
-                value=f"2 matches → **{pfmt(LOTTERY_PRIZE_2)}**\n1 match → your ticket back ({pfmt(LOTTERY_COST)})")
-    p1, p2, p3 = (_lottery_chance(k) for k in (1, 2, 3))
-    e.add_field(name="📊 Odds per ticket", inline=False,
-                value=f"Win something: **{(p1 + p2 + p3) * 100:.0f}%** · 2+ matches: **{(p2 + p3) * 100:.1f}%** · jackpot: **1 in {round(1 / p3):,}**")
-    lines = [f"`{_lottery_nums(p)}`" for _, p in sorted(mine.items())]
-    e.add_field(name=f"🎫 Your tickets tonight ({len(mine)}/{LOTTERY_MAX_TICKETS})", inline=False,
-                value="\n".join(lines) or "None yet — buy one below!")
-    e.add_field(name="🧾 Sold tonight", value=f"{POINTS.tickets_sold(day):,} tickets")
+            f"Buy tickets — **one winner takes the whole pot**. More tickets, better chance.\n"
+            f"The draw is every night at 12:00 AM ({LIMIT_RESET_TZ}). A ticket costs {pfmt(LOTTERY_COST)} · "
+            f"up to **{LOTTERY_MAX_TICKETS}** per person per draw.\n"
+            f"A few empty tickets are mixed in, so now and then nobody wins and the pot rolls over."
+        ))
+    e.add_field(name="💰 Pot right now", value=f"**{pfmt(_lottery_pot(day))}**" + (f"\n({pamt(POINTS.lottery['carry'])} rolled over)" if POINTS.lottery["carry"] else ""))
+    e.add_field(name="🎫 Tickets sold", value=f"**{sold:,}** from {players} player{'s' if players != 1 else ''}")
+    chance = (mine / sold) * (1 - _lottery_nowin_chance(sold)) if sold else 0.0
+    e.add_field(name=f"Your tickets ({mine}/{LOTTERY_MAX_TICKETS})", inline=False,
+                value=(f"You hold **{mine}** — about **{chance * 100:.0f}%** to win tonight's pot." if mine else "You have none yet — grab one below!"))
+    if players < LOTTERY_MIN_PLAYERS:
+        e.add_field(name="Heads up", inline=False, value=f"It takes at least {LOTTERY_MIN_PLAYERS} players to run the draw. With fewer, everyone is refunded.")
     last = POINTS.lottery.get("last")
-    if last:
-        winners = " ".join(f"<@{u}>" for u in last.get("top", [])) or "nobody"
-        e.add_field(name=f"🎱 Last draw ({last['day']})", inline=False,
-                    value=f"Numbers: **{_lottery_nums(last['nums'])}** · {last['tickets']:,} tickets\nJackpot: {winners if last['w3'] else 'no winner — it rolled over'} · 2 matches: {last['w2']} · 1 match: {last['w1']}")
-    e.set_footer(text=f"Tickets cost {pamt(LOTTERY_COST)} · the jackpot restarts at {pamt(LOTTERY_SEED)} after a win")
+    if isinstance(last, dict) and last.get("kind"):
+        if last["kind"] == "win":
+            text = f"<@{last['winner']}> won **{pfmt(last['pot'])}** ({last['tickets']:,} tickets, {last['players']} players)"
+        elif last["kind"] == "nowin":
+            text = f"An empty ticket came up — nobody won, the pot rolled over to **{pfmt(last['carry'])}**"
+        else:
+            text = "Not enough players — everyone was refunded"
+        e.add_field(name=f"Last draw ({last['day']})", value=text, inline=False)
+    e.set_footer(text=f"Prizes never count for the leaderboard · {pamt(LOTTERY_COST)} per ticket")
     return e
 
 
-def _lottery_buy_error(uid: int) -> str | None:
+def _lottery_max_qty(uid: int) -> int:
+    day = _day_info()[0]
+    return max(0, min(LOTTERY_MAX_TICKETS - POINTS.ticket_count(uid, day), POINTS.points(uid) // LOTTERY_COST))
+
+
+def _lottery_buy_error(uid: int, qty: int = 1) -> str | None:
     if not POINTS.ready:
         return _POINTS_UNAVAILABLE
     blocked = frozen_block(uid) or gamblin_block_text("`/lottery`")
     if blocked:
         return blocked
-    if POINTS.ticket_count(uid, _day_info()[0]) >= LOTTERY_MAX_TICKETS:
+    mine = POINTS.ticket_count(uid, _day_info()[0])
+    if mine >= LOTTERY_MAX_TICKETS:
         return f"🎟️ You already have {LOTTERY_MAX_TICKETS} tickets for tonight's draw — good luck!"
-    if POINTS.points(uid) < LOTTERY_COST:
-        return f"🎟️ A ticket costs {pfmt(LOTTERY_COST)} and you have {pamt(POINTS.points(uid))}."
+    if mine + qty > LOTTERY_MAX_TICKETS:
+        return f"🎟️ You can only hold {LOTTERY_MAX_TICKETS} tickets per draw (you have {mine})."
+    if POINTS.points(uid) < LOTTERY_COST * qty:
+        return f"🎟️ {qty} ticket{'s' if qty != 1 else ''} cost{'' if qty != 1 else 's'} {pfmt(LOTTERY_COST * qty)} and you have {pamt(POINTS.points(uid))}."
     return None
 
 
-def _lottery_buy(uid: int, picks) -> None:
-    """Instant memory work (no awaits): takes the cost, records the ticket, grows the jackpot."""
-    POINTS.buy_ticket(uid, _day_info()[0], tuple(sorted(picks)), LOTTERY_COST, LOTTERY_CUT)
+def _lottery_buy(uid: int, qty: int) -> None:
+    """Take the money and record the tickets. Instant memory work (no awaits), saved with the next autosave."""
+    day = _day_info()[0]
+    for _ in range(qty):
+        POINTS.buy_ticket(uid, day, (0, 0, 0), LOTTERY_COST, 0)         # a ticket is just an entry; (0,0,0) keeps the saved format
 
 
 class LotteryMenuView(discord.ui.View):
-    """The main /lottery panel: buy a ticket by picking numbers, or take a random one."""
+    """Buy 1 / 5 / max tickets. Re-checked at click time; the panel refreshes after every buy."""
 
     def __init__(self, owner_id: int) -> None:
-        super().__init__(timeout=180)
+        super().__init__(timeout=300)
         self.owner_id = owner_id
+        room = _lottery_max_qty(owner_id)
+        sizes = [q for q in (1, 5) if q <= room]
+        if room >= 2 and room not in sizes:
+            sizes.append(room)
+        for q in sizes:
+            b = discord.ui.Button(label=(f"Buy max ({q})" if q == room and q not in (1, 5) else f"Buy {q}"), emoji="🎟️",
+                                  style=discord.ButtonStyle.success if q == 1 else discord.ButtonStyle.primary)
+            b.callback = self._buyer(q)
+            self.add_item(b)
+        if not sizes:
+            self.add_item(discord.ui.Button(label="No more tickets to buy", disabled=True, style=discord.ButtonStyle.secondary))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
@@ -7916,106 +7938,20 @@ class LotteryMenuView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Pick my numbers", emoji="🎟️", style=discord.ButtonStyle.success)
-    async def pick(self, interaction: discord.Interaction, button: discord.ui.Button):
-        err = _lottery_buy_error(self.owner_id)
-        if err:
-            await interaction.response.send_message(err, ephemeral=True)
-            return
-        await interaction.response.edit_message(content=f"🎟️ **Pick {LOTTERY_PICKS} numbers** (1–{LOTTERY_RANGE}):", embed=None, view=LotteryPickView(self.owner_id))
-
-    @discord.ui.button(label="Quick pick", emoji="🎲", style=discord.ButtonStyle.primary)
-    async def quick(self, interaction: discord.Interaction, button: discord.ui.Button):
-        err = _lottery_buy_error(self.owner_id)
-        if err:
-            await interaction.response.send_message(err, ephemeral=True)
-            return
-        picks = sorted(random.sample(range(1, LOTTERY_RANGE + 1), LOTTERY_PICKS))
-        _lottery_buy(self.owner_id, picks)
-        await interaction.response.edit_message(
-            content=f"🎲 Quick pick bought: **{_lottery_nums(picks)}** (−{pfmt(LOTTERY_COST)}). Good luck! 🍀",
-            embed=_lottery_embed(self.owner_id), view=LotteryMenuView(self.owner_id),
-        )
-
-
-class LotteryPickView(discord.ui.View):
-    """15 number buttons: tap exactly 3, then Buy. (Memory only; nothing is charged until Buy.)"""
-
-    def __init__(self, owner_id: int) -> None:
-        super().__init__(timeout=180)
-        self.owner_id = owner_id
-        self.picks: set[int] = set()
-        self.num_buttons: dict[int, discord.ui.Button] = {}
-        for n in range(1, LOTTERY_RANGE + 1):
-            b = discord.ui.Button(label=str(n), style=discord.ButtonStyle.secondary, row=(n - 1) // 5)
-            b.callback = self._toggle(n)
-            self.num_buttons[n] = b
-            self.add_item(b)
-        self.rand = discord.ui.Button(label="Random", emoji="🎲", style=discord.ButtonStyle.primary, row=3)
-        self.rand.callback = self._random
-        self.clear = discord.ui.Button(label="Clear", style=discord.ButtonStyle.secondary, row=3)
-        self.clear.callback = self._clear
-        self.buy = discord.ui.Button(label=f"Buy ({pamt(LOTTERY_COST)})", emoji="✅", style=discord.ButtonStyle.success, row=3, disabled=True)
-        self.buy.callback = self._buy
-        for b in (self.rand, self.clear, self.buy):
-            self.add_item(b)
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("Open your own with `/lottery` 🐾", ephemeral=True)
-            return False
-        return True
-
-    def _text(self) -> str:
-        chosen = _lottery_nums(self.picks) if self.picks else "—"
-        return f"🎟️ **Pick {LOTTERY_PICKS} numbers** (1–{LOTTERY_RANGE}): **{chosen}** ({len(self.picks)}/{LOTTERY_PICKS})"
-
-    def _refresh(self) -> None:
-        for n, b in self.num_buttons.items():
-            b.style = discord.ButtonStyle.success if n in self.picks else discord.ButtonStyle.secondary
-        self.buy.disabled = len(self.picks) != LOTTERY_PICKS
-
-    def _toggle(self, n: int):
+    def _buyer(self, qty: int):
         async def callback(interaction: discord.Interaction) -> None:
-            if n in self.picks:
-                self.picks.discard(n)
-            elif len(self.picks) < LOTTERY_PICKS:
-                self.picks.add(n)
-            else:
-                await interaction.response.send_message(f"You already picked {LOTTERY_PICKS} — tap one to unselect it first.", ephemeral=True)
+            err = _lottery_buy_error(self.owner_id, qty)
+            if err:
+                await interaction.response.send_message(err, ephemeral=True)
                 return
-            self._refresh()
-            await interaction.response.edit_message(content=self._text(), view=self)
+            _lottery_buy(self.owner_id, qty)
+            await interaction.response.edit_message(
+                content=f"✅ Bought **{qty}** ticket{'s' if qty != 1 else ''} (−{pfmt(LOTTERY_COST * qty)}). Good luck! 🍀",
+                embed=_lottery_embed(self.owner_id), view=LotteryMenuView(self.owner_id))
         return callback
 
-    async def _random(self, interaction: discord.Interaction) -> None:
-        self.picks = set(random.sample(range(1, LOTTERY_RANGE + 1), LOTTERY_PICKS))
-        self._refresh()
-        await interaction.response.edit_message(content=self._text(), view=self)
 
-    async def _clear(self, interaction: discord.Interaction) -> None:
-        self.picks = set()
-        self._refresh()
-        await interaction.response.edit_message(content=self._text(), view=self)
-
-    async def _buy(self, interaction: discord.Interaction) -> None:
-        err = _lottery_buy_error(self.owner_id)
-        if err:
-            await interaction.response.send_message(err, ephemeral=True)
-            return
-        if len(self.picks) != LOTTERY_PICKS:
-            await interaction.response.send_message(f"Pick exactly {LOTTERY_PICKS} numbers first.", ephemeral=True)
-            return
-        picks = sorted(self.picks)
-        _lottery_buy(self.owner_id, picks)
-        self.stop()
-        await interaction.response.edit_message(
-            content=f"✅ Ticket bought: **{_lottery_nums(picks)}** (−{pfmt(LOTTERY_COST)}). Good luck! 🍀",
-            embed=_lottery_embed(self.owner_id), view=LotteryMenuView(self.owner_id),
-        )
-
-
-@bot.tree.command(name="lottery", description="Daily lottery — pick 3 numbers, the draw is at midnight!")
+@bot.tree.command(name="lottery", description="Daily lottery — buy tickets, one winner takes the whole pot at midnight!")
 async def lottery_slash(interaction: discord.Interaction):
     if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
         await interaction.response.send_message("This bot is not configured for this server.", ephemeral=True)
@@ -8025,48 +7961,44 @@ async def lottery_slash(interaction: discord.Interaction):
         return
     await interaction.response.send_message(
         embed=_lottery_embed(interaction.user.id), view=LotteryMenuView(interaction.user.id), ephemeral=True,
-        allowed_mentions=discord.AllowedMentions.none(),
     )
 
 
-def _lottery_draw(day: str) -> dict | None:
-    """Draw the numbers for one day's tickets and pay everyone. Instant memory work.
+def _lottery_draw(day: str, rng: random.Random | None = None) -> dict | None:
+    """Draw one day's raffle and pay the winner. Instant memory work.
     Returns the result, or None if there was nothing to draw (or it was already drawn)."""
+    rng = rng or random
     state = POINTS.lottery
     if state["drawn"] >= day:
         return None
-    tickets = POINTS.tickets.get(day, {})
-    total = sum(len(v) for v in tickets.values())
+    tickets = {u: len(v) for u, v in POINTS.tickets.get(day, {}).items() if v}
+    total = sum(tickets.values())
     if total == 0:
         POINTS.finish_lottery(day, state["carry"], None)
         return None
-    nums = sorted(random.sample(range(1, LOTTERY_RANGE + 1), LOTTERY_PICKS))
-    winning = set(nums)
-    prizes: dict[int, int] = {}
-    jackpot_tickets: list[int] = []
-    n2 = n1 = 0
-    for uid, mine in tickets.items():
-        for picks in mine.values():
-            matched = len(winning & set(picks))
-            if matched == LOTTERY_PICKS:
-                jackpot_tickets.append(uid)
-            elif matched == 2:
-                prizes[uid] = prizes.get(uid, 0) + LOTTERY_PRIZE_2
-                n2 += 1
-            elif matched == 1:
-                prizes[uid] = prizes.get(uid, 0) + LOTTERY_COST
-                n1 += 1
-    carry, paid = state["carry"], 0
-    if jackpot_tickets:
-        share = carry // len(jackpot_tickets)
-        for uid in jackpot_tickets:
-            prizes[uid] = prizes.get(uid, 0) + share
-        paid = share * len(jackpot_tickets)
-        carry = LOTTERY_SEED + (carry - paid)                   # restart (any leftover coins stay in)
-    for uid, amount in prizes.items():
-        POINTS.add_balance(uid, amount)
-    result = {"day": day, "nums": nums, "tickets": total, "w3": len(jackpot_tickets), "w2": n2, "w1": n1,
-              "jackpot": paid, "carry": carry, "top": sorted(set(jackpot_tickets))[:10]}
+    carry = state["carry"]
+    base = {"day": day, "tickets": total, "players": len(tickets), "winner": 0, "winner_tickets": 0, "ghosts": 0}
+    if len(tickets) < LOTTERY_MIN_PLAYERS:                                 # not enough people: give everything back
+        for uid, n in tickets.items():
+            POINTS.add_balance(uid, n * LOTTERY_COST)
+        result = dict(base, kind="refund", pot=0, carry=carry)
+    else:
+        ghosts = rng.choice(LOTTERY_EMPTY_TICKETS)
+        pot = total * LOTTERY_COST + carry
+        if rng.random() < min(LOTTERY_NOWIN_MAX, ghosts / (total + ghosts)):   # an empty ticket came up: nobody wins
+            carry = pot
+            result = dict(base, kind="nowin", pot=pot, carry=carry, ghosts=ghosts)
+        else:
+            pick = rng.randrange(total)                                    # one real ticket, every ticket equally likely
+            winner = 0
+            for uid, n in sorted(tickets.items()):
+                if pick < n:
+                    winner = uid
+                    break
+                pick -= n
+            POINTS.add_balance(winner, pot)
+            carry = LOTTERY_SEED
+            result = dict(base, kind="win", pot=pot, carry=carry, winner=winner, winner_tickets=tickets[winner], ghosts=ghosts)
     POINTS.finish_lottery(day, carry, result)
     POINTS.tickets.pop(day, None)
     return result
@@ -8074,14 +8006,14 @@ def _lottery_draw(day: str) -> dict | None:
 
 def _lottery_result_embed(r: dict) -> discord.Embed:
     e = discord.Embed(title=f"🎟️ Lottery draw — {r['day']}", color=discord.Color.gold())
-    lines = [f"🎱 **{_lottery_nums(r['nums'])}**", f"{r['tickets']:,} ticket{'s' if r['tickets'] != 1 else ''} {'were' if r['tickets'] != 1 else 'was'} played.", ""]
-    if r["w3"]:
-        lines.append(f"🏆 **JACKPOT!** {' '.join(f'<@{u}>' for u in r['top'])} won **{pfmt(r['jackpot'])}**"
-                     + (f" ({r['w3']} winning tickets, shared)" if r["w3"] > 1 else "") + " 🎉")
+    lines = [f"{r['tickets']:,} ticket{'s' if r['tickets'] != 1 else ''} from {r['players']} player{'s' if r['players'] != 1 else ''} went into the draw."]
+    if r["kind"] == "win":
+        lines.append(f"\n🏆 <@{r['winner']}> won the whole pot: **{pfmt(r['pot'])}** 🎉")
+        lines.append(f"They held {r['winner_tickets']} of {r['tickets']} tickets.")
+    elif r["kind"] == "nowin":
+        lines.append(f"\n🫥 An **empty ticket** came up — nobody wins tonight!\nThe pot rolls over: **{pfmt(r['carry'])}** is up for grabs tomorrow.")
     else:
-        lines.append(f"No jackpot winner — it rolls over to **{pfmt(r['carry'])}**!")
-    lines.append(f"🥈 2 matches: **{r['w2']}** ticket{'s' if r['w2'] != 1 else ''} × {pfmt(LOTTERY_PRIZE_2)}")
-    lines.append(f"🥉 1 match: **{r['w1']}** ticket{'s' if r['w1'] != 1 else ''} refunded")
+        lines.append(f"\nNot enough players (at least {LOTTERY_MIN_PLAYERS} needed), so everybody got their {PTS_NAME} back.")
     lines.append("\nNew tickets are on sale now — `/lottery`!")
     e.description = "\n".join(lines)
     return e
@@ -8100,15 +8032,15 @@ async def _post_lottery_result(r: dict) -> None:
             channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
             await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
         await _retry_discord(send, "the lottery result post")
-    await log_event(f"🎟️ Lottery {r['day']}: numbers {_lottery_nums(r['nums'])}, {r['tickets']} tickets, "
-                    f"{r['w3']} jackpot / {r['w2']} two-match / {r['w1']} one-match winners, jackpot now {pamt(r['carry'])}.")
+    await log_event(f"🎟️ Lottery {r['day']}: {r['kind']} — {r['tickets']} tickets, {r['players']} players, pot {pamt(r['pot'])}"
+                    + (f", winner <@{r['winner']}>" if r["kind"] == "win" else "") + f", rollover now {pamt(r['carry'])}.")
 
 
 async def _lottery_settle(day: str) -> None:
     result = _lottery_draw(day)
     if result is None:
         return
-    await POINTS.flush("lottery draw")          # prizes + the new jackpot are saved right away
+    await POINTS.flush("lottery draw")          # prizes + the new pot are saved right away
     await _post_lottery_result(result)
 
 
@@ -8129,7 +8061,6 @@ async def _lottery_loop() -> None:
             await _lottery_settle(ended)
             continue
         await asyncio.sleep(max(0.5, min(secs, 30)))
-
 
 
 # ---------------------------------------------------------------------------
@@ -8372,6 +8303,8 @@ EXTRA_KEY_LIMITED = "milo:shop:limited"
 EXTRA_KEY_DAILYG = "milo:gamblin:daily"
 EXTRA_KEY_SEASON = "milo:season:state"
 EXTRA_KEY_SEASON_HIST = "milo:season:history"
+EXTRA_KEY_COLOR = "milo:profile:color"        # HASH user id -> colour key from PROFILE_COLORS; absent = default blurple
+EXTRA_KEY_PACKS = "milo:slots:packs"          # STRING JSON {"day": "YYYY-MM-DD", "bought": {user id: bonus spins bought today}}
 EXTRA_KEY_FAV = "milo:profile:fav"            # HASH user id -> game kind (slots / bj / duck / roulette); absent = auto (most played)
 
 # Permanent default codes. They live in code (so they can never be lost or expire) and
@@ -8439,6 +8372,8 @@ class ExtraData:
         self.season: dict = {"name": "", "num": SEASON_DEFAULT_NUM, "started": 0, "baseline": {}}
         self.history: list[dict] = []
         self.fav: dict[int, str] = {}                    # /customize: favourite game shown on /inspect
+        self.color: dict[int, str] = {}                  # /customize: sidebar colour of the /inspect card
+        self.packs: dict = {"day": "", "bought": {}}     # bonus spins bought today (see _packs_bought)
         self._dirty: dict[str, str] = {}                 # key -> value that still has to be SET in Upstash
         self._lock = asyncio.Lock()                      # serialises redeems and manager edits
         self._daily_lock = asyncio.Lock()
@@ -8487,6 +8422,7 @@ class ExtraData:
         res = await store.pipeline([
             ["HGETALL", EXTRA_KEY_CODES], ["HGETALL", EXTRA_KEY_LIMITED], ["GET", EXTRA_KEY_DAILYG],
             ["GET", EXTRA_KEY_SEASON], ["GET", EXTRA_KEY_SEASON_HIST], ["HGETALL", EXTRA_KEY_FAV],
+            ["HGETALL", EXTRA_KEY_COLOR], ["GET", EXTRA_KEY_PACKS],
         ])
         for item in res:
             if not isinstance(item, dict) or "error" in item:
@@ -8532,6 +8468,14 @@ class ExtraData:
             except (TypeError, ValueError):
                 logger.warning("Ignoring an unreadable season history in the database")
         self.fav = {int(u): k for u, k in _flat_pairs(res[5].get("result")) if str(u).isdigit() and k in GAMBLIN_GAMES}
+        self.color = {int(u): k for u, k in _flat_pairs(res[6].get("result")) if str(u).isdigit() and k in PROFILE_COLORS}
+        if EXTRA_KEY_PACKS not in self._dirty and res[7].get("result"):
+            try:
+                parsed = json.loads(res[7]["result"])
+                if isinstance(parsed, dict) and isinstance(parsed.get("bought"), dict):
+                    self.packs = {"day": str(parsed.get("day", "")), "bought": {str(k): int(v) for k, v in parsed["bought"].items()}}
+            except (TypeError, ValueError):
+                logger.warning("Ignoring unreadable bonus-pack data in the database")
         names = list(DEFAULT_REDEEM_CODES) + list(codes)
         used_res = await store.pipeline([["SMEMBERS", EXTRA_KEY_USED + n] for n in names])
         used: dict[str, set[int]] = {}
@@ -8630,6 +8574,31 @@ class ExtraData:
             else:
                 self.fav[uid] = kind
         return None
+
+    async def set_color(self, uid: int, key: str | None) -> str | None:
+        """Save (or clear, with None = default) the /inspect card colour. Returns an error text or None."""
+        async with self._lock:
+            if self.store is not None:
+                try:
+                    if key is None:
+                        await self.store._cmd("HDEL", EXTRA_KEY_COLOR, str(uid))
+                    else:
+                        await self.store._cmd("HSET", EXTRA_KEY_COLOR, str(uid), key)
+                except StoreError as exc:
+                    return f"I couldn't save that right now ({exc}). Nothing changed."
+            if key is None:
+                self.color.pop(uid, None)
+            else:
+                self.color[uid] = key
+        return None
+
+    def set_bought(self, uid: int, day: str, total: int) -> None:
+        """Record how many bonus spins this person has bought today. Memory now; saved with the next autosave
+        (together with the balance change that paid for it, so the two can't drift apart)."""
+        if self.packs.get("day") != day:
+            self.packs = {"day": day, "bought": {}}
+        self.packs["bought"][str(uid)] = total
+        self._dirty[EXTRA_KEY_PACKS] = json.dumps(self.packs, separators=(",", ":"))
 
     # ---- redeem codes ---------------------------------------------------------------------------
     async def add_code(self, code: str, rewards: list[str], expires: int, by: int) -> str | None:
@@ -9330,7 +9299,29 @@ def _favourite_game(uid: int) -> str | None:
     return f"{emoji} {label}" + (f"\n{plays:,} played" if plays else "")
 
 
+# Sidebar colours for the /inspect card (picked in /customize). key -> (label, swatch, (r, g, b))
+PROFILE_COLORS: dict[str, tuple[str, str, tuple[int, int, int]]] = {
+    "blurple": ("Blurple (default)", "💠", (88, 101, 242)),
+    "red": ("Red", "🟥", (237, 66, 69)),
+    "orange": ("Orange", "🟧", (250, 140, 40)),
+    "gold": ("Gold", "🟨", (255, 200, 0)),
+    "green": ("Green", "🟩", (67, 181, 129)),
+    "teal": ("Teal", "🩵", (32, 178, 170)),
+    "blue": ("Blue", "🟦", (52, 120, 246)),
+    "purple": ("Purple", "🟪", (155, 89, 182)),
+    "pink": ("Pink", "🌸", (255, 105, 180)),
+    "white": ("White", "⬜", (240, 240, 240)),
+}
+
+
+def _profile_color(uid: int) -> discord.Color:
+    key = EXTRAS.color.get(uid)
+    return discord.Color.from_rgb(*PROFILE_COLORS[key][2]) if key in PROFILE_COLORS else discord.Color.blurple()
+
+
 class CustomizeView(discord.ui.View):
+    """/customize: favourite game + sidebar colour for your /inspect card. Each choice saves the moment it's picked."""
+
     def __init__(self, owner_id: int) -> None:
         super().__init__(timeout=180)
         self.owner_id = owner_id
@@ -9339,9 +9330,15 @@ class CustomizeView(discord.ui.View):
                                      description="Shows the game you've played the most")]
         for kind, (emoji, label, _) in GAMBLIN_GAMES.items():
             opts.append(discord.SelectOption(label=label, value=kind, emoji=emoji, default=cur == kind))
-        self.select = discord.ui.Select(placeholder="Favourite game…", options=opts)
+        self.select = discord.ui.Select(placeholder="Favourite game…", options=opts, row=0)
         self.select.callback = self._picked
         self.add_item(self.select)
+        cc = EXTRAS.color.get(owner_id, "blurple")
+        self.color_select = discord.ui.Select(
+            placeholder="Profile colour…", row=1,
+            options=[discord.SelectOption(label=label, value=key, emoji=swatch, default=key == cc) for key, (label, swatch, _) in PROFILE_COLORS.items()])
+        self.color_select.callback = self._picked_color
+        self.add_item(self.color_select)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
@@ -9361,8 +9358,18 @@ class CustomizeView(discord.ui.View):
         text = "Saved. Your `/inspect` profile will show: " + (shown.replace("\n", " · ") if shown else "nothing yet (play a game!)")
         await interaction.response.edit_message(content=text, view=self)
 
+    async def _picked_color(self, interaction: discord.Interaction) -> None:
+        value = self.color_select.values[0]
+        err = await EXTRAS.set_color(self.owner_id, None if value == "blurple" else value)
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        for o in self.color_select.options:
+            o.default = o.value == value
+        await interaction.response.edit_message(content=f"Saved. Your `/inspect` card colour is now **{PROFILE_COLORS[value][0]}**.", view=self)
 
-@bot.tree.command(name="customize", description="Customize your /inspect profile (favourite game).")
+
+@bot.tree.command(name="customize", description="Customize your /inspect profile (favourite game and colour).")
 async def customize_slash(interaction: discord.Interaction):
     if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
         await interaction.response.send_message("This bot is not configured for this server.", ephemeral=True)
@@ -9372,9 +9379,11 @@ async def customize_slash(interaction: discord.Interaction):
         return
     uid = interaction.user.id
     cur = _favourite_game(uid)
-    text = ("**Customize your profile**\nPick the game shown as your favourite on `/inspect`. "
-            "Leave it on automatic and Milo shows the game you've played the most.\n"
-            f"Now showing: {cur.replace(chr(10), ' · ') if cur else 'nothing yet'}\n"
+    color = PROFILE_COLORS.get(EXTRAS.color.get(uid, "blurple"), PROFILE_COLORS["blurple"])[0]
+    text = ("**Customize your profile**\n"
+            "Pick the game shown as your favourite on `/inspect` (leave it on automatic and Milo shows the game you've played most), "
+            "and the colour of the card's side bar.\n"
+            f"Favourite now: {cur.replace(chr(10), ' · ') if cur else 'nothing yet'} · Colour: {color}\n"
             "Titles, tags and other looks are equipped in `/shop`.")
     await interaction.response.send_message(text, view=CustomizeView(uid), ephemeral=True)
 
@@ -9391,7 +9400,7 @@ def _profile_embed(target: discord.Member | discord.User) -> discord.Embed:
     line = f"@{target.name}" + (f"  ·  {tag}" if tag else "")
     if title:
         line += f"\n**{title}**"
-    e = discord.Embed(title=target.display_name, description=line, color=discord.Color.blurple())
+    e = discord.Embed(title=target.display_name, description=line, color=_profile_color(uid))
     e.set_thumbnail(url=target.display_avatar.url)                   # avatar: small, top-right
     e.add_field(name="Balance", value=pcompact(POINTS.points(uid), True))
     e.add_field(name=f"Rank · {EXTRAS.season_label()}", value=f"#{rank}" if rank else f"{EXTRAS.season_earned(uid):,}/{LEADERBOARD_MIN_POINTS:,} to join")

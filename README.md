@@ -221,11 +221,11 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 
 | Command | Description |
 |---|---|
-| `/slots` | Spin a 3-reel slot machine for points. **25 free spins a day**, then up to **20 bonus spins** in packs: **5 points buys a pack of 10 spins**. Match all three to win: 7️⃣ 100 · ⭐ 25 · 🍇 12 · 🍉 8 · 🍋 6 · 🍒 4. Every **200th spin since your last 777 is a guaranteed 777**, and a small win is guaranteed after 19 misses. Buying a pack asks you to confirm first. **With 2+ spins ready, Milo asks "spin once, or all N at once?"**; spinning all posts one long result message and then a separate message for each win (every 777 gets its own). 5-second cooldown. Can be limited to certain channels with `SLOTS_CHANNEL_IDS`. |
+| `/slots` | Spin a 3-reel slot machine for points. **25 free spins a day**, then up to **20 bonus spins** in packs: **5 points buys a pack of 10 spins**. **Buying a pack only adds the spins** — nothing spins until you press *Spin once* or *Spin all*, and if another pack is left today a *Buy another pack* button appears. Match all three of any symbol to win; every 200th spin without a 777 is a 777. |
 | `/daily` | Claim free points once a day. Day 1 gives 15 and each consecutive day adds 5 (up to day 7), and **every 7th day in a row adds a +50 bonus**. Miss a day and the streak restarts. Works out to roughly 37 points a day for a perfect streak. |
 | `/pay @user amount` | Send some of your points to another member. You confirm first. A **5% fee is burned** on every payment (rounded up, at least 1), so you pay the amount plus the fee and they get the full amount. There's also a **daily limit of 200 points sent** per person (`PAY_DAILY_CAP`, the fee doesn't count towards it). Not allowed to yourself, to bots, to or from frozen people, or while a Gamblin game runs. |
 | `/shop` | **Buy designs for Milo's messages** with your points: designs, 777 announcement styles and profile titles in 7 independent categories, from 2,500 points. Seasonal items appear only during a limited-time listing. **Preview any of them for free before buying.** Cosmetic only. Section 28. |
-| `/lottery` | **Daily lottery.** Pick 3 numbers from 1–15 (or take a quick pick) for 10 points a ticket, up to 5 tickets a day. The draw is at midnight: 3 matches share the rollover **jackpot**, 2 matches win 4× the ticket, 1 match refunds it. Section 24. |
+| `/lottery` | **Daily lottery (raffle).** Buy tickets (10 points each, up to 5 a night). At midnight **one ticket is drawn and its owner wins the whole pot** — every ticket sold, plus any rollover. More tickets = better odds. 2–3 empty tickets are mixed in, so rarely nobody wins and the pot rolls over. |
 | `/gamblinstats [user]` | Your Gamblin record (games, total profit, biggest win, best game, favourite) plus the **hall of fame**: biggest single win, best single game, most games, highest total profit. |
 | `/points user:<member>` | Your balance, total points earned, leaderboard rank (or progress toward it), and spins left today. Private to you. Add a member to peek at theirs (spins hidden). |
 | `/leaderboard` | Two boards: the top 10 by **total points earned** (all-time; you need 1,000 earned via `LEADERBOARD_MIN_POINTS` to appear, until then it shows who's closest) and, below it, the top 5 **richest right now** by current balance (no minimum). Both come from memory — 0 Upstash commands. |
@@ -297,7 +297,7 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `POINTS_NAME` | Optional | What the currency is called everywhere in Discord, e.g. `Milo Chips`. Default `points`. See Section 25. |
 | `POINTS_EMOJI` | Optional | An emoji shown with the name: a custom emoji **ID** (just the digits), a full `<:name:id>` / `<a:name:id>`, or a normal emoji like 🪙. Default none. |
 | `POINTS_NAME_SINGULAR` | Optional | Only if the automatic "1 chip" (it drops a trailing `s`) is wrong for your name, e.g. `Gas`. |
-| `LOTTERY_TICKET_COST` / `LOTTERY_MAX_TICKETS` / `LOTTERY_JACKPOT_SEED` | Optional | Lottery ticket price (default `10`), most tickets per person per draw (`5`), and the jackpot's starting amount (`50`). |
+| `LOTTERY_TICKET_COST` / `LOTTERY_MAX_TICKETS` / `LOTTERY_JACKPOT_SEED` / `LOTTERY_NOWIN_MAX_PERCENT` / `LOTTERY_MIN_PLAYERS` | Optional | Ticket price (default `10`), most tickets per person per draw (`5`), where a rolled-over pot restarts after a win (`0`), the highest chance that nobody wins because an empty ticket came up (`15`%), and the fewest players needed to run a draw (`2`). See section 24. |
 | `LOTTERY_CHANNEL_ID` | Optional | Where the nightly lottery results post. Falls back to `RESET_ANNOUNCE_CHANNEL_ID`. If neither is set, results only go to the log channel and `/lottery`. |
 | `API_USER_AGENT` | Optional | The name Milo gives the gif sites when it asks them for a gif (nekos.best insists on a real one). The default is fine; set it to something like `MiloBot/1.0 (https://github.com/you/da-bot)` if you want to be tidy. |
 | `REACT_DISABLE` / `REACT_BLOCK` | Optional | `REACT_DISABLE=purrbot` switches whole gif sources off (names: `otakugifs`, `nekosbest`, `gifukai`, `purrbot`). `REACT_BLOCK=bully,glomp` hides individual reactions you don't want. See Section 26. |
@@ -801,29 +801,15 @@ The numbers come from your settings, so it stays correct if you change `SLOTS_FR
 
 ## 24. Daily lottery (`/lottery`)
 
-Pick **3 numbers from 1 to 15** (15 buttons, tap three) or press **Quick pick**. One ticket costs **10 points** (`LOTTERY_TICKET_COST`) and each person can hold up to **5** per draw. Everything is private (only you see your panel).
+A raffle. Everybody buys tickets (**10 points** each, `LOTTERY_TICKET_COST`; up to **5** per person per night, `LOTTERY_MAX_TICKETS`) with the **Buy 1 / Buy 5 / Buy max** buttons. At the daily reset (12:00 AM, `LIMIT_RESET_TZ`) Milo draws **one ticket**; its owner wins the **whole pot** = tickets sold × ticket price + any rollover. The more tickets you hold, the better your chance, and `/lottery` shows your exact odds.
 
-**The draw** happens at the daily reset, **12:00 AM** in `LIMIT_RESET_TZ`, for all tickets bought that day:
-
-| Matches | Prize | Chance per ticket |
-|---|---|---|
-| 3 | the **jackpot**, split equally between all winning tickets | 1 in 455 (0.22%) |
-| 2 | **4× the ticket** (40 at the default price) | 7.9% |
-| 1 | **your ticket back** | 43.5% |
-| 0 | nothing | 48.4% |
-
-You win *something* on about **52%** of tickets. These odds are exact: I enumerated every ticket against every possible draw.
-
-**The jackpot** starts at 50 (`LOTTERY_JACKPOT_SEED`). Every ticket adds 2 points to it. If nobody hits all 3, it **rolls over** and keeps growing; when someone wins it restarts at 50. The other prizes are paid from nowhere (not from the jackpot), so on average players get back about **95%** of what they spend and the other ~5% leaves the economy. `/lottery` shows the jackpot, your tickets, how many tickets are sold and last night's result.
-
-**Details worth knowing**
-- **Saved:** tickets, the jackpot and the last result are in the database, so redeploys don't lose them. Cost: roughly 1 Upstash command per ticket bought plus a few per draw.
-- **Offline at midnight?** The draw happens as soon as Milo is back (it catches up on any missed day, up to 3 days).
-- **Results:** posted as an embed (no pings) in `LOTTERY_CHANNEL_ID`, or in `RESET_ANNOUNCE_CHANNEL_ID` if that's your only channel, and always summarised in the log channel. The midnight announcement also mentions `/lottery`.
-- **Leaderboard:** lottery prizes change balances but do **not** count towards "total earned", so one lucky jackpot can't dominate the all-time board.
-- **Blocked** while a Gamblin game is running, and for frozen people.
-- **Backups:** `?backup` / `?restore` don't include lottery tickets. If you restore a backup made earlier in the day, tickets bought afterwards stay valid.
-
+- **Empty tickets:** 2 or 3 empty tickets are mixed into every draw. If one comes up, **nobody wins** and the whole pot rolls over to the next night. That chance is capped at `LOTTERY_NOWIN_MAX_PERCENT` (default **15%**), so with a normal number of tickets it stays rare.
+- **Not enough players:** with fewer than `LOTTERY_MIN_PLAYERS` (default **2**) different players there is no draw and everybody is refunded.
+- **Rollover:** a night with no winner adds its pot to the next one. After a win the rollover restarts at `LOTTERY_JACKPOT_SEED` (default **0**). Any rollover that existed before this change goes to the next winner.
+- **Results:** posted as an embed (no pings) in `LOTTERY_CHANNEL_ID`, or `RESET_ANNOUNCE_CHANNEL_ID`, and summarised in the log channel. If Milo is offline at midnight, the draw happens when it comes back.
+- **Leaderboard:** lottery prizes change balances but not "total earned".
+- **Saved tickets:** tickets from before this change (which had 3 numbers) still count as one entry each.
+- **Backups:** `?backup` / `?restore` don't include lottery tickets.
 
 ## 25. Naming the currency (`POINTS_NAME`, `POINTS_EMOJI`)
 
@@ -940,3 +926,12 @@ All of it is loaded into memory at startup; manager changes write to Upstash fir
 **Shop discounts.** `SHOP_DISCOUNT=5, Happy New Year` and `SHOP_DISCOUNT_IDS=0` (all items) or `slots_cosmic,daily_sunrise` (just those). The price shown and the price charged come from the same function.
 
 **Tests.** `DISCORD_TOKEN=x python -m pytest tests -q` runs the offline test-suite (`tests/test_milo.py`).
+
+
+---
+
+## 30. Slots packs, lottery raffle and profile colour (latest changes)
+
+- **Slots packs are bought first, spun later.** Buying a pack adds its spins to your day (they're banked). The panel then offers **Spin once**, **Spin all N** and, if you haven't hit the daily limit, **Buy another pack**. The spins you've already used today are never lost: a pack that was part-used before this change is still counted. The bought-spin count is saved (`milo:slots:packs`) together with the balance change on the next autosave.
+- **Lottery** is now a one-winner raffle (section 24). New variables: `LOTTERY_NOWIN_MAX_PERCENT`, `LOTTERY_MIN_PLAYERS`; `LOTTERY_JACKPOT_SEED` now defaults to 0.
+- **`/customize`** now also sets the **side colour of your `/inspect` card** (10 presets, saved in `milo:profile:color`) next to the favourite game.
