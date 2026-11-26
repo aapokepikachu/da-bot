@@ -8,7 +8,7 @@ Features:
 - A persistent **✔️ Interested** button on `/join` messages — survives bot restarts, **no database required**
 - A cat-themed welcome message when new members join
 - Self-assign roles (button-based, no database), posted via the hidden `?rolemenu` command
-- Hidden text commands — `?send` (Manager role only), `?rolemenu`, `?updateDB`, `?gamblin` (slots, blackjack, duck race, roulette) and the Manager toolbox (`?give`, `?set`, `?undo`, `?check`, `?balances`, `?resetspins`, `?resetleaderboard`, `?snapshot`, `?mhelp`, `?mmhelp`, `?addredeem`, `?limitedshop`, `?customid`). All Manager role only, silent to everyone else; see Sections 16 and 17. — the **only** `?`-prefixed commands in the whole bot. None shows up in Discord's `/` picker and none is listed in `/help`; they're documented here in the README only.
+- Hidden text commands — `?send` (Manager role **or** Milo role), `?rolemenu`, `?updateDB`, `?gamblin` (slots, blackjack, duck race, roulette) and the Manager toolbox (`?give`, `?set`, `?undo`, `?check`, `?balances`, `?resetspins`, `?resetleaderboard`, `?snapshot`, `?mhelp`, `?mmhelp`, `?addredeem`, `?limitedshop`, `?customid`). All Manager role only, silent to everyone else; see Sections 16 and 17. — the **only** `?`-prefixed commands in the whole bot. None shows up in Discord's `/` picker and none is listed in `/help`; they're documented here in the README only.
 - Several commands call free, keyless public APIs (cat facts/photos, quotes, dictionary, weather, translation, reaction gifs) — every call has a graceful fallback message if the API is briefly down or slow
 - Runs as a **Render Free Web Service** (Discord Gateway + a tiny HTTP health server in one process)
 - Secrets stay in environment variables, never in code
@@ -159,7 +159,7 @@ This works exactly like the Interested button — no database. Each role button'
 
 ## 8. The hidden `?send`, `?rolemenu` and `?updateDB` commands
 
-The `?`-prefixed commands are all **hidden, plain-text, Manager-only** (except five read/announce commands the Milo role can use: `?announce`, `?snapshot`, `?check`, `?balances`, `?gamblin schedule list` — see `?mmhelp`). Everything else is a slash command. The full list, with what each does, is in Sections 16–22; type `?mhelp` in Discord any time for a short version. They are never shown in `/help`, and anyone without the right role just gets silence.
+The `?`-prefixed commands are all **hidden, plain-text, Manager-only** (except six commands the Milo role can use: `?send`, `?announce`, `?snapshot`, `?check`, `?balances`, `?gamblin schedule list` — see `?mmhelp`). Everything else is a slash command. The full list, with what each does, is in Sections 16–22; type `?mhelp` in Discord any time for a short version. They are never shown in `/help`, and anyone without the right role just gets silence.
 
 | Command | What it does |
 |---|---|
@@ -172,7 +172,7 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | Role | `?send` | `?rolemenu` | `?updateDB` |
 |---|---|---|---|
 | Manager (`MANAGER_ROLE_ID`) | ✅ | ✅ | ✅ |
-| Milo (`MILO_ROLE_ID`) | ❌ (use `?announce`) | ❌ | ❌ |
+| Milo (`MILO_ROLE_ID`) | ✅ | ❌ | ❌ |
 | Everyone else | ❌ | ❌ | ❌ |
 
 ---
@@ -328,7 +328,7 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `CAT_API_KEY` | Optional | Free key from [thecatapi.com/signup](https://thecatapi.com/signup), needed for `/catbreed`. Command is disabled with a clear message if blank. |
 | `WELCOME_CHANNEL_ID` | Optional | Channel where new-member welcome messages post. Welcome feature is skipped if blank. |
 | `MANAGER_ROLE_ID` | Optional | The Manager role. Can use `?send` **and** `?rolemenu`. `?rolemenu` is disabled if blank. |
-| `MILO_ROLE_ID` | Optional | A limited role. Can use only `?announce`, `?snapshot`, `?check`, `?balances` and `?gamblin schedule list` (`?mmhelp`). Everything that changes data needs `MANAGER_ROLE_ID`. |
+| `MILO_ROLE_ID` | Optional | A limited role. Can use only `?send`, `?announce`, `?snapshot`, `?check`, `?balances` and `?gamblin schedule list` (`?mmhelp`). Everything that changes data needs `MANAGER_ROLE_ID`. |
 | `SELF_ROLES` | Optional | Self-assignable roles for `?rolemenu`, as `ROLE_ID\|Label\|Emoji,...`. `?rolemenu` has nothing to post if blank. |
 | `PORT` | Managed by Render | HTTP port for the health server. Don't set this yourself on Render. |
 
@@ -353,7 +353,7 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 - [ ] Restart the bot process, then click **Interested** on an *old* message — it still works correctly.
 - [ ] A new member joining posts a cat-themed welcome message in `WELCOME_CHANNEL_ID`.
 - [ ] `?send Hello everyone` from a Manager-role member deletes their message and posts "Hello everyone" as Milo.
-- [ ] `?send Hello everyone` from a member with **only** the Milo role (`MILO_ROLE_ID`) does nothing (use `?announce` / `?mmhelp`).
+- [ ] `?send Hello everyone` from a member with **only** the Milo role (`MILO_ROLE_ID`) does the same.
 - [ ] `?rolemenu` from a member with **only** the Milo role does nothing at all (it's Manager-only).
 - [ ] `?send Hello everyone` from a non-Manager does nothing at all (no reply, no error).
 - [ ] `/help` lists every command **except** `?send`.
@@ -410,9 +410,9 @@ See `.env.example` for a ready-to-copy version of all of these with comments.
 
 - Discord only renders `[text](url)` markdown as a clickable link **inside embeds**, not in plain message content, so `/aboutme` sends a small embed to make "AAPoke" clickable.
 - `/poll` supports up to 5 options because Discord slash commands need fixed, named parameters rather than an open-ended list — `option3`–`option5` are optional.
-- `?send` and `?rolemenu` accept only `MANAGER_ROLE_ID`. `MILO_ROLE_ID` members get exactly five commands (Section 29).
+- `?send` accepts either `MANAGER_ROLE_ID` or `MILO_ROLE_ID`; `?rolemenu` accepts only `MANAGER_ROLE_ID`. `MILO_ROLE_ID` members get exactly six commands (Section 29).
 - `?rolemenu` can offer at most 25 roles (Discord's hard limit on buttons in one message); if `SELF_ROLES` has more, the extras are dropped with a log warning.
-- `?send` requires `MANAGER_ROLE_ID` to be set, plus the Message Content intent to be enabled — without those, it silently does nothing.
+- `?send` requires at least one of `MANAGER_ROLE_ID` / `MILO_ROLE_ID` to be set, plus the Message Content intent to be enabled — without those, it silently does nothing.
 - Clicking your own **Interested** button is blocked with a friendly ephemeral message — remove that check in `bot.py` if you'd rather allow it.
 - Custom `/join` messages are capped at 300 characters; Discord's own per-message limit is 2000.
 - `/catfact`, `/meow`, `/quote`, `/weather`, `/yesno`, and `/react` all call free, keyless public APIs (catfact.ninja, cataas.com, zenquotes.io, Open-Meteo, yesno.wtf, and for `/react`: otakugifs.xyz, nekos.best, gifukai.com, purrbot.site). None of them need an API key or env var, but they're third-party services outside your control — if one is briefly down, slow, or rate-limits you, the command replies with a friendly fallback message instead of crashing (and the reaction commands still post as plain text without the gif).
@@ -921,12 +921,13 @@ Instead of roles (Discord caps a server at 250), the shop sells **designs for Mi
 | `milo:shop:limited` (hash) | limited-time listings (item id → price, start, end) |
 | `milo:gamblin:daily` | today's game schedule and each game's status |
 | `milo:season:state` / `milo:season:history` | current leaderboard season and archived seasons |
+| `milo:profile:fav` (hash) | each player's `/customize` favourite game (none = automatic) |
 
 All of it is loaded into memory at startup; manager changes write to Upstash first and then re-read it, so the cache always matches the database. Designs themselves (the catalog) live in `bot.py` under `CATALOG`; players only own **IDs**, so editing a design updates it for every owner.
 
-**Player commands:** `/redeem code:<code>` (default codes: `MILO_GIFTS` = +50, `MILO_TAG` = the ❤️‍🔥 Zealous tag) · `/inspect [user]` (profile card) · `/leaderboard [season]` · `/daily` (streak insurance) · `/shop` (now also 777 announcements, titles, tags).
+**Player commands:** `/redeem code:<code>` (default codes: `MILO_GIFTS` = +50, `MILO_TAG` = the ❤️‍🔥 Zealous tag) · `/inspect [user]` (profile card) · `/customize` (pick the favourite game shown on it; automatic = most played) · `/leaderboard [season]` · `/daily` (streak insurance) · `/shop` (now also 777 announcements, titles, tags).
 
-**Manager commands** (`?mhelp`): `?addredeem CODE +50,daily_christmas [expires:2026-12-31]` · `?removeredeem CODE` · `?redeems` · `?customid` · `?limitedshop add|price|time|remove|list` · `?resetleaderboard sname:Christmas snum:Season 01`. **Milo role** (`?mmhelp`): `?announce`, `?snapshot`, `?check`, `?balances`, `?gamblin schedule list`.
+**Manager commands** (`?mhelp`): `?addredeem CODE +50,daily_christmas [expires:2026-12-31]` · `?removeredeem CODE` · `?redeems` · `?customid` · `?limitedshop add|price|time|remove|list` · `?resetleaderboard sname:Christmas snum:Season 01`. **Milo role** (`?mmhelp`): `?send`, `?announce`, `?snapshot`, `?check`, `?balances`, `?gamblin schedule list`.
 
 **Streak insurance.** Miss a day and `/daily` shows a private offer: the exact fee (`STREAK_INSURANCE_PERCENT`% of your current balance, rounded up, at least 1) and what you get. Nothing is charged unless you press **Restore**. **Start fresh** (or ignoring it) resets the streak with no charge. The fee is re-checked when you press the button; if your balance changed it shows the new fee instead of charging. Gaps longer than `STREAK_INSURANCE_MAX_MISSED_DAYS` can't be insured.
 

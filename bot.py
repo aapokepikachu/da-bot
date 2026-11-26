@@ -4650,7 +4650,7 @@ async def help_slash(interaction: discord.Interaction):
             f"{SLOTS_PAID_SPINS} bonus spins ({SLOTS_PACK_SPINS}-spin packs for {pfmt(SLOTS_PACK_COST)}). "
             f"Every {SLOTS_JACKPOT_PITY_AT}th spin without a 777 **is** a 777! Spin one or all at once.\n"
             f"Match all 3 to win: {payout_line}\n"
-            "`/points` — your balance, rank and spins left · `/inspect user:<member>` — a profile card (yours by default)\n"
+            "`/points` — your balance, rank and spins left · `/inspect user:<member>` — a profile card (yours by default) · `/customize` — pick your favourite game for it\n"
             f"`/daily` — claim free {PTS_NAME} every day; a streak makes it bigger (+{DAILY_WEEK_BONUS} bonus every 7th day!)"
             + (f" Missed a day? Streak insurance can restore it for {STREAK_INSURANCE_PERCENT}% of your balance (you always see the fee first).\n" if STREAK_INSURANCE_PERCENT else "\n")
             + "`/redeem code:<code>` — redeem a code for a reward (once per person)\n"
@@ -4758,9 +4758,9 @@ async def on_app_command_error(
 # revealed.
 # ---------------------------------------------------------------------------
 async def _handle_send_command(message: discord.Message) -> None:
-    allowed_role_ids = {r for r in (MANAGER_ROLE_ID,) if r is not None}      # full managers only (MILO_ROLE_ID has ?announce instead)
+    allowed_role_ids = {r for r in (MANAGER_ROLE_ID, MILO_ROLE_ID) if r is not None}
     if not allowed_role_ids:
-        return  # Feature disabled -- no manager role is configured.
+        return  # Feature disabled -- neither role is configured.
     if message.guild is None or not isinstance(message.author, discord.Member):
         return  # Only works inside a server, where roles exist.
 
@@ -8372,6 +8372,7 @@ EXTRA_KEY_LIMITED = "milo:shop:limited"
 EXTRA_KEY_DAILYG = "milo:gamblin:daily"
 EXTRA_KEY_SEASON = "milo:season:state"
 EXTRA_KEY_SEASON_HIST = "milo:season:history"
+EXTRA_KEY_FAV = "milo:profile:fav"            # HASH user id -> game kind (slots / bj / duck / roulette); absent = auto (most played)
 
 # Permanent default codes. They live in code (so they can never be lost or expire) and
 # their rewards point at the catalog / a Yarns amount -- no duplicate definitions.
@@ -8437,6 +8438,7 @@ class ExtraData:
         self.daily: dict = {}                            # today's Gamblin schedule
         self.season: dict = {"name": "", "num": SEASON_DEFAULT_NUM, "started": 0, "baseline": {}}
         self.history: list[dict] = []
+        self.fav: dict[int, str] = {}                    # /customize: favourite game shown on /inspect
         self._dirty: dict[str, str] = {}                 # key -> value that still has to be SET in Upstash
         self._lock = asyncio.Lock()                      # serialises redeems and manager edits
         self._daily_lock = asyncio.Lock()
@@ -8484,7 +8486,7 @@ class ExtraData:
             return
         res = await store.pipeline([
             ["HGETALL", EXTRA_KEY_CODES], ["HGETALL", EXTRA_KEY_LIMITED], ["GET", EXTRA_KEY_DAILYG],
-            ["GET", EXTRA_KEY_SEASON], ["GET", EXTRA_KEY_SEASON_HIST],
+            ["GET", EXTRA_KEY_SEASON], ["GET", EXTRA_KEY_SEASON_HIST], ["HGETALL", EXTRA_KEY_FAV],
         ])
         for item in res:
             if not isinstance(item, dict) or "error" in item:
@@ -8529,6 +8531,7 @@ class ExtraData:
                     self.history = [h for h in parsed if isinstance(h, dict) and "label" in h][-24:]
             except (TypeError, ValueError):
                 logger.warning("Ignoring an unreadable season history in the database")
+        self.fav = {int(u): k for u, k in _flat_pairs(res[5].get("result")) if str(u).isdigit() and k in GAMBLIN_GAMES}
         names = list(DEFAULT_REDEEM_CODES) + list(codes)
         used_res = await store.pipeline([["SMEMBERS", EXTRA_KEY_USED + n] for n in names])
         used: dict[str, set[int]] = {}
@@ -8610,6 +8613,23 @@ class ExtraData:
             if clean and item_id in CATALOG:
                 limited[item_id] = clean
         self.limited = limited
+
+    async def set_fav(self, uid: int, kind: str | None) -> str | None:
+        """Save (or clear, with None = automatic) someone's favourite game. Returns an error text or None."""
+        async with self._lock:
+            if self.store is not None:
+                try:
+                    if kind is None:
+                        await self.store._cmd("HDEL", EXTRA_KEY_FAV, str(uid))
+                    else:
+                        await self.store._cmd("HSET", EXTRA_KEY_FAV, str(uid), kind)
+                except StoreError as exc:
+                    return f"I couldn't save that right now ({exc}). Nothing changed."
+            if kind is None:
+                self.fav.pop(uid, None)
+            else:
+                self.fav[uid] = kind
+        return None
 
     # ---- redeem codes ---------------------------------------------------------------------------
     async def add_code(self, code: str, rewards: list[str], expires: int, by: int) -> str | None:
@@ -9284,6 +9304,81 @@ async def shop_slash(interaction: discord.Interaction):
 # ---------------------------------------------------------------------------
 # 🪪 /inspect  (profile card)  ·  🎟️ /redeem
 # ---------------------------------------------------------------------------
+def _game_by_name(name: str) -> tuple[str, str, str] | None:
+    """(kind, emoji, label) for the name Milo stores in stats (a session's NAME)."""
+    for kind, (emoji, label, cls) in GAMBLIN_GAMES.items():
+        if cls.NAME == name:
+            return kind, emoji, label
+    return None
+
+
+def _favourite_game(uid: int) -> str | None:
+    """The game shown on /inspect: the one they picked in /customize, else the one they've played most."""
+    gm = (POINTS.stats.get(uid) or {}).get("gm") or {}
+    kind = EXTRAS.fav.get(uid)
+    if kind in GAMBLIN_GAMES:
+        emoji, label, cls = GAMBLIN_GAMES[kind]
+        plays = gm.get(cls.NAME, 0)
+    elif gm:
+        found = [(plays, g) for g, plays in gm.items() if _game_by_name(g)]
+        if not found:
+            return None
+        plays, name = max(found)
+        _, emoji, label = _game_by_name(name)
+    else:
+        return None
+    return f"{emoji} {label}" + (f"\n{plays:,} played" if plays else "")
+
+
+class CustomizeView(discord.ui.View):
+    def __init__(self, owner_id: int) -> None:
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+        cur = EXTRAS.fav.get(owner_id)
+        opts = [discord.SelectOption(label="Automatic: most played", value="auto", emoji="📊", default=cur is None,
+                                     description="Shows the game you've played the most")]
+        for kind, (emoji, label, _) in GAMBLIN_GAMES.items():
+            opts.append(discord.SelectOption(label=label, value=kind, emoji=emoji, default=cur == kind))
+        self.select = discord.ui.Select(placeholder="Favourite game…", options=opts)
+        self.select.callback = self._picked
+        self.add_item(self.select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Open your own with `/customize` 🐾", ephemeral=True)
+            return False
+        return True
+
+    async def _picked(self, interaction: discord.Interaction) -> None:
+        value = self.select.values[0]
+        err = await EXTRAS.set_fav(self.owner_id, None if value == "auto" else value)
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        for o in self.select.options:
+            o.default = o.value == value
+        shown = _favourite_game(self.owner_id)
+        text = "Saved. Your `/inspect` profile will show: " + (shown.replace("\n", " · ") if shown else "nothing yet (play a game!)")
+        await interaction.response.edit_message(content=text, view=self)
+
+
+@bot.tree.command(name="customize", description="Customize your /inspect profile (favourite game).")
+async def customize_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message("This bot is not configured for this server.", ephemeral=True)
+        return
+    if not (POINTS.ready and EXTRAS.ready):
+        await interaction.response.send_message(_POINTS_UNAVAILABLE, ephemeral=True)
+        return
+    uid = interaction.user.id
+    cur = _favourite_game(uid)
+    text = ("**Customize your profile**\nPick the game shown as your favourite on `/inspect`. "
+            "Leave it on automatic and Milo shows the game you've played the most.\n"
+            f"Now showing: {cur.replace(chr(10), ' · ') if cur else 'nothing yet'}\n"
+            "Titles, tags and other looks are equipped in `/shop`.")
+    await interaction.response.send_message(text, view=CustomizeView(uid), ephemeral=True)
+
+
 def _profile_embed(target: discord.Member | discord.User) -> discord.Embed:
     uid = target.id
     tag, title = _tag_of(uid), _title_of(uid)
@@ -9295,7 +9390,7 @@ def _profile_embed(target: discord.Member | discord.User) -> discord.Embed:
 
     line = f"@{target.name}" + (f"  ·  {tag}" if tag else "")
     if title:
-        line += f"\\n**{title}**"
+        line += f"\n**{title}**"
     e = discord.Embed(title=target.display_name, description=line, color=discord.Color.blurple())
     e.set_thumbnail(url=target.display_avatar.url)                   # avatar: small, top-right
     e.add_field(name="Balance", value=pcompact(POINTS.points(uid), True))
@@ -9308,14 +9403,16 @@ def _profile_embed(target: discord.Member | discord.User) -> discord.Embed:
         e.add_field(name="Daily streak", value=(f"{streak_text}\nNext reward: **+{pamt(_daily_reward(streak + 1))}**\n"
                                                 f"Bonus: +{DAILY_WEEK_BONUS} on day {bonus_day}"))
     else:
-        e.add_field(name="Daily streak", value="**0** days" + (f" (was {streak})" if streak else "") + f"\\nNext reward: **+{pamt(_daily_reward(1))}**")
+        e.add_field(name="Daily streak", value="**0** days" + (f" (was {streak})" if streak else "") + f"\nNext reward: **+{pamt(_daily_reward(1))}**")
 
     if st and st.get("s"):
-        fav = max(st["gm"].items(), key=lambda kv: kv[1])[0] if st.get("gm") else "—"
         e.add_field(name="Biggest Gamblin win", value=f"**+{st['bw']:,}**")
-        e.add_field(name="Gamblin", value=f"{st['s']:,} games · {st['net']:+,} profit\\nFavourite: {fav}")
+        e.add_field(name="Gamblin", value=f"{st['s']:,} games\n{st['net']:+,} profit")
     else:
         e.add_field(name="Biggest Gamblin win", value="No games yet")
+    fav = _favourite_game(uid)
+    if fav:
+        e.add_field(name="Favourite game", value=fav)
     e.add_field(name="777 guarantee", value=f"{POINTS.jp_count(uid)}/{SLOTS_JACKPOT_PITY_AT} spins")
 
     eq = []
@@ -9323,7 +9420,7 @@ def _profile_embed(target: discord.Member | discord.User) -> discord.Embed:
         item = style_of(uid, cat)
         if item != "classic":
             eq.append(f"{SHOP_CATEGORIES[cat][1]}: **{CATALOG[item]['name']}**")
-    e.add_field(name="Equipped", value="\\n".join(eq) if eq else "Classic everything", inline=False)
+    e.add_field(name="Equipped", value="\n".join(eq) if eq else "Classic everything", inline=False)
     if uid in POINTS.frozen:
         e.set_footer(text="Frozen by a manager")
     elif isinstance(target, discord.Member) and target.joined_at:
@@ -9363,7 +9460,7 @@ async def redeem_slash(interaction: discord.Interaction, code: app_commands.Rang
     status, info = await EXTRAS.redeem(interaction.user.id, code)
     if status == "ok":
         e = discord.Embed(title="Code redeemed", color=discord.Color.green(),
-                          description="\\n".join(f"• {l}" for l in info["lines"]) or "Done.")
+                          description="\n".join(f"• {l}" for l in info["lines"]) or "Done.")
         e.set_footer(text=f"Code: {info['code']} · equip cosmetics in /shop")
         await interaction.response.send_message(embed=e, ephemeral=True)
         await log_event(f"🎟️ `/redeem` <@{interaction.user.id}> used `{info['code']}`")
@@ -10067,8 +10164,9 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
     # ---- ?mmhelp (MILO_ROLE_ID and managers) ----
     if word == "?mmhelp":
         e = discord.Embed(title="🧰 Milo role commands", color=discord.Color.teal(),
-                          description="These are the only management commands the Milo role can use.")
+                          description="These are the only management commands the Milo role can use (six).")
         e.add_field(name="Commands", inline=False, value=(
+            "`?send message` — speak as Milo in this channel (attach images/files if you like)\n"
             "`?announce Title | message` — post a fancy embed (optional `#channel` and `--ping` for @everyone), e.g. `?announce --ping Movie night | 8pm in voice!`\n"
             "`?snapshot` — post everyone's balances to the log channel\n"
             "`?gamblin schedule list` — see today's daily games and anything scheduled (read-only)\n"
@@ -10105,7 +10203,7 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
             "`?resetleaderboard sname:Christmas snum:Season 01` — archive this season and start a fresh board (asks to confirm). "
             "Balances and lifetime stats never change. Past seasons: `/leaderboard season:`"))
         e.add_field(name="📢 Chat, backups & saving", inline=False, value=(
-            "`?announce Title | message` (`#channel`, `--ping`) · `?send` — speak as Milo · `?rolemenu` — post the self-role menu\n"
+            "`?announce Title | message` (`#channel`, `--ping`) · `?send` — speak as Milo (Milo role too) · `?rolemenu` — post the self-role menu\n"
             f"`?backup` / `?restore` (attach file) · `?snapshot` — everyone's {PTS_NAME} to the log channel · `?updateDB` — save to Upstash now"))
         e.set_footer(text="Balance changes never touch the leaderboard. Daily games: see DAILY_* env vars.")
         await message.channel.send(embed=e, delete_after=240)
