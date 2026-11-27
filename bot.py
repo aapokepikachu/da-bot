@@ -6716,7 +6716,18 @@ CRASH_CAP = 100.0                      # the rocket stops here and everyone stil
 LD_PREFIX = "ld:"
 HL_PREFIX = "hl:"
 CR_PREFIX = "cr:"
-CR_AUTO_CHOICES = (15, 20, 30, 50, 100)   # auto cash-out choices, in tenths (x1.5 ... x10)
+CR_AUTO_CHOICES = (11, 12, 13, 14, 15, 20, 25, 30, 50, 100)   # auto cash-out choices, in tenths (x1.1 ... x10)
+MIN_WIN_MULT = 1.2                     # one-pick games never offer a bet that pays less than this, so a WIN is always a real profit (min bet 5 -> at least +1)
+
+
+def _pk_payout(stake: int, mult: float) -> int:
+    """What a winning one-pick bet pays back. The epsilon stops float noise (e.g. 1.2 x 5 = 5.999...) from costing a point."""
+    return math.floor(stake * mult + 1e-9)
+
+
+def _crash_payout(stake: int, mult: float) -> int:
+    """What a cash-out pays back: rounded to the NEAREST point (not down), and never less than the stake."""
+    return max(stake, math.floor(stake * mult + 0.5 + 1e-9))
 
 
 def _fmt_mult(m: float) -> str:
@@ -6833,7 +6844,7 @@ class PickSession(GamblinSession):
             key, stake = p.bet
             label, _, mult = self.options[key]
             if self._wins(key, outcome):
-                profit = self._settle(p, stake, math.floor(stake * mult))
+                profit = self._settle(p, stake, _pk_payout(stake, mult))
                 lines.append(f"✅ <@{p.uid}> {label} · **{stake:,}** → **+{profit:,}**")
             else:
                 self._settle(p, stake, 0)
@@ -6858,7 +6869,7 @@ def _pk_bet_error(g: PickSession, p: PKPlayer) -> str | None:
 
 async def _pk_confirm_panel(interaction, g: PickSession, key: str, amt: int) -> None:
     label, _, m = g.options[key]
-    payout = math.floor(amt * m)
+    payout = _pk_payout(amt, m)
     text = (f"Bet **{amt:,}** on {label} (pays {_fx(m)})?\n"
             f"Win → **{payout:,}** back (+{payout - amt:,}) · Lose → −{amt:,}\n"
             "⚠️ Once locked, it can't be changed.")
@@ -7066,7 +7077,7 @@ class HiLoSession(PickSession):
     PREFIX = HL_PREFIX
     TITLE = "🎴 HIGHER OR LOWER"
     COLOR = discord.Color.dark_green()
-    LOBBY_LINES = ("A card is shown — bet if the next one is higher, lower or the same rank (Ace is high)",
+    LOBBY_LINES = ("A card is shown (always 5 to Jack) — bet if the next one is higher, lower or the same rank (Ace is high)",
                    "Ties lose for Higher and Lower; only **Same** wins them")
 
     def __init__(self, channel, started_by: int) -> None:
@@ -7084,11 +7095,15 @@ class HiLoSession(PickSession):
 
     def _new_round(self) -> None:
         deck = [(r, s) for r in range(2, 15) for s in _SUITS]
-        self.shown, self.nxt = random.sample(deck, 2)        # two different cards: the next one comes from the other 51
+        # The shown card is always 5..J: from there BOTH Higher and Lower are unlikely enough to pay a real profit
+        # (on an Ace, "Lower" would pay less than the stake). The next card comes from the other 51.
+        self.shown = random.choice([c for c in deck if 5 <= c[0] <= 11])
+        self.nxt = random.choice([c for c in deck if c != self.shown])
         r = self.shown[0]
         counts = {"hi": 4 * (14 - r), "lo": 4 * (r - 2), "eq": 3}
         names = {"hi": "⬆️ Higher", "lo": "⬇️ Lower", "eq": "🟰 Same rank"}
-        self.options = {k: (names[k], n / 51, _g_mult(n / 51, GAMBLIN_MAX_MULT)) for k, n in counts.items() if n > 0}
+        opts = {k: (names[k], n / 51, _g_mult(n / 51, GAMBLIN_MAX_MULT)) for k, n in counts.items() if n > 0}
+        self.options = {k: v for k, v in opts.items() if v[2] >= MIN_WIN_MULT}           # safety net on top of the 5..J rule
 
     def _table(self, outcome=None) -> str:
         if outcome is None:
@@ -7244,8 +7259,8 @@ class CrashSession(GamblinSession):
         lines = []
         for p in bettors:
             if p.cashed:
-                profit = self._settle(p, p.bet, math.floor(p.bet * p.cashed))
-                lines.append(f"✅ <@{p.uid}> **{p.bet:,}** cashed out at **{_fmt_mult(p.cashed)}** → **+{profit:,}**")
+                profit = self._settle(p, p.bet, _crash_payout(p.bet, p.cashed))
+                lines.append(f"✅ <@{p.uid}> **{p.bet:,}** cashed out at **{_fmt_mult(p.cashed)}** → **{profit:+,}**")
             else:
                 self._settle(p, p.bet, 0)
                 lines.append(f"❌ <@{p.uid}> **{p.bet:,}** → −{p.bet:,}")
@@ -7268,13 +7283,15 @@ def _cr_bet_error(g: CrashSession, p: CRPlayer) -> str | None:
 
 
 async def _cr_cashout_panel(interaction, amt: int) -> None:
-    """After the amount: lock it in with manual or auto cash-out. One tap locks."""
-    buttons = [_gb(f"🔒 Lock · cash out by hand ({amt})", f"cr:lock:{amt}:0", "green")]
-    buttons += [_gb(f"🔒 Auto {_fmt_mult(a / 10)}", f"cr:lock:{amt}:{a}", "blue") for a in CR_AUTO_CHOICES]
+    """After the amount: ONE tap locks the bet. Pick how you cash out: by hand, or an automatic multiplier."""
+    buttons = [_gb(f"🖐 Manual cash out ({amt})", f"cr:lock:{amt}:0", "green")]
+    buttons += [_gb(f"⚙️ Auto {_fmt_mult(a / 10)}", f"cr:lock:{amt}:{a}", "blue" if a < 20 else "grey") for a in CR_AUTO_CHOICES]
     buttons.append(_gb("← Back", "cr:bet", "grey"))
     await _gpanel(interaction,
-                  (f"Bet **{amt:,}** on the rocket.\n**By hand:** you press Cash out in time. "
-                   "**Auto:** Milo cashes you out at that multiplier (you get it only if the rocket gets there).\n"
+                  (f"Bet **{amt:,}** on the rocket — how do you want to cash out?\n"
+                   "🖐 **Manual:** you press Cash out in time.\n"
+                   "⚙️ **Auto:** Milo cashes you out at exactly that multiplier — **you get it only if the rocket gets there**, "
+                   "and there's no latency to worry about.\n"
                    "⚠️ Once locked, it can't be changed."),
                   _gview(*buttons))
 
@@ -7345,7 +7362,7 @@ async def handle_cr_click(interaction: discord.Interaction, custom_id: str) -> N
             await say(f"You already cashed out at {_fmt_mult(p.cashed)} 💸")
         else:
             p.cashed = g.mult
-            await say(f"💸 **Cashed out at {_fmt_mult(p.cashed)}!** Pays {pfmt(math.floor(p.bet * p.cashed))} when the rocket lands.")
+            await say(f"💸 **Cashed out at {_fmt_mult(p.cashed)}!** Pays {pfmt(_crash_payout(p.bet, p.cashed))} when the rocket lands.")
         return
 
     if action == "bet":
