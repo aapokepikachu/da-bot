@@ -312,7 +312,7 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `GAMBLIN_BJ_ROUNDS` / `GAMBLIN_BJ_BET_SECONDS` / `GAMBLIN_BJ_TURN_SECONDS` | Optional | Blackjack: rounds (default `5`), betting window (`30`), and time to play your hand (`40`). Uses the same channel, bet limits and table size as Gamblin. |
 | `GAMBLIN_CHANNEL_ID` | Needed for Gamblin | The channel Gamblin runs in. Without it `?gamblin` just tells the manager to set it. See Section 16. |
 | `GAMBLIN_LOBBY_SECONDS` / `GAMBLIN_ROUNDS` | Optional | Join window (default `90`) and rounds per event (default `3`). |
-| `GAMBLIN_BET_SECONDS` / `GAMBLIN_REEL_SECONDS` | Optional | Betting window before reel 1 (default `40`) and before reels 2 and 3 (default `25`). |
+| `GAMBLIN_BET_SECONDS` | Optional | Time to pick reels and bet each Slots Gamblin round (default `45`). `GAMBLIN_REEL_SECONDS` is no longer used. |
 | `GAMBLIN_MIN_BET` / `GAMBLIN_MAX_BET` | Optional | Smallest and largest single bet. Defaults `5` and `100`. |
 | `GAMBLIN_MAX_PLAYERS` / `GAMBLIN_MAX_MULT` | Optional | Table size (default `25`) and the cap on 3-of-a-kind multipliers (default `500`). |
 | `LEADERBOARD_MIN_POINTS` | Optional | Total points a person must have *earned* to appear on `/leaderboard`. Default `1000`. |
@@ -619,21 +619,22 @@ In the Gamblin channel: deny **Send Messages** (and Create Threads) for `@everyo
 
 ### How an event runs
 1. **Lobby.** Milo posts `@everyone`, three empty reels `[ ❔ | ❔ | ❔ ]`, a **Join** button and a countdown. Each join gets a "`@name` is participating!" line. You need at least `GAMBLIN_MIN_BET` points to join. When the timer ends the lobby message is deleted.
-2. **Rounds** (`GAMBLIN_ROUNDS`, default 3). One shared machine per round. Reel 1, 2 and 3 stop one at a time, with a betting window before each:
-   - **🎰 Jackpot Spin** — one bet on the whole spin, placed *before reel 1*. Pick: a specific triple (3× 🍒 …), **Any triple**, or **Pair or better**.
-   - **🎚️ Reel Rush** — bet on each reel separately: pick the symbol that reel will land on. Skip any reel you like.
-   - You choose one mode per round. Once you lock a bet it can't be changed, and Jackpot Spin players simply wait while the reels stop.
-3. **Betting is private.** Buttons open a panel only you can see: pick → stake (5% / 10% / 25% / All-in-or-Max / ✏️ Custom popup) → confirm → 🔒 Lock. Bets are `GAMBLIN_MIN_BET`–`GAMBLIN_MAX_BET`.
-4. **Results** are posted after each reel (and the whole spin after reel 3), then standings at the end.
+2. **Rounds** (`GAMBLIN_ROUNDS`, default 3). Each round has one betting window (`GAMBLIN_BET_SECONDS`, default 45). Tap **🎰 Pick your reels** and a private panel opens (it looks like this, with headings between rows of buttons):
+   - **REEL 1 / REEL 2 / REEL 3** — one row of symbol buttons each (🍒 🍋 🍉 🍇 ⭐ 7️⃣, two rows of three). Press one symbol per reel; it turns green. Press it again to un-pick, or press another to switch.
+   - **QUICK SELECT** — 🍒🍒🍒, 🍋🍋🍋, 🍉🍉🍉, 🍇🍇🍇, ⭐⭐⭐, 7️⃣7️⃣7️⃣ picks all three reels at once. While one is on, the reel buttons and the other quick buttons are locked; press the green one again (or **Clear**) to undo.
+   - **Proceed to bet** — enabled once every reel has a pick. Then choose the amount (5% / 10% / 25% / All-in-or-Max / ✏️ Custom popup) → see your exact payouts → 🔒 Lock. A bet can't be changed once locked.
+   - **The spin:** when betting closes, Milo spins reel 1, reel 2 and reel 3 one at a time. You win if **any** of your picks match their reel: **1 match** pays at least x1.2, **2 matches** pay more, and **all 3** pay a big bonus. The exact multipliers are shown for your picks before you lock in.
+3. **Betting is private** (panels only you can see). Bets are `GAMBLIN_MIN_BET`–`GAMBLIN_MAX_BET`; one bet per round.
+4. **Results** are posted after the spin, then standings at the end.
 
 ### What Milo pauses while it runs
 `/slots`, `/ask` (+ the think buttons), `/grouptrivia` and the 5-minute autosave. `?updateDB` tells the manager to wait (or use `?gamblin stop`). Everything resumes automatically when it ends.
 
 ### The odds (computed from the real reel weights)
-The Gamblin reels are weighted: 🍒 24% · 🍋 21% · 🍉 18% · 🍇 16% · ⭐ 12% · 7️⃣ 9%. Every multiplier is `0.92 ÷ chance`, so over a long time the house keeps about 8%. Reel Rush pays x3.8 (🍒) up to x10.2 (7️⃣). Jackpot Spin pays e.g. Pair or better x1.9, Any triple x25.9, 3× 🍒 x66.5, 3× ⭐ and 3× 7️⃣ capped at x500 (`GAMBLIN_MAX_MULT`). **The cap makes the two rarest triples worse value than the rest** — that's on purpose, so one lucky bet can't wreck the economy.
+The Gamblin reels are weighted: 🍒 24% · 🍋 21% · 🍉 18% · 🍇 16% · ⭐ 12% · 7️⃣ 9%. Your payouts are worked out from the exact chances of the three symbols you picked (rarer picks pay more), so the house keeps about 8% over a long time and a winning bet is always a real profit (at least x1.2).
 
 ### Points and saving
-- A stake is only *held* until its reel stops (it still shows in your balance, but you can't bet it twice). Then your real balance changes in memory.
+- A stake is only *held* until the round's spin finishes (it still shows in your balance, but you can't bet it twice). Then your real balance changes in memory.
 - Balances move as each bet lands. Your positive session profit also counts towards the all-time leaderboard (see the Leaderboard note in the intro of this section); everything shows on **Richest right now**.
 - When the event ends, Milo does **one batched save** to Upstash: about **1 command per player whose balance changed** (10 players ≈ 10 commands, a few % of 1 day's normal use). Nothing is written during the event.
 - If Milo crashes mid-event, Upstash still holds the pre-event balances, so at worst the event's results are lost, never half-applied. On a normal shutdown (SIGTERM) Milo stops Gamblin, never charges unresolved bets, and saves what already landed.

@@ -4865,8 +4865,7 @@ _raw_gamblin_channel = os.getenv("GAMBLIN_CHANNEL_ID", "").strip()
 GAMBLIN_CHANNEL_ID = int(_raw_gamblin_channel) if _raw_gamblin_channel.isdigit() else None
 GAMBLIN_LOBBY_SECONDS = _env_int("GAMBLIN_LOBBY_SECONDS", 90)    # join window
 GAMBLIN_ROUNDS = _env_int("GAMBLIN_ROUNDS", 3)                   # machines per session
-GAMBLIN_BET_SECONDS = _env_int("GAMBLIN_BET_SECONDS", 40)        # window before reel 1
-GAMBLIN_REEL_SECONDS = _env_int("GAMBLIN_REEL_SECONDS", 25)      # windows before reels 2 and 3
+GAMBLIN_BET_SECONDS = _env_int("GAMBLIN_BET_SECONDS", 45)        # time to pick reels and bet each round
 GAMBLIN_MIN_BET = _env_int("GAMBLIN_MIN_BET", 5)
 GAMBLIN_MAX_BET = max(GAMBLIN_MIN_BET, _env_int("GAMBLIN_MAX_BET", 100))
 GAMBLIN_MAX_PLAYERS = _env_int("GAMBLIN_MAX_PLAYERS", 25)
@@ -4894,17 +4893,49 @@ def _fx(m: float) -> str:
     return f"x{m:g}"
 
 
-G_REEL_MULT = [_g_mult(p) for p in G_P]                      # Reel Rush: this one reel shows my symbol
-_p_triple_any = sum(p ** 3 for p in G_P)
-_p_all_different = 6 * sum(
-    G_P[i] * G_P[j] * G_P[k] for i in range(6) for j in range(i + 1, 6) for k in range(j + 1, 6)
-)
-G_FULL: dict[str, tuple[str, float, float]] = {}                # Jackpot Spin: key -> (label, chance, multiplier)
-for _i, _s in enumerate(G_SYMS):
-    G_FULL[f"t{_i}"] = (f"3× {_s}", G_P[_i] ** 3, _g_mult(G_P[_i] ** 3, GAMBLIN_MAX_MULT))
-G_FULL["any"] = ("Any triple", _p_triple_any, _g_mult(_p_triple_any, GAMBLIN_MAX_MULT))
-G_FULL["pair"] = ("Pair or better", 1 - _p_all_different, _g_mult(1 - _p_all_different))
+# How a Slots Gamblin bet pays. You pick ONE symbol for each of the 3 reels and bet once. After the spin, the number of
+# reels that matched your pick (1, 2 or 3) decides the payout. The multipliers are worked out from the exact chances
+# of YOUR picks, so rarer picks pay more, and over a long time the house keeps only (100 - GAMBLIN_RTP)%.
+#   - 1 match pays at least x1.2 (a win is always a real profit),
+#   - 2 matches pay more, and 3 matches (all three) pay a big bonus.
+G_TIER_SHARES = (0.55, 0.30, 0.15)          # how the long-run return is split between 1, 2 and 3 matches
 
+
+def _g_match_chances(picks) -> list[float]:
+    """Chance of EXACTLY k matches (k = 0..3) for these three picks (symbol indexes)."""
+    ps = [G_P[i] for i in picks]
+    out = [0.0, 0.0, 0.0, 0.0]
+    for mask in range(8):
+        pr, k = 1.0, 0
+        for r in range(3):
+            if mask >> r & 1:
+                pr *= ps[r]
+                k += 1
+            else:
+                pr *= 1 - ps[r]
+        out[k] += pr
+    return out
+
+
+def _g_tiers(picks) -> dict[int, tuple[float, float]]:
+    """{matches: (chance, multiplier)} for matches 1..3. Fair to the exact odds of these picks (house edge only)."""
+    ch = _g_match_chances(picks)
+    m1 = max(MIN_WIN_MULT, G_TIER_SHARES[0] * GAMBLIN_RTP / ch[1])
+    rest = max(0.0, GAMBLIN_RTP - m1 * ch[1])
+    s2, s3 = G_TIER_SHARES[1], G_TIER_SHARES[2]
+    m2 = rest * (s2 / (s2 + s3)) / ch[2]
+    m3 = rest * (s3 / (s2 + s3)) / ch[3]
+    return {1: (ch[1], _floor1(m1)), 2: (ch[2], _floor1(m2)), 3: (ch[3], min(GAMBLIN_MAX_MULT, _floor1(m3)))}
+
+
+def _g_tier_text(picks) -> str:
+    t = _g_tiers(picks)
+    win = sum(c for c, _ in t.values())
+    return (f"1 match → **{_fx(t[1][1])}** · 2 matches → **{_fx(t[2][1])}** · all 3 → **{_fx(t[3][1])}** (bonus)\n"
+            f"Chance of at least one match: **{win * 100:.0f}%**")
+
+
+GAMBLIN: "GamblinSession | None" = None
 GAMBLIN: "GamblinSession | None" = None
 
 
@@ -4914,18 +4945,6 @@ def gamblin_block_text(feature: str) -> str | None:
         return None
     where = f" in <#{GAMBLIN_CHANNEL_ID}>" if GAMBLIN_CHANNEL_ID else ""
     return f"🎲 **Gamblin** is running{where} — {feature} is paused until it's over. Back soon! {MILO_EMOJI}"
-
-
-def _g_full_wins(pred: str, reels: list[str]) -> bool:
-    if pred == "any":
-        return reels[0] == reels[1] == reels[2]
-    if pred == "pair":
-        return len(set(reels)) <= 2
-    return reels[0] == reels[1] == reels[2] == G_SYMS[int(pred[1:])]
-
-
-def _g_odds(p: float) -> str:
-    return f"1 in {round(1 / p):,}"
 
 
 def _gb(label: str, cid: str, style: str = "grey", disabled: bool = False) -> discord.ui.Button:
@@ -4944,20 +4963,6 @@ def _gview(*buttons: discord.ui.Button) -> discord.ui.View:
     return view
 
 
-def _gtarget(t: str, x: str):
-    """What a bet is on: (description, chance, multiplier), or None if the id is junk."""
-    if t == "f":
-        entry = G_FULL.get(x)
-        if entry is None:
-            return None
-        label, p, m = entry
-        return f"Jackpot Spin → **{label}**", p, m
-    if t.startswith("r") and t[1:].isdigit() and x.isdigit() and 0 <= int(x) < len(G_SYMS) and t[1:] in ("1", "2", "3"):
-        i = int(x)
-        return f"Reel {t[1:]} → **{G_SYMS[i]}**", G_P[i], G_REEL_MULT[i]
-    return None
-
-
 @dataclass
 class GPlayer:
     uid: int
@@ -4967,12 +4972,13 @@ class GPlayer:
     played: int = 0                  # bets settled this session (for /gamblinstats)
     wagered: int = 0
     best_win: int = 0
-    mode: str | None = None          # "full" or "reel" (locked for the round once chosen)
-    full: tuple[str, int] | None = None
-    reel: dict = field(default_factory=dict)   # stage -> (symbol index, stake)
+    draft: list = field(default_factory=lambda: [None, None, None])   # Slots Gamblin: the symbol picked on each reel (index) while choosing
+    quick: int | None = None         # Slots Gamblin: a Quick Select (three of a kind) is active
+    picks: tuple | None = None       # Slots Gamblin: the locked-in picks
+    stake: int = 0                   # Slots Gamblin: the locked-in bet
 
     def reset_round(self) -> None:
-        self.mode, self.full, self.reel, self.round_net = None, None, {}, 0
+        self.draft, self.quick, self.picks, self.stake, self.round_net = [None, None, None], None, None, 0, 0
 
 
 def _g_avail(p: GPlayer) -> int:
@@ -5109,6 +5115,7 @@ class GamblinSession:
                 "**[ ❔ | ❔ | ❔ ]**\n"
                 f"Press **Join** to play with your {PTS_NAME}. Starts <t:{end_ts}:R>.\n\n"
                 f"• {GAMBLIN_ROUNDS} rounds · bets {GAMBLIN_MIN_BET}–{pfmt(GAMBLIN_MAX_BET)}\n"
+                "• Pick **one symbol for each of the 3 reels**, then bet. Match 1, 2 or all 3 reels to win\n"
                 "• Your winnings count towards the **leaderboard**\n"
                 "• Everything is buttons — no typing needed\n"
                 "• `/slots` and `/ask` are paused until it's over"
@@ -5132,23 +5139,22 @@ class GamblinSession:
         except discord.HTTPException:
             pass
 
-    def _odds_fields(self, embed: discord.Embed, stage: int) -> None:
-        if stage == 1:
-            lines = [f"{label} · **{_fx(m)}** · {_g_odds(p)}" for label, p, m in G_FULL.values()]
-            embed.add_field(name="🎰 Jackpot Spin — bet on all 3 reels (before reel 1)", value="\n".join(lines), inline=False)
-        reel_line = " · ".join(f"{s} **{_fx(m)}**" for s, m in zip(G_SYMS, G_REEL_MULT))
-        embed.add_field(name=f"🎚️ Reel Rush — bet on reel {stage}", value=reel_line, inline=False)
+    def _chances_line(self) -> str:
+        return " · ".join(f"{s} {p * 100:.0f}%" for s, p in zip(G_SYMS, G_P))
 
-    def _round_embed(self, status: str, stage: int | None = None) -> discord.Embed:
+    def _round_embed(self, status: str) -> discord.Embed:
         shown = [self.reels[i] if i < self.revealed else "❔" for i in range(3)]
         embed = discord.Embed(
             title=f"🎰 Gamblin — Round {self.round}/{GAMBLIN_ROUNDS}",
             description=f"**[ {' | '.join(shown)} ]**\n{status}",
             color=discord.Color.gold(),
         )
-        if stage:
-            self._odds_fields(embed, stage)
-        embed.set_footer(text=f"{len(self.players)} players · bets {GAMBLIN_MIN_BET}–{pamt(GAMBLIN_MAX_BET)}")
+        if self.phase == "betting" and self.window_open:
+            embed.add_field(name="How it pays", inline=False, value=(
+                "Pick **one symbol per reel**, then bet. After the spin you win if **any** of your picks match their reel.\n"
+                "More matches pay more, and **all 3** matching pays a big bonus. Your exact payouts are shown before you lock in.\n"
+                f"Chance a reel shows each symbol: {self._chances_line()}"))
+        embed.set_footer(text=f"{len(self.players)} players · bets {GAMBLIN_MIN_BET}–{pamt(GAMBLIN_MAX_BET)} · one bet per round")
         return embed
 
     async def _play_round(self, r: int) -> None:
@@ -5158,87 +5164,56 @@ class GamblinSession:
         for p in self.players.values():
             p.reset_round()
         self.phase = "betting"
-        self.msg = None
+        self.stage = 1
+        self.deadline = time.time() + GAMBLIN_BET_SECONDS
+        self.msg = await self._send(
+            embed=self._round_embed(f"Bets close <t:{int(self.deadline)}:R>\nTap **Pick your reels**."),
+            view=_gview(_gb("🎰 Pick your reels", "gmb:open", "green")),
+        )
+        if self.msg is None:
+            raise RuntimeError("couldn't post the round message")
+        self.window_open = True
+        await asyncio.sleep(GAMBLIN_BET_SECONDS)
+        self.window_open = False                       # sync from here on: no late bets can sneak in
 
-        for stage in (1, 2, 3):
-            secs = GAMBLIN_BET_SECONDS if stage == 1 else GAMBLIN_REEL_SECONDS
+        bettors = [p for p in self.players.values() if p.stake and p.picks]
+        if not bettors:
+            self.empty_rounds = getattr(self, "empty_rounds", 0) + 1
+            note = "Nobody bet this round."
+            if self.empty_rounds >= 2:
+                self.stop_early = True
+                note += " Two quiet rounds in a row, so the table is closing."
+            await self._edit(self.msg, embed=self._round_embed(note), view=None)
+            return
+        self.empty_rounds = 0
+
+        for stage in (1, 2, 3):                        # the spin: one reel at a time
             self.stage = stage
-            self.deadline = time.time() + secs
-            if stage == 1:
-                view = _gview(
-                    _gb("🎰 Jackpot Spin (all 3 reels)", "gmb:open:full", "green"),
-                    _gb("🎚️ Reel Rush (reel by reel)", "gmb:open:reel", "blue"),
-                )
-            else:
-                view = _gview(_gb(f"🎚️ Bet on reel {stage}", "gmb:open:reel", "blue"))
-            status = (
-                f"Bets close <t:{int(self.deadline)}:R>\n"
-                + ("Pick **Jackpot Spin** (one bet on the whole spin) or **Reel Rush** (bet reel by reel)."
-                   if stage == 1 else
-                   f"Reel {stage - 1} landed {self.reels[stage - 2]}! **Reel Rush** players can bet on reel {stage} now.")
-            )
-            embed = self._round_embed(status, stage)
-            if self.msg is None:
-                self.msg = await self._send(embed=embed, view=view)
-                if self.msg is None:
-                    raise RuntimeError("couldn't post the round message")
-            else:
-                await self._edit(self.msg, embed=embed, view=view)
-
-            self.window_open = True
-            await asyncio.sleep(secs)
-            self.window_open = False                       # sync from here on: no late bets can sneak in
-
             await self._edit(self.msg, embed=self._round_embed(f"🌀 Reel {stage} is spinning…"), view=None)
-            await asyncio.sleep(2.5)
+            await asyncio.sleep(2.2)
             self.revealed = stage
-            await self._reveal(stage)
-
         await self._edit(self.msg, embed=self._round_embed("Round over!"), view=None)
+        await self._results(bettors)
 
-    async def _reveal(self, stage: int) -> None:
-        sym = self.reels[stage - 1]
-        lines: list[str] = []
-        for p in self.players.values():
-            bet = p.reel.get(stage)
-            if not bet:
-                continue
-            idx, stake = bet
-            if G_SYMS[idx] == sym:
-                payout = math.floor(stake * G_REEL_MULT[idx])
-                profit = self._settle(p, stake, payout)
-                lines.append(f"✅ <@{p.uid}> bet **{stake}** on {G_SYMS[idx]} → **+{profit}**")
+    async def _results(self, bettors: list) -> None:
+        lines = []
+        for p in bettors:
+            picks, stake = p.picks, p.stake
+            hits = [G_SYMS[picks[i]] == self.reels[i] for i in range(3)]
+            k = sum(hits)
+            marks = " ".join(f"{G_SYMS[picks[i]]}{'✅' if hits[i] else '❌'}" for i in range(3))
+            if k:
+                mult = _g_tiers(picks)[k][1]
+                profit = self._settle(p, stake, _pk_payout(stake, mult))
+                lines.append(f"✅ <@{p.uid}> {marks} · {k}/3 · bet **{stake:,}** ({_fx(mult)}) → **+{profit:,}**")
             else:
                 self._settle(p, stake, 0)
-                lines.append(f"❌ <@{p.uid}> bet **{stake}** on {G_SYMS[idx]} → −{stake}")
-
-        title = f"🎚️ Reel {stage} landed {sym}"
-        if stage == 3:
-            title = f"🎰 Final: [ {' | '.join(self.reels)} ]"
-            lines.append("")
-            lines.append("**Jackpot Spin bets**")
-            full_lines = []
-            for p in self.players.values():
-                if not p.full:
-                    continue
-                pred, stake = p.full
-                label, _, mult = G_FULL[pred]
-                if _g_full_wins(pred, self.reels):
-                    profit = self._settle(p, stake, math.floor(stake * mult))
-                    full_lines.append(f"✅ <@{p.uid}> {label} ({_fx(mult)}) → **+{profit}**")
-                else:
-                    self._settle(p, stake, 0)
-                    full_lines.append(f"❌ <@{p.uid}> {label} → −{stake}")
-            lines.extend(full_lines or ["No Jackpot Spin bets this round."])
-            movers = [p for p in self.players.values() if p.round_net]
-            if movers:
-                lines.append("")
-                lines.append("**Round result**")
-                for p in sorted(movers, key=lambda q: -q.round_net):
-                    lines.append(f"<@{p.uid}> {p.round_net:+,} → balance **{POINTS.points(p.uid):,}**")
-        elif not lines:
-            lines = ["No Reel Rush bets on this reel."]
-        embed = discord.Embed(title=title, description="\n".join(lines)[:4000], color=discord.Color.gold())
+                lines.append(f"❌ <@{p.uid}> {marks} · 0/3 · bet **{stake:,}** → −{stake:,}")
+        movers = [p for p in self.players.values() if p.round_net]
+        if movers:
+            lines += ["", "**Round result**"] + [f"<@{p.uid}> {p.round_net:+,} → balance **{POINTS.points(p.uid):,}**"
+                                                for p in sorted(movers, key=lambda q: -q.round_net)]
+        embed = discord.Embed(title=f"🎰 Final: [ {' | '.join(self.reels)} ]", description="\n".join(lines)[:4000], color=discord.Color.gold())
         await self._send(embed=embed)
 
     async def _winner_card(self) -> None:
@@ -5281,29 +5256,6 @@ async def _gpanel(interaction: discord.Interaction, text: str, view: discord.ui.
         await interaction.response.send_message(text, ephemeral=True, **kwargs)
 
 
-def _gcheck(g: GamblinSession, p: GPlayer, t: str, x: str) -> str | None:
-    if _gtarget(t, x) is None:
-        return "That button looks broken — open a fresh bet from the main message."
-    if g.phase != "betting" or not g.window_open:
-        return "⏳ Betting is closed right now — wait for the next window."
-    if t == "f":
-        if g.stage != 1:
-            return "🎰 Jackpot Spin bets close before the first reel stops."
-        if p.mode == "reel":
-            return "🎚️ You're playing Reel Rush this round."
-        if p.full:
-            return "🔒 You're already locked in for the Jackpot Spin."
-    else:
-        n = int(t[1:])
-        if n != g.stage:
-            return "That reel's betting window isn't open anymore."
-        if p.mode == "full":
-            return "🔒 You're locked into Jackpot Spin — wait for the reels!"
-        if n in p.reel:
-            return "🔒 You already bet on this reel."
-    return None
-
-
 def _gstake_error(p: GPlayer, amt: int) -> str | None:
     avail = _g_avail(p)
     if amt < GAMBLIN_MIN_BET:
@@ -5315,65 +5267,107 @@ def _gstake_error(p: GPlayer, amt: int) -> str | None:
     return None
 
 
-async def _g_pick_panel(interaction, p: GPlayer, kind: str) -> None:
-    if kind == "full":
-        lines = [f"{label} — pays **{_fx(m)}** ({_g_odds(pr)})" for label, pr, m in G_FULL.values()]
-        text = "🎰 **Jackpot Spin** — one bet on the whole spin. What will the 3 reels show?\n" + "\n".join(lines)
-        buttons = [_gb(f"{G_FULL[k][0]} {_fx(G_FULL[k][2])}", f"gmb:pick:f:{k}", "grey") for k in G_FULL]
-    else:
-        n = GAMBLIN.stage
-        lines = [f"{s} — pays **{_fx(m)}** ({pr * 100:.0f}% chance)" for s, m, pr in zip(G_SYMS, G_REEL_MULT, G_P)]
-        text = f"🎚️ **Reel Rush — reel {n}.** What will this reel land on?\n" + "\n".join(lines)
-        buttons = [_gb(f"{s} {_fx(m)}", f"gmb:pick:r{n}:{i}", "grey") for i, (s, m) in enumerate(zip(G_SYMS, G_REEL_MULT))]
-    await _gpanel(interaction, text, _gview(*buttons))
+# ---- Slots Gamblin panels -----------------------------------------------------------------------------
+# These are Discord "Components V2" layouts (discord.py 2.6+): text headings between rows of buttons, so the
+# panel can look like   REEL 1 / 🍒 🍋 🍇 ⭐ 7️⃣  ...  Quick Select ...  Proceed to bet.
+# Which symbols you picked is kept on your GPlayer, so every click just redraws the panel from that.
+def _g_text(text: str) -> discord.ui.TextDisplay:
+    return discord.ui.TextDisplay(text[:3900])
 
 
-async def _g_stake_panel(interaction, p: GPlayer, t: str, x: str) -> None:
-    desc, prob, mult = _gtarget(t, x)
+def _g_layout(*items) -> discord.ui.LayoutView:
+    view = discord.ui.LayoutView(timeout=1800)       # buttons have no callbacks: the raw on_interaction listener handles them
+    for item in items:
+        view.add_item(item)
+    return view
+
+
+def _g_rows(buttons: list) -> list:
+    """Split buttons into rows of 3 (6 symbols = 2 neat rows; a row holds at most 5)."""
+    return [discord.ui.ActionRow(*buttons[i:i + 3]) for i in range(0, len(buttons), 3)]
+
+
+def _g_picker_layout(p: GPlayer, note: str = "") -> discord.ui.LayoutView:
+    # Discord allows 40 components per message: this layout uses 39 (kept under on purpose).
+    ready = all(d is not None for d in p.draft)
+    locked_quick = p.quick is not None
+    items: list = []
+    for r in range(3):
+        pick = f"  ▸  {G_SYMS[p.draft[r]]}" if p.draft[r] is not None else ""
+        title = f"**REEL {r + 1}**{pick}"
+        if r == 0:
+            title = ("## 🎰 Pick your reels\nPick **one symbol on each reel**, or use **Quick Select** for three of a kind."
+                     + (f"\n{note}" if note else "") + f"\n\n{title}")
+        items.append(_g_text(title))
+        items += _g_rows([_gb(sym, f"gmb:r:{r}:{i}", "green" if p.draft[r] == i else "grey", disabled=locked_quick)
+                          for i, sym in enumerate(G_SYMS)])
+    items.append(_g_text("**QUICK SELECT**" + ("  (press the green one again to undo)" if locked_quick else "")))
+    items += _g_rows([_gb(sym * 3, f"gmb:q:{i}", "green" if p.quick == i else "grey", disabled=locked_quick and p.quick != i)
+                      for i, sym in enumerate(G_SYMS)])
+    items.append(discord.ui.ActionRow(
+        _gb("Proceed to bet", "gmb:go", "blue", disabled=not ready),
+        _gb("Clear", "gmb:clr", "grey", disabled=not ready and p.quick is None and all(d is None for d in p.draft)),
+    ))
+    return _g_layout(*items)
+
+
+def _g_picks_text(p: GPlayer) -> str:
+    return "  ".join(G_SYMS[i] for i in p.draft)
+
+
+def _g_stake_layout(p: GPlayer, note: str = "") -> discord.ui.LayoutView:
     avail = _g_avail(p)
     cap = min(avail, GAMBLIN_MAX_BET)
+    head = (f"## 💰 Your bet\nYour reels: **{_g_picks_text(p)}**\n{_g_tier_text(p.draft)}\n"
+            f"You have {pcompact(avail, True)} free (max bet {GAMBLIN_MAX_BET}). How much?" + (f"\n{note}" if note else ""))
     if cap < GAMBLIN_MIN_BET:
-        await _gpanel(interaction, f"You need at least {GAMBLIN_MIN_BET} free {PTS_NAME} to bet (you have {avail:,}).")
-        return
+        return _g_layout(_g_text(head + f"\nYou need at least {GAMBLIN_MIN_BET} free {PTS_NAME} to bet."),
+                         discord.ui.ActionRow(_gb("← Edit reels", "gmb:edit", "grey")))
     seen: set[int] = set()
     buttons = []
     for pct in (5, 10, 25):
         amt = min(cap, max(GAMBLIN_MIN_BET, avail * pct // 100))
         if amt not in seen:
             seen.add(amt)
-            buttons.append(_gb(f"{pct}% · {amt}", f"gmb:conf:{t}:{x}:{amt}", "grey"))
+            buttons.append(_gb(f"{pct}% · {amt}", f"gmb:conf:{amt}", "grey"))
     if cap not in seen:
-        label = "All-in" if cap == avail else "Max bet"
-        buttons.append(_gb(f"{label} · {cap}", f"gmb:conf:{t}:{x}:{cap}", "red"))
-    buttons.append(_gb("✏️ Custom", f"gmb:cust:{t}:{x}", "blue"))
-    buttons.append(_gb("← Back", "gmb:open:full" if t == "f" else "gmb:open:reel", "grey"))
-    text = (
-        f"{desc} · pays **{_fx(mult)}** · {_g_odds(prob)}\n"
-        f"You have {pcompact(avail, True)} free (max bet {GAMBLIN_MAX_BET}). How much do you want to bet?"
-    )
-    await _gpanel(interaction, text, _gview(*buttons))
+        buttons.append(_gb(f"{'All-in' if cap == avail else 'Max bet'} · {cap}", f"gmb:conf:{cap}", "red"))
+    buttons.append(_gb("✏️ Custom", "gmb:cust", "blue"))
+    return _g_layout(_g_text(head), discord.ui.ActionRow(*buttons), discord.ui.ActionRow(_gb("← Edit reels", "gmb:edit", "grey")))
 
 
-async def _g_confirm_panel(interaction, p: GPlayer, t: str, x: str, amt: int) -> None:
-    desc, prob, mult = _gtarget(t, x)
-    payout = math.floor(amt * mult)
-    text = (
-        f"Lock {pcompact(amt, True)} on {desc}?\n"
-        f"Win → **{payout:,}** back (+{payout - amt:,}) · Lose → −{amt:,}\n"
-        "⚠️ Once locked, it can't be changed."
-    )
-    await _gpanel(interaction, text, _gview(
-        _gb(f"🔒 Lock it in ({amt})", f"gmb:lock:{t}:{x}:{amt}", "green"),
-        _gb("← Back", f"gmb:pick:{t}:{x}", "grey"),
-    ))
+def _g_confirm_layout(p: GPlayer, amt: int) -> discord.ui.LayoutView:
+    t = _g_tiers(p.draft)
+    rows = "\n".join(f"{k} match{'es' if k > 1 else ''} → **{_pk_payout(amt, t[k][1]):,}** back (+{_pk_payout(amt, t[k][1]) - amt:,})"
+                     + (" · bonus" if k == 3 else "") for k in (1, 2, 3))
+    text = (f"## 🔒 Lock your bet?\nReels: **{_g_picks_text(p)}** · bet **{amt:,}**\n{rows}\n"
+            f"No match → −{amt:,}\n⚠️ Once locked, it can't be changed.")
+    return _g_layout(_g_text(text), discord.ui.ActionRow(
+        _gb(f"🔒 Lock it in ({amt})", f"gmb:lock:{amt}", "green"), _gb("← Change amount", "gmb:go", "grey")))
+
+
+async def _gshow(interaction: discord.Interaction, layout: discord.ui.LayoutView) -> None:
+    """Show a private panel: edit it in place if the click came from one, else open a new one."""
+    msg = interaction.message
+    if msg is not None and msg.flags.ephemeral:
+        await interaction.response.edit_message(view=layout)
+    else:
+        await interaction.response.send_message(view=layout, ephemeral=True)
+
+
+def _g_bet_error(g: "GamblinSession", p: GPlayer) -> str | None:
+    if g.phase != "betting" or not g.window_open:
+        return "⏳ Betting is closed right now — wait for the next round."
+    if p.stake:
+        return f"🔒 You're already locked in: {pfmt(p.stake)} on {'  '.join(G_SYMS[i] for i in p.picks)}."
+    return None
 
 
 class GamblinStakeModal(discord.ui.Modal):
     """The popup for typing your own bet amount (a popup, not a chat message)."""
 
-    def __init__(self, t: str, x: str, cap: int) -> None:
+    def __init__(self, cap: int) -> None:
         super().__init__(title="Custom bet", timeout=300)
-        self.t, self.x = t, x
         self.amount = discord.ui.TextInput(
             label=f"{PTS_CAP} ({GAMBLIN_MIN_BET}–{cap})", placeholder=str(cap), min_length=1, max_length=7,
         )
@@ -5381,12 +5375,14 @@ class GamblinStakeModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         g = GAMBLIN
-        p = g.players.get(interaction.user.id) if g is not None and type(g) is GamblinSession else None
-        if g is None or p is None:
+        p = g.players.get(interaction.user.id) if type(g) is GamblinSession else None
+        if p is None:
             await interaction.response.send_message("🎰 That Gamblin session is over.", ephemeral=True)
             return
-        err = _gcheck(g, p, self.t, self.x)
+        err = _g_bet_error(g, p)
         raw = str(self.amount.value).strip().replace(",", "")
+        if err is None and not all(d is not None for d in p.draft):
+            err = "Pick your reels first."
         if err is None and not raw.isdigit():
             err = "Numbers only please 🐾"
         if err is None:
@@ -5394,7 +5390,7 @@ class GamblinStakeModal(discord.ui.Modal):
         if err is not None:
             await interaction.response.send_message(err, ephemeral=True)
             return
-        await _g_confirm_panel(interaction, p, self.t, self.x, int(raw))
+        await _gshow(interaction, _g_confirm_layout(p, int(raw)))
 
 
 async def handle_gamblin_click(interaction: discord.Interaction, custom_id: str) -> None:
@@ -5434,68 +5430,89 @@ async def handle_gamblin_click(interaction: discord.Interaction, custom_id: str)
             )
         return
 
+    if action == "open":                          # "Pick your reels" on the round message: anyone can sit down while betting is open
+        if g.phase != "betting" or not g.window_open:
+            await say("⏳ Betting is closed right now — wait for the next round.")
+            return
+        err = _join_table(g, uid, GPlayer, "🎰")
+        if err:
+            await say(err)
+            return
+        p = g.players[uid]
+        err = _g_bet_error(g, p)
+        if err:
+            await say(err)
+            return
+        await _gshow(interaction, _g_picker_layout(p))
+        return
+
     p = g.players.get(uid)
     if p is None:
-        await say("🎰 You're not in this Gamblin — join the next one!")
+        await say("🎰 You're not in this Gamblin — tap **Pick your reels** during the betting window!")
         return
-
-    if action == "open" and len(parts) == 3 and parts[2] in ("full", "reel"):
-        kind = parts[2]
-        t = "f" if kind == "full" else f"r{g.stage}"
-        if g.phase != "betting" or not g.window_open:
-            await say("⏳ Betting is closed right now — wait for the next window.")
-            return
-        # Use any valid symbol just to run the shared state checks.
-        err = _gcheck(g, p, t, "any" if kind == "full" else "0")
-        if err is not None:
-            await say(err)
-            return
-        if _g_avail(p) < GAMBLIN_MIN_BET:
-            await say(f"You need at least {GAMBLIN_MIN_BET} free {PTS_NAME} to bet (you have {_g_avail(p):,}).")
-            return
-        await _g_pick_panel(interaction, p, kind)
+    err = _g_bet_error(g, p)
+    if err:
+        await say(err)
         return
+    ready = all(isinstance(d, int) for d in p.draft)
 
-    if action in ("pick", "conf", "lock", "cust") and len(parts) >= 4:
-        t, x = parts[2], parts[3]
-        err = _gcheck(g, p, t, x)
-        if err is not None:
-            await say(err)
+    if action == "r" and len(parts) == 4 and parts[2] in ("0", "1", "2") and parts[3].isdigit() and int(parts[3]) < len(G_SYMS):
+        r, sym = int(parts[2]), int(parts[3])
+        if p.quick is not None:
+            await say("⚡ Quick Select is on — press **Proceed to bet**, or undo it first.")
             return
-        if action == "pick":
-            await _g_stake_panel(interaction, p, t, x)
+        p.draft[r] = None if p.draft[r] == sym else sym          # press again to un-pick
+        await _gshow(interaction, _g_picker_layout(p))
+        return
+    if action == "q" and len(parts) == 3 and parts[2].isdigit() and int(parts[2]) < len(G_SYMS):
+        sym = int(parts[2])
+        if p.quick == sym:                                       # pressing the active quick button undoes it
+            p.quick, p.draft = None, [None, None, None]
+        elif p.quick is not None:
+            await say("⚡ Quick Select is on — press **Proceed to bet**, or undo it first.")
             return
-        if action == "cust":
-            cap = min(_g_avail(p), GAMBLIN_MAX_BET)
-            if cap < GAMBLIN_MIN_BET:
-                await say(f"You need at least {GAMBLIN_MIN_BET} free {PTS_NAME} to bet.")
-                return
-            await interaction.response.send_modal(GamblinStakeModal(t, x, cap))
+        else:
+            p.quick, p.draft = sym, [sym, sym, sym]
+        await _gshow(interaction, _g_picker_layout(p))
+        return
+    if action == "clr":
+        p.quick, p.draft = None, [None, None, None]
+        await _gshow(interaction, _g_picker_layout(p))
+        return
+    if action == "edit":
+        await _gshow(interaction, _g_picker_layout(p))
+        return
+    if action in ("go", "cust", "conf", "lock") and not ready:
+        await _gshow(interaction, _g_picker_layout(p, "👆 Pick a symbol on **every** reel first (or use Quick Select)."))
+        return
+    if action == "go":
+        await _gshow(interaction, _g_stake_layout(p))
+        return
+    if action == "cust":
+        cap = min(_g_avail(p), GAMBLIN_MAX_BET)
+        if cap < GAMBLIN_MIN_BET:
+            await say(f"You need at least {GAMBLIN_MIN_BET} free {PTS_NAME} to bet.")
             return
-        if len(parts) != 5 or not parts[4].isdigit():
-            await say("That button looks broken — open a fresh bet from the main message.")
-            return
-        amt = int(parts[4])
+        await interaction.response.send_modal(GamblinStakeModal(cap))
+        return
+    if action in ("conf", "lock") and len(parts) == 3 and parts[2].isdigit():
+        amt = int(parts[2])
         err = _gstake_error(p, amt)
         if err is not None:
             await say(err)
             return
         if action == "conf":
-            await _g_confirm_panel(interaction, p, t, x, amt)
+            await _gshow(interaction, _g_confirm_layout(p, amt))
             return
-        # action == "lock": instant memory work, no awaits between the checks and the commit.
-        desc, _, mult = _gtarget(t, x)
-        if t == "f":
-            p.full, p.mode = (x, amt), "full"
-        else:
-            p.reel[int(t[1:])], p.mode = (int(x), amt), "reel"
+        # lock: instant memory work, no awaits between the checks and the commit.
+        p.picks, p.stake = tuple(p.draft), amt
         p.pending += amt
-        tail = ("Wait for the reels — good luck! 🍀" if t == "f"
-                else "Result comes when the reel stops. You can bet on the next reel when it opens.")
-        await _gpanel(interaction, f"🔒 **Locked:** {pfmt(amt)} on {desc} (pays {_fx(mult)}).\n{tail}")
+        await _gshow(interaction, _g_layout(_g_text(
+            f"## 🔒 Locked\n**{pfmt(amt)}** on **{'  '.join(G_SYMS[i] for i in p.picks)}**\n{_g_tier_text(p.picks)}\n"
+            "Wait for the reels — good luck! 🍀")))
         return
 
-    await say("That button looks broken — open a fresh bet from the main message.")
+    await say("That button looks broken — tap **Pick your reels** again.")
 
 
 async def _gamblin_shutdown() -> None:
