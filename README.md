@@ -8,7 +8,7 @@ Features:
 - A persistent **✔️ Interested** button on `/join` messages — survives bot restarts, **no database required**
 - A cat-themed welcome message when new members join
 - Self-assign roles (button-based, no database), posted via the hidden `?rolemenu` command
-- Hidden text commands — `?send` (Manager role **or** Milo role), `?rolemenu`, `?updateDB`, `?gamblin` (slots, blackjack, duck race, roulette) and the Manager toolbox (`?give`, `?set`, `?undo`, `?check`, `?balances`, `?resetspins`, `?resetleaderboard`, `?snapshot`, `?mhelp`, `?mmhelp`, `?addredeem`, `?limitedshop`, `?customid`). All Manager role only, silent to everyone else; see Sections 16 and 17. — the **only** `?`-prefixed commands in the whole bot. None shows up in Discord's `/` picker and none is listed in `/help`; they're documented here in the README only.
+- Hidden text commands — `?send` (Manager role **or** Milo role), `?rolemenu`, `?updateDB`, `?gamblin` (slots, blackjack, duck race, roulette, crash, lucky dice, higher or lower) and the Manager toolbox (`?give`, `?set`, `?undo`, `?check`, `?balances`, `?resetspins`, `?resetleaderboard`, `?snapshot`, `?mhelp`, `?mmhelp`, `?addredeem`, `?limitedshop`, `?customid`). All Manager role only, silent to everyone else; see Sections 16 and 17. — the **only** `?`-prefixed commands in the whole bot. None shows up in Discord's `/` picker and none is listed in `/help`; they're documented here in the README only.
 - Several commands call free, keyless public APIs (cat facts/photos, quotes, dictionary, weather, translation, reaction gifs) — every call has a graceful fallback message if the API is briefly down or slow
 - Runs as a **Render Free Web Service** (Discord Gateway + a tiny HTTP health server in one process)
 - Secrets stay in environment variables, never in code
@@ -275,7 +275,7 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `?send <message>` | **Hidden.** Manager role or Milo role. Posts `<message>` as Milo. Not in `/help`, not a slash command. |
 | `?rolemenu` | **Hidden.** Manager-role-only. Posts the self-assign roles menu. Not in `/help`, not a slash command. |
 | `?updateDB` | **Hidden.** Manager-role-only. Saves all points to Upstash now and confirms. Not in `/help`, not a slash command. |
-| `?gamblin` / `?gamblin stop` | **Hidden.** Manager-role-only. Shows a button picker (Slots / Blackjack / Duck Race / Roulette), pings everyone and starts the one you choose in `GAMBLIN_CHANNEL_ID`. `?gamblin stop` ends whichever game is running (Section 16). |
+| `?gamblin` / `?gamblin stop` | **Hidden.** Manager-role-only. Shows a button picker (Slots / Blackjack / Duck Race / Roulette / Crash / Lucky Dice / Higher or Lower), pings everyone and starts the one you choose in `GAMBLIN_CHANNEL_ID`. `?gamblin stop` ends whichever game is running (Section 16). |
 | `?resetleaderboard sname:<name> snum:<number>` | **Hidden.** Manager-only. Archives the current leaderboard season and starts a fresh one (Section 29). Balances and lifetime stats don't change. |
 
 ---
@@ -606,11 +606,11 @@ A successful 🧠/🔮 press costs about 4.4 commands. Each active member costs 
 
 ## 16. Gamblin (button-only betting event)
 
-A Manager types **`?gamblin`** (from anywhere). Milo shows a short-lived button picker: **🎰 Slots · 🃏 Blackjack · 🦆 Duck Race · 🎡 Roulette**. Only the manager who typed it can press. Pick one and Milo pings @everyone and starts it in `GAMBLIN_CHANNEL_ID`. **`?gamblin stop`** ends whichever game is running. Shortcuts skip the picker: `?gamblin slots`, `?gamblin bj`, `?gamblin duck`, `?gamblin roulette`. All of it is silent to everyone without the Manager role. (`?gamblinbj` no longer exists; it's now just `?gamblin bj`.)
+A Manager types **`?gamblin`** (from anywhere). Milo shows a short-lived button picker: **🎰 Slots · 🃏 Blackjack · 🦆 Duck Race · 🎡 Roulette · 🚀 Crash · 🎲 Lucky Dice · 🎴 Higher or Lower**. Only the manager who typed it can press. Pick one and Milo pings @everyone and starts it in `GAMBLIN_CHANNEL_ID`. **`?gamblin stop`** ends whichever game is running. Shortcuts skip the picker: `?gamblin slots`, `?gamblin bj`, `?gamblin duck`, `?gamblin roulette`. All of it is silent to everyone without the Manager role. (`?gamblinbj` no longer exists; it's now just `?gamblin bj`.)
 
 **Scheduling:** `?gamblin schedule duck 8pm` announces the game with an @everyone ping and **starts it by itself** at that time. `?gamblin schedule 8pm` lets you pick the game with buttons. Times: `in 30m`, `in 1h30m`, `8pm`, `8:30pm`, `20:00` (clock times are in `LIMIT_RESET_TZ`, and mean the *next* time that clock shows; up to 24 hours ahead, up to 5 games). `?gamblin schedule list` shows what's coming and `?gamblin schedule cancel` clears it. The schedule is **saved to the database**, so a redeploy won't lose it. If another game is still running at the start time, the scheduled one waits and is dropped after 10 minutes (and logged).
 
-All four games share the same rules of the house: button-only betting in private panels, stakes held until each result lands, `/slots` + `/ask` + `/grouptrivia` + autosave paused while a game runs (back automatically when it ends or is stopped), one game at a time, and one batched save to Upstash at the end. Sections 16 (Slots), 19 (Blackjack), 20 (Duck Race) and 21 (Roulette) describe each game.
+All the games share the same rules of the house: button-only betting in private panels, stakes held until each result lands, `/slots` + `/ask` + `/grouptrivia` + autosave paused while a game runs (back automatically when it ends or is stopped), one game at a time, and one batched save to Upstash at the end. Sections 16 (Slots), 19 (Blackjack), 20 (Duck Race) and 21 (Roulette) describe each game.
 
 **Leaderboard (all four games):** a player's *positive* session profit is added to their all-time "total earned" when the game ends (even if it's stopped early). Losses never reduce it, and a losing session adds nothing. It's counted per session so winning and losing back and forth can't inflate the board.
 
@@ -935,3 +935,15 @@ All of it is loaded into memory at startup; manager changes write to Upstash fir
 - **Slots packs are bought first, spun later.** Buying a pack adds its spins to your day (they're banked). The panel then offers **Spin once**, **Spin all N** and, if you haven't hit the daily limit, **Buy another pack**. The spins you've already used today are never lost: a pack that was part-used before this change is still counted. The bought-spin count is saved (`milo:slots:packs`) together with the balance change on the next autosave.
 - **Lottery** is now a one-winner raffle (section 24). New variables: `LOTTERY_NOWIN_MAX_PERCENT`, `LOTTERY_MIN_PLAYERS`; `LOTTERY_JACKPOT_SEED` now defaults to 0.
 - **`/customize`** now also sets the **side colour of your `/inspect` card** (10 presets, saved in `milo:profile:color`) next to the favourite game.
+
+
+---
+
+## 31. New Gamblin games: 🚀 Crash, 🎲 Lucky Dice, 🎴 Higher or Lower
+
+Start them like any other game: `?gamblin` (pick with buttons), `?gamblin crash`, `?gamblin dice` or `?gamblin hilo`. They use the same table as the others: join in the lobby or tap **Place bet** any time, bets `GAMBLIN_MIN_BET`–`GAMBLIN_MAX_BET`, stakes held until the result, winnings count towards the leaderboard, `/slots` and `/ask` pause while it runs, one game at a time. They can also be picked by the **daily scheduled games**. All payouts come from the real odds with the same 92% long-run return as the other games, so the odds shown are the odds you get.
+
+- **🚀 Crash** (`GAMBLIN_CRASH_ROUNDS`=4, `GAMBLIN_CRASH_BET_SECONDS`=30, `GAMBLIN_CRASH_TICK_SECONDS`=1.25). Bet, then watch the rocket climb from x1.00. Press **Cash out** to lock in the multiplier it shows, or choose **Auto x1.5 / x2 / x3 / x5 / x10** when you bet (you get it only if the rocket gets there). The crash point is drawn before take-off so the chance of getting past x is exactly 0.92/x (instant crash about 8%), which means cashing out at any multiplier is worth the same in the long run. Max x100: the rocket stops there and everyone still in cashes out.
+- **🎲 Lucky Dice** (`GAMBLIN_DICE_ROUNDS`=4, `GAMBLIN_DICE_BET_SECONDS`=30). Two dice, one bet per round: **Under 7** (x2.2), **Lucky 7** (x5.5), **Over 7** (x2.2), **Doubles** (x5.5), **Snake eyes** 1+1 (x33.1) or **Boxcars** 6+6 (x33.1).
+- **🎴 Higher or Lower** (`GAMBLIN_HILO_ROUNDS`=5, `GAMBLIN_HILO_BET_SECONDS`=30). A card is shown; bet that the next one (from the rest of the deck, Ace high) is **Higher**, **Lower** or the **Same** rank. The odds depend on the card shown and are displayed on the buttons; ties lose for Higher and Lower, and only Same wins them. A 2 has no Lower and an Ace has no Higher.
+- **Favourite game:** all three appear in `/customize`. Stats are recorded under "Crash", "Lucky Dice" and "Higher or Lower".
