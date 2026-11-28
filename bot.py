@@ -26,6 +26,7 @@ See .env.example for every environment variable this bot uses.
 """
 
 import asyncio
+import difflib
 import hashlib
 import io
 import json
@@ -4038,6 +4039,7 @@ async def slots_slash(interaction: discord.Interaction):
     if status == "empty":
         # Out of spins but a pack can be bought: show the panel. Buying only adds spins; they spin them when they choose.
         await interaction.response.send_message(_slots_panel_text(uid, info["day"], info["msg"]), view=SlotsPanelView(uid), ephemeral=True)
+        await _send_chores(interaction, "slots")
         return
     if status != "ok":
         await interaction.response.send_message(info["msg"], ephemeral=True)
@@ -4047,10 +4049,12 @@ async def slots_slash(interaction: discord.Interaction):
     if ready >= 2:
         # Several spins are ready: spin once, spin all, or buy another pack.
         await interaction.response.send_message(_slots_panel_text(uid, info["day"]), view=SlotsPanelView(uid), ephemeral=True)
+        await _send_chores(interaction, "slots")
         return
 
     embed = _perform_spin(uid, paid=info["paid"], cost=0, day=info["day"])
     await interaction.response.send_message(embed=embed)
+    await _send_chores(interaction, "slots")
 
 
 @bot.tree.command(name="points", description=f"Check your {PTS_NAME}, rank, and spins left.")
@@ -7700,6 +7704,47 @@ def _insurance_embed(offer: dict) -> discord.Embed:
     return e
 
 
+# ---- the "what's left today" nudge: a small private message after /daily, /slots or /lottery ---------------
+_CHORES_SEEN: dict[str, set] = {}          # day -> {(user id, trigger)}: each nudge is sent at most once a day per person and command
+
+
+def _chores_text(uid: int, just_did: str) -> str | None:
+    """What this person still hasn't done today, leaving out the thing they just did. None if there is nothing left."""
+    day = _day_info()[0]
+    todo = []
+    if just_did != "daily" and POINTS.daily_state(uid)[0] < day:
+        todo.append("`/daily` — your daily reward is waiting")
+    if just_did != "slots":
+        left = SLOTS_FREE_SPINS - POINTS.used(uid, day)[0]
+        if left > 0:
+            todo.append(f"`/slots` — **{left}** free spin{'s' if left != 1 else ''} left")
+    if just_did != "lottery" and POINTS.ticket_count(uid, day) == 0:
+        todo.append("`/lottery` — you have no ticket for tonight's draw")
+    if not todo:
+        return None
+    head = {"daily": "✅ Daily claimed!", "slots": "🎰 Nice spin!", "lottery": "🎟️ Ticket bought, good luck!"}.get(just_did, "🐾")
+    return f"{head} Still on today's list:\n" + "\n".join(f"• {t}" for t in todo)
+
+
+async def _send_chores(interaction: discord.Interaction, just_did: str) -> None:
+    """Send the nudge as a private follow-up. It is only a reminder, so a failure here never matters."""
+    uid = interaction.user.id
+    day = _day_info()[0]
+    for old in [d for d in _CHORES_SEEN if d != day]:
+        del _CHORES_SEEN[old]
+    seen = _CHORES_SEEN.setdefault(day, set())
+    if (uid, just_did) in seen:
+        return
+    text = _chores_text(uid, just_did)
+    if text is None:
+        return
+    seen.add((uid, just_did))
+    try:
+        await interaction.followup.send(text, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
 class StreakInsuranceView(discord.ui.View):
     """Private choice shown when someone comes back after missing a day. The fee is only taken on 'Restore'."""
 
@@ -7751,6 +7796,7 @@ class StreakInsuranceView(discord.ui.View):
         POINTS.insure_daily(uid, day, new_streak, _daily_reward(new_streak), offer["fee"])      # no awaits since the checks
         await interaction.response.edit_message(content=f"Streak restored for {pamt(offer['fee'])}.", embed=None, view=None)
         await self._public_card(interaction, _daily_card(self.user, uid, new_streak, offer["streak"], False, offer["fee"]))
+        await _send_chores(interaction, "daily")
         await log_event(f"🛡️ `/daily` <@{uid}> bought streak insurance: {offer['streak']}-day streak restored for {offer['fee']:,} "
                         f"({STREAK_INSURANCE_PERCENT}% of {offer['balance']:,}).")
 
@@ -7770,6 +7816,7 @@ class StreakInsuranceView(discord.ui.View):
         POINTS.claim_daily(uid, day, 1, _daily_reward(1))
         await interaction.response.edit_message(content="Streak reset — nothing was charged.", embed=None, view=None)
         await self._public_card(interaction, _daily_card(self.user, uid, 1, streak, streak > 1))
+        await _send_chores(interaction, "daily")
 
     async def on_timeout(self) -> None:
         if self.message is not None and not self.used:
@@ -7813,6 +7860,7 @@ async def daily_slash(interaction: discord.Interaction):
     new_streak = streak + 1 if last == _day_before(day) else 1
     POINTS.claim_daily(uid, day, new_streak, _daily_reward(new_streak))
     await interaction.response.send_message(embed=_daily_card(interaction.user, uid, new_streak, streak, streak > 1 and new_streak == 1))
+    await _send_chores(interaction, "daily")
 
 
 def _pay_error(sender_id: int, recipient: discord.abc.User, amount: int) -> str | None:
@@ -8702,6 +8750,7 @@ class LotteryMenuView(discord.ui.View):
             await interaction.response.edit_message(
                 content=f"✅ Bought **{qty}** ticket{'s' if qty != 1 else ''} (−{pfmt(LOTTERY_COST * qty)}). Good luck! 🍀",
                 embed=_lottery_embed(self.owner_id), view=LotteryMenuView(self.owner_id))
+            await _send_chores(interaction, "lottery")
         return callback
 
 
@@ -10296,10 +10345,21 @@ PROFILE_COLORS: dict[str, tuple[str, str, tuple[int, int, int]]] = {
 # What /customize can show or hide on the card: key -> (label, emoji)
 PROFILE_SECTIONS: dict[str, tuple[str, str]] = {
     "balance": ("Balance", "💰"), "rank": ("Rank", "🏆"), "earned": ("Lifetime earned", "📈"), "streak": ("Daily streak", "🔥"),
-    "gamblin": ("Gamblin", "🎲"), "fav": ("Favourite game", "⭐"), "equipped": ("Equipped designs", "🎨"),
+    "gamblin": ("Gamblin", "🎲"), "fav": ("Favourite game", "⭐"), "equipped": ("Equipped designs", "🎨"), "joined": ("Server join date", "📅"),
 }
 PROFILE_AVATARS = {"small": "Small (top right)", "large": "Large (bottom)", "none": "Hidden"}
+PROFILE_DIVIDERS: dict[str, tuple[str, str]] = {            # key -> (label, the line drawn under the name); "default" = the card design's own line
+    "default": ("The card's own", ""), "paws": ("Paw prints", "🐾 · 🐾 · 🐾 · 🐾 · 🐾"), "stars": ("Stars", "✦ ✧ ✦ ✧ ✦ ✧ ✦ ✧ ✦"),
+    "hearts": ("Hearts", "💗 · 💗 · 💗 · 💗 · 💗"), "waves": ("Waves", "🌊 ～～～～～～～～ 🌊"), "line": ("Plain line", "━━━━━━━━━━━━━━━━━━"),
+    "none": ("No line", ""),
+}
+PROFILE_FEATURED: dict[str, tuple[str, str]] = {            # the big number at the top of the card: key -> (label, emoji)
+    "balance": ("Balance", "💰"), "earned": ("Lifetime earned", "📈"), "streak": ("Daily streak", "🔥"),
+    "bestwin": ("Best Gamblin win", "🏆"), "profit": ("Gamblin profit", "📊"), "rank": ("Leaderboard rank", "🥇"),
+}
+PROFILE_STATUS = ("🐱", "👑", "🔥", "⭐", "🍀", "🌙", "💎", "🎰", "🧶", "🦆", "🚀", "🎲")          # an emoji in front of your name
 PROFILE_BIO_MAX = 100
+PROFILE_MAX_SEASONS = 3
 
 
 def _clean_profile_opts(raw) -> dict | None:
@@ -10319,44 +10379,82 @@ def _clean_profile_opts(raw) -> dict | None:
         out["hide"] = hide
     if data.get("av") in PROFILE_AVATARS and data.get("av") != "small":
         out["av"] = data["av"]
+    if isinstance(data.get("hex"), str) and re.fullmatch(r"[0-9a-f]{6}", data["hex"].lower()):
+        out["hex"] = data["hex"].lower()
+    if data.get("feat") in PROFILE_FEATURED or data.get("feat") == "off":
+        out["feat"] = data["feat"]
+    if data.get("div") in PROFILE_DIVIDERS and data.get("div") != "default":
+        out["div"] = data["div"]
+    if data.get("emo") in PROFILE_STATUS:
+        out["emo"] = data["emo"]
+    if isinstance(data.get("seasons"), list):
+        seen: list[str] = []
+        for label in data["seasons"]:
+            if isinstance(label, str) and 0 < len(label) <= 100 and label not in seen:
+                seen.append(label)
+        if seen:
+            out["seasons"] = seen[:PROFILE_MAX_SEASONS]
     return out or None
 
 
-# How each Inspect Card looks. layout: grid (fields, like Classic) / lines (one line per stat) / ledger (monospaced table).
-# mark = bullet, banner = a line of art under the name, color = side bar (a colour picked in /customize wins), av = default avatar size.
+def parse_hex_color(text: str) -> str | None:
+    """'#f80', 'FF8800' ... -> 'ff8800'. None if it isn't a hex colour."""
+    t = (text or "").strip().lstrip("#").lower()
+    if re.fullmatch(r"[0-9a-f]{3}", t):
+        t = "".join(c * 2 for c in t)
+    return t if re.fullmatch(r"[0-9a-f]{6}", t) else None
+
+
+# How each Inspect Card looks. Nothing here uses code boxes (custom emoji and bold do not work inside them).
+#   layout: grid (stat fields) / list (one line per stat) / quote (the stats in a quote block)
+#   head = big title line, divider = line under the name, mark = bullet, feat = the big number at the top (a /customize pick wins),
+#   fields = emoji in front of each field name (grid), color = side bar (a /customize colour wins), av = default avatar size.
 INSPECT_DESIGNS: dict[str, dict] = {
     "classic": {"layout": "grid"},
-    "card_lucky_paw": {"layout": "lines", "color": (67, 181, 129), "mark": "🍀", "name": "🍀  {name}  🍀",
-                       "banner": "`🍀 · · · · · · · · · · 🍀`"},
-    "card_night_owl": {"layout": "lines", "color": (88, 80, 190), "mark": "✦", "name": "🌙  {name}",
-                       "banner": "`· ˚ ✦ · ⋆ · ˚ ✦ · ⋆ · ˚`"},
-    "card_high_roller": {"layout": "ledger", "color": (200, 30, 60), "name": "♠ ♥  {name}  ♦ ♣", "banner": "HIGH ROLLER"},
-    "card_yarn_tycoon": {"layout": "grid", "color": (255, 196, 0), "name": "🧶  {name}", "banner": "━━━━━━  YARN TYCOON  ━━━━━━", "av": "large"},
-    "card_jackpot_hunter": {"layout": "lines", "color": (150, 80, 255), "mark": "🎰", "name": "{name}",
-                            "banner": "```\n┃ 7️⃣ ┃ 7️⃣ ┃ 7️⃣ ┃\n```"},
+    "card_lucky_paw": {"layout": "list", "color": (67, 181, 129), "title": "🍀  {name}", "head": "## 🍀 Lucky Paw 🍀", "mark": "🍀",
+                       "divider": "🌿 · · · · · · · · · · 🌿", "feat": "balance", "footer": "May your spins be lucky"},
+    "card_night_owl": {"layout": "quote", "color": (88, 80, 190), "title": "🌙  {name}", "head": "## 🌙 Night Owl", "mark": "✦",
+                       "divider": "· ˚ ✦ · ⋆ · ˚ ✦ · ⋆ · ˚", "feat": "streak", "footer": "Still up? So is Milo"},
+    "card_high_roller": {"layout": "grid", "color": (200, 30, 60), "title": "♠ ♥  {name}  ♦ ♣", "head": "## ♠️ HIGH ROLLER ♠️", "fields": "♠♥♦♣",
+                         "divider": "♠️ ♥️ ♦️ ♣️ ♠️ ♥️ ♦️ ♣️", "feat": "balance", "footer": "The house always fears you"},
+    "card_yarn_tycoon": {"layout": "list", "color": (255, 196, 0), "title": "🧶  {name}", "head": "## 🧶 YARN TYCOON 🧶", "mark": "🧵",
+                         "divider": "━━━━━━━━━━━━━━━━━━", "feat": "earned", "av": "large", "footer": "Built one yarn at a time"},
+    "card_jackpot_hunter": {"layout": "quote", "color": (150, 80, 255), "title": "🎰  {name}", "head": "## 🎰 7️⃣ 7️⃣ 7️⃣ 🎰", "mark": "💎",
+                            "divider": "💎 ─────────── 💎", "feat": "bestwin", "footer": "Hunting the next 777"},
 }
 
 
-def _inspect_sections(uid: int) -> dict[str, tuple[str, list[str]]]:
-    """key -> (label, value lines) for every part of the card, before /customize hides any."""
+def _streak_now(uid: int) -> int:
+    """The running daily streak (0 once it has been broken)."""
     day, _ = _day_info()
     last, streak = POINTS.daily_state(uid)
-    alive = bool(last) and last >= _day_before(day)                  # streak still running (claimed today or yesterday)
+    return streak if last and last >= _day_before(day) else 0
+
+
+def _season_rank(uid: int, label: str) -> int | None:
+    for h in EXTRAS.history:
+        if h.get("label") == label:
+            for i, row in enumerate(h.get("top", [])):
+                if int(row[0]) == uid:
+                    return i + 1
+    return None
+
+
+def _inspect_sections(uid: int, seasons: list[str] | None = None) -> dict[str, tuple[str, list[str]]]:
+    """key -> (label, value lines) for every part of the card, before /customize hides any."""
     st = POINTS.stats.get(uid)
     rank = POINTS.rank_of(uid)
     out: dict[str, tuple[str, list[str]]] = {
         "balance": ("Balance", [pcompact(POINTS.points(uid), True)]),
         "rank": (f"Rank · {EXTRAS.season_label()}", [f"#{rank}" if rank else f"{EXTRAS.season_earned(uid):,}/{LEADERBOARD_MIN_POINTS:,} to join"]),
-        "earned": ("Lifetime earned", [f"{POINTS.total_earned(uid):,}"]),
     }
-    if alive:
-        bonus_day = streak + 7 - (streak % 7)                         # the next 7th-day bonus (a full week ahead if today was one)
-        out["streak"] = ("Daily streak", [f"**{streak}** day{'s' if streak != 1 else ''}" + (" · claimed today" if last == day else " · ready to claim"),
-                                          f"Next reward: **+{pamt(_daily_reward(streak + 1))}**",
-                                          f"Bonus: +{DAILY_WEEK_BONUS} on day {bonus_day}"])
-    else:
-        out["streak"] = ("Daily streak", ["**0** days" + (f" (was {streak})" if streak else ""),
-                                          f"Next reward: **+{pamt(_daily_reward(1))}**"])
+    if seasons:
+        rows = [f"**{label}** · " + (f"#{r}" if (r := _season_rank(uid, label)) else "unranked") for label in seasons
+                if any(h.get("label") == label for h in EXTRAS.history)]
+        if rows:
+            out["pastranks"] = ("Past seasons", rows)
+    out["earned"] = ("Lifetime earned", [f"{POINTS.total_earned(uid):,}"])
+    out["streak"] = ("Daily streak", [f"🔥 **{_streak_now(uid)}**"])
     if st and st.get("s"):
         out["gamblin"] = ("Gamblin", [f"{st['s']:,} games", f"{st['net']:+,} profit", f"Best win **+{st['bw']:,}**"])
     else:
@@ -10373,7 +10471,31 @@ def _inspect_sections(uid: int) -> dict[str, tuple[str, list[str]]]:
     return out
 
 
+def _featured(uid: int, key: str) -> tuple[str, str, str]:
+    """(label, emoji, value) of the big number at the top of the card."""
+    label, emoji = PROFILE_FEATURED[key]
+    st = POINTS.stats.get(uid) or {}
+    if key == "balance":
+        value = pcompact(POINTS.points(uid))
+    elif key == "earned":
+        value = f"{POINTS.total_earned(uid):,}"
+    elif key == "streak":
+        value = str(_streak_now(uid))
+    elif key == "bestwin":
+        value = f"+{st['bw']:,}" if st.get("bw") else "—"
+    elif key == "profit":
+        value = f"{st['net']:+,}" if st.get("s") else "—"
+    else:
+        rank = POINTS.rank_of(uid)
+        value = f"#{rank}" if rank else "unranked"
+    return label, emoji, value
+
+
 def _profile_color(uid: int, design: dict | None = None) -> discord.Color:
+    """A hex colour beats a preset colour, which beats the card design's own colour."""
+    hexcode = EXTRAS.opts.get(uid, {}).get("hex")
+    if hexcode:
+        return discord.Color(int(hexcode, 16))
     key = EXTRAS.color.get(uid)
     if key in PROFILE_COLORS:
         return discord.Color.from_rgb(*PROFILE_COLORS[key][2])
@@ -10391,33 +10513,33 @@ def _profile_embed(target: discord.Member | discord.User, design_id: str | None 
     hidden = set(opts.get("hide", ()))
     tag = _tag_of(uid)
 
-    head = f"@{target.name}" + (f"  ·  {tag}" if tag else "")
+    divider = PROFILE_DIVIDERS[opts["div"]][1] if opts.get("div") else design.get("divider", "")
+    feat = opts.get("feat") or design.get("feat")
+    top = [design["head"]] if design.get("head") else []
+    top.append(f"@{target.name}" + (f"  ·  {tag}" if tag else ""))
     if opts.get("bio"):
-        head += f"\n*{opts['bio']}*"
-    parts = {k: v for k, v in _inspect_sections(uid).items() if k not in hidden}
-    layout = design["layout"]
-    title = design.get("name", "{name}").format(name=target.display_name)[:256]
-    e = discord.Embed(title=title, color=_profile_color(uid, design))
+        top.append(f"*{opts['bio']}*")
+    if divider:
+        top.append(divider)
+    if feat in PROFILE_FEATURED:
+        label, emoji, value = _featured(uid, feat)
+        top.append(f"# {emoji} {value}\n*{label}*")
 
+    shown_big = feat if feat in PROFILE_FEATURED else None            # the big number already shows that stat, so it isn't repeated below
+    parts = {k: v for k, v in _inspect_sections(uid, opts.get("seasons")).items() if k not in hidden and k != shown_big}
+    layout, mark = design["layout"], design.get("mark", "▸")
+    name = (f"{opts['emo']} " if opts.get("emo") else "") + target.display_name
+    e = discord.Embed(title=design.get("title", "{name}").format(name=name)[:256], color=_profile_color(uid, design))
     if layout == "grid":
-        e.description = (design["banner"] + "\n" if design.get("banner") else "") + head
-        for key, (label, lines) in parts.items():
-            e.add_field(name=label, value="\n".join(lines), inline=key != "equipped")
-    elif layout == "lines":
-        rows = [f"{design['mark']} **{label}:** " + " · ".join(lines) for _, (label, lines) in parts.items()]
-        e.description = "\n".join([head, design["banner"], *rows])
-    else:                                                              # ledger: a monospaced table
-        table = []
-        for _, (label, lines) in parts.items():
-            lines = [l.replace("**", "") for l in lines]
-            label = label.split(" · ")[0].upper()
-            if len(lines[0]) <= 14:                                   # short value: same row as the label, the rest indented below
-                table.append(f"{label[:17]:<17}{lines[0]:>14}")
-                lines = lines[1:]
-            else:                                                     # long text: the label gets its own row
-                table.append(label)
-            table += [f"   {l[:44]}" for l in lines]
-        e.description = f"**{design['banner']}**\n{head}\n```\n" + "\n".join(table) + "\n```"
+        e.description = "\n".join(top)
+        suits = design.get("fields", "")
+        for i, (key, (label, lines)) in enumerate(parts.items()):
+            deco = f"{suits[i % len(suits)]} " if suits else ""
+            e.add_field(name=f"{deco}{label}", value="\n".join(lines), inline=key not in ("equipped", "pastranks"))
+    else:
+        bullet = "> " if layout == "quote" else ""
+        rows = [f"{bullet}{mark} **{label}** · " + " · ".join(lines) for label, lines in parts.values()]
+        e.description = "\n".join(top) + "\n\n" + "\n".join(rows)
     e.description = (e.description or "")[:4000]
 
     av = opts.get("av") or design.get("av", "small")
@@ -10425,10 +10547,16 @@ def _profile_embed(target: discord.Member | discord.User, design_id: str | None 
         e.set_image(url=target.display_avatar.url)
     elif av == "small":
         e.set_thumbnail(url=target.display_avatar.url)                # avatar: small, top-right
+    foot = []
     if uid in POINTS.frozen:
-        e.set_footer(text="Frozen by a manager")
-    elif isinstance(target, discord.Member) and target.joined_at:
-        e.set_footer(text=f"In the server since {target.joined_at:%d %b %Y}")
+        foot.append("Frozen by a manager")
+    else:
+        if design.get("footer"):
+            foot.append(design["footer"])
+        if "joined" not in hidden and isinstance(target, discord.Member) and target.joined_at:
+            foot.append(f"In the server since {target.joined_at:%d %b %Y}")
+    if foot:
+        e.set_footer(text=" · ".join(foot))
     return e
 
 
@@ -10449,45 +10577,111 @@ class AboutMeModal(discord.ui.Modal, title="About me"):
         await interaction.response.send_message("Saved. Your about-me line is on your `/inspect` card." if text else "Removed your about-me line.", ephemeral=True)
 
 
-class CustomizeView(discord.ui.View):
-    """/customize: favourite game, colour, which parts show, avatar size and an about-me line for your /inspect card.
-    Each choice saves the moment it's picked."""
-
+class HexColorModal(discord.ui.Modal, title="Card colour (hex code)"):
     def __init__(self, owner_id: int) -> None:
-        super().__init__(timeout=180)
+        super().__init__(timeout=300)
         self.owner_id = owner_id
-        cur = EXTRAS.fav.get(owner_id)
-        opts = [discord.SelectOption(label="Automatic: most played", value="auto", emoji="📊", default=cur is None,
-                                     description="Shows the game you've played the most")]
-        for kind, (emoji, label, _) in GAMBLIN_GAMES.items():
-            opts.append(discord.SelectOption(label=label, value=kind, emoji=emoji, default=cur == kind))
-        self.select = discord.ui.Select(placeholder="Favourite game…", options=opts, row=0)
-        self.select.callback = self._picked
-        self.add_item(self.select)
-        cc = EXTRAS.color.get(owner_id, "blurple")
-        self.color_select = discord.ui.Select(
-            placeholder="Profile colour…", row=1,
-            options=[discord.SelectOption(label=label, value=key, emoji=swatch, default=key == cc) for key, (label, swatch, _) in PROFILE_COLORS.items()])
-        self.color_select.callback = self._picked_color
-        self.add_item(self.color_select)
-        hidden = set(EXTRAS.opts.get(owner_id, {}).get("hide", ()))
-        self.sections_select = discord.ui.Select(
-            placeholder="Parts shown on your card…", row=2, min_values=0, max_values=len(PROFILE_SECTIONS),
-            options=[discord.SelectOption(label=label, value=key, emoji=emoji, default=key not in hidden) for key, (label, emoji) in PROFILE_SECTIONS.items()])
-        self.sections_select.callback = self._picked_sections
-        self.add_item(self.sections_select)
-        av = EXTRAS.opts.get(owner_id, {}).get("av", "small")
-        self.avatar_select = discord.ui.Select(
-            placeholder="Avatar size…", row=3,
-            options=[discord.SelectOption(label=label, value=key, emoji="🖼️", default=key == av) for key, label in PROFILE_AVATARS.items()])
-        self.avatar_select.callback = self._picked_avatar
-        self.add_item(self.avatar_select)
-        self.about_btn = discord.ui.Button(label="About me", emoji="✏️", style=discord.ButtonStyle.primary, row=4)
-        self.about_btn.callback = self._about
-        self.add_item(self.about_btn)
-        self.preview_btn = discord.ui.Button(label="Preview my card", emoji="👀", style=discord.ButtonStyle.secondary, row=4)
-        self.preview_btn.callback = self._preview
-        self.add_item(self.preview_btn)
+        cur = EXTRAS.opts.get(owner_id, {}).get("hex")
+        self.code = discord.ui.TextInput(label="Hex code, like #FF8800", required=False, max_length=7, min_length=0,
+                                         default=f"#{cur}" if cur else "", placeholder="Leave empty to go back to the normal colour")
+        self.add_item(self.code)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        raw = str(self.code.value or "").strip()
+        code = parse_hex_color(raw) if raw else None
+        if raw and code is None:
+            await interaction.response.send_message("That isn't a hex colour. Use 3 or 6 digits (0-9, A-F), like `#FF8800` or `#f80`.", ephemeral=True)
+            return
+        err = await EXTRAS.set_opts(self.owner_id, hex=code)
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        await interaction.response.send_message(f"Saved. Your card colour is now **#{code.upper()}**." if code else "Removed your hex colour.", ephemeral=True)
+
+
+class CustomizeView(discord.ui.View):
+    """/customize, in four pages (Discord only allows 5 rows): Look, Content, Past ranks, About me.
+    Each choice saves the moment it's picked."""
+    PAGES = {"look": ("🎨", "Look", "Colour, hex colour, divider line, avatar size"),
+             "content": ("📋", "Content", "Parts shown, big number, favourite game"),
+             "seasons": ("🏆", "Past ranks", "Show your finish in up to 3 old seasons"),
+             "about": ("✏️", "About me", "A short line and an emoji by your name")}
+
+    def __init__(self, owner_id: int, page: str = "look") -> None:
+        super().__init__(timeout=300)
+        self.owner_id, self.page = owner_id, page
+        self._build()
+
+    def _add(self, item: discord.ui.Item, callback) -> None:
+        item.callback = callback
+        self.add_item(item)
+
+    def _build(self) -> None:
+        self.clear_items()
+        uid = self.owner_id
+        opts = EXTRAS.opts.get(uid, {})
+        self.page_select = discord.ui.Select(
+            placeholder="What do you want to customize?", row=0,
+            options=[discord.SelectOption(label=label, value=key, emoji=emoji, description=desc, default=key == self.page)
+                     for key, (emoji, label, desc) in self.PAGES.items()])
+        self._add(self.page_select, self._page_picked)
+        if self.page == "look":
+            cc = EXTRAS.color.get(uid, "blurple")
+            self.color_select = discord.ui.Select(
+                placeholder="Colour…", row=1,
+                options=[discord.SelectOption(label=label, value=key, emoji=swatch, default=key == cc) for key, (label, swatch, _) in PROFILE_COLORS.items()])
+            self._add(self.color_select, self._picked_color)
+            self.divider_select = discord.ui.Select(
+                placeholder="Divider line…", row=2,
+                options=[discord.SelectOption(label=label, value=key, description=line or None, default=key == opts.get("div", "default"))
+                         for key, (label, line) in PROFILE_DIVIDERS.items()])
+            self._add(self.divider_select, self._picked_divider)
+            self.avatar_select = discord.ui.Select(
+                placeholder="Avatar size…", row=3,
+                options=[discord.SelectOption(label=label, value=key, emoji="🖼️", default=key == opts.get("av", "small")) for key, label in PROFILE_AVATARS.items()])
+            self._add(self.avatar_select, self._picked_avatar)
+            self._add(discord.ui.Button(label="Hex colour", emoji="🎨", style=discord.ButtonStyle.primary, row=4), self._hex)
+            self._add(discord.ui.Button(label="Preview my card", emoji="👀", style=discord.ButtonStyle.secondary, row=4), self._preview)
+        elif self.page == "content":
+            hidden = set(opts.get("hide", ()))
+            self.sections_select = discord.ui.Select(
+                placeholder="Parts shown on your card…", row=1, min_values=0, max_values=len(PROFILE_SECTIONS),
+                options=[discord.SelectOption(label=label, value=key, emoji=emoji, default=key not in hidden) for key, (label, emoji) in PROFILE_SECTIONS.items()])
+            self._add(self.sections_select, self._picked_sections)
+            feat = opts.get("feat", "default")
+            fopts = [discord.SelectOption(label="The card's own", value="default", default=feat == "default"),
+                     discord.SelectOption(label="Nothing", value="off", default=feat == "off")]
+            fopts += [discord.SelectOption(label=label, value=key, emoji=emoji, default=feat == key) for key, (label, emoji) in PROFILE_FEATURED.items()]
+            self.featured_select = discord.ui.Select(placeholder="Big number at the top…", row=2, options=fopts)
+            self._add(self.featured_select, self._picked_featured)
+            cur = EXTRAS.fav.get(uid)
+            gopts = [discord.SelectOption(label="Automatic: most played", value="auto", emoji="📊", default=cur is None, description="Shows the game you've played the most")]
+            for kind, (emoji, label, _) in GAMBLIN_GAMES.items():
+                gopts.append(discord.SelectOption(label=label, value=kind, emoji=emoji, default=cur == kind))
+            self.select = discord.ui.Select(placeholder="Favourite game…", options=gopts, row=3)
+            self._add(self.select, self._picked)
+            self._add(discord.ui.Button(label="Preview my card", emoji="👀", style=discord.ButtonStyle.secondary, row=4), self._preview)
+        elif self.page == "seasons":
+            chosen = set(opts.get("seasons", ()))
+            history = list(reversed(EXTRAS.history))[:25]
+            if history:
+                sopts = []
+                for h in history:
+                    r = _season_rank(uid, h["label"])
+                    sopts.append(discord.SelectOption(label=h["label"][:100], value=h["label"], emoji="🏆", default=h["label"] in chosen,
+                                                      description=(f"You finished #{r}" if r else "You weren't in the top 10")))
+                self.seasons_select = discord.ui.Select(placeholder="Pick up to 3 seasons to show…", row=1, min_values=0,
+                                                        max_values=min(PROFILE_MAX_SEASONS, len(sopts)), options=sopts)
+                self._add(self.seasons_select, self._picked_seasons)
+            self._add(discord.ui.Button(label="Preview my card", emoji="👀", style=discord.ButtonStyle.secondary, row=2), self._preview)
+        else:
+            cur_emo = opts.get("emo")
+            eopts = [discord.SelectOption(label="No emoji", value="none", default=cur_emo is None)]
+            eopts += [discord.SelectOption(label=f"{e} by my name", value=e, emoji=e, default=cur_emo == e) for e in PROFILE_STATUS]
+            self.status_select = discord.ui.Select(placeholder="Emoji in front of your name…", row=1, options=eopts)
+            self._add(self.status_select, self._picked_status)
+            self._add(discord.ui.Button(label="About me", emoji="✏️", style=discord.ButtonStyle.primary, row=2), self._about)
+            self._add(discord.ui.Button(label="Preview my card", emoji="👀", style=discord.ButtonStyle.secondary, row=2), self._preview)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
@@ -10495,47 +10689,64 @@ class CustomizeView(discord.ui.View):
             return False
         return True
 
-    async def _picked(self, interaction: discord.Interaction) -> None:
-        value = self.select.values[0]
-        err = await EXTRAS.set_fav(self.owner_id, None if value == "auto" else value)
+    async def _saved(self, interaction: discord.Interaction, err: str | None, text: str) -> None:
         if err:
             await interaction.response.send_message(err, ephemeral=True)
             return
-        for o in self.select.options:
-            o.default = o.value == value
-        shown = _favourite_game(self.owner_id)
-        text = "Saved. Your `/inspect` profile will show: " + (shown.replace("\n", " · ") if shown else "nothing yet (play a game!)")
+        self._build()
         await interaction.response.edit_message(content=text, view=self)
+
+    async def _page_picked(self, interaction: discord.Interaction) -> None:
+        self.page = self.page_select.values[0]
+        self._build()
+        await interaction.response.edit_message(content=_customize_text(self.owner_id, self.page), view=self)
+
+    async def _picked(self, interaction: discord.Interaction) -> None:
+        value = self.select.values[0]
+        err = await EXTRAS.set_fav(self.owner_id, None if value == "auto" else value)
+        shown = _favourite_game(self.owner_id)
+        await self._saved(interaction, err, "Saved. Your `/inspect` profile will show: " + (shown.replace("\n", " · ") if shown else "nothing yet (play a game!)"))
 
     async def _picked_color(self, interaction: discord.Interaction) -> None:
         value = self.color_select.values[0]
         err = await EXTRAS.set_color(self.owner_id, None if value == "blurple" else value)
-        if err:
-            await interaction.response.send_message(err, ephemeral=True)
-            return
-        for o in self.color_select.options:
-            o.default = o.value == value
-        await interaction.response.edit_message(content=f"Saved. Your `/inspect` card colour is now **{PROFILE_COLORS[value][0]}**.", view=self)
+        await self._saved(interaction, err, f"Saved. Your `/inspect` card colour is now **{PROFILE_COLORS[value][0]}**."
+                          + (" (Your hex colour still wins — remove it with the Hex colour button.)" if "hex" in EXTRAS.opts.get(self.owner_id, {}) else ""))
 
-    async def _picked_sections(self, interaction: discord.Interaction) -> None:
-        shown = set(self.sections_select.values)
-        err = await EXTRAS.set_opts(self.owner_id, hide=[k for k in PROFILE_SECTIONS if k not in shown])
-        if err:
-            await interaction.response.send_message(err, ephemeral=True)
-            return
-        for o in self.sections_select.options:
-            o.default = o.value in shown
-        await interaction.response.edit_message(content=f"Saved. Your card shows {len(shown)} of {len(PROFILE_SECTIONS)} parts.", view=self)
+    async def _picked_divider(self, interaction: discord.Interaction) -> None:
+        value = self.divider_select.values[0]
+        err = await EXTRAS.set_opts(self.owner_id, div=None if value == "default" else value)
+        await self._saved(interaction, err, f"Saved. Divider line: **{PROFILE_DIVIDERS[value][0]}**.")
 
     async def _picked_avatar(self, interaction: discord.Interaction) -> None:
         value = self.avatar_select.values[0]
         err = await EXTRAS.set_opts(self.owner_id, av=None if value == "small" else value)
-        if err:
-            await interaction.response.send_message(err, ephemeral=True)
-            return
-        for o in self.avatar_select.options:
-            o.default = o.value == value
-        await interaction.response.edit_message(content=f"Saved. Avatar on your card: **{PROFILE_AVATARS[value]}**.", view=self)
+        await self._saved(interaction, err, f"Saved. Avatar on your card: **{PROFILE_AVATARS[value]}**.")
+
+    async def _picked_sections(self, interaction: discord.Interaction) -> None:
+        shown = set(self.sections_select.values)
+        err = await EXTRAS.set_opts(self.owner_id, hide=[k for k in PROFILE_SECTIONS if k not in shown])
+        await self._saved(interaction, err, f"Saved. Your card shows {len(shown)} of {len(PROFILE_SECTIONS)} parts.")
+
+    async def _picked_featured(self, interaction: discord.Interaction) -> None:
+        value = self.featured_select.values[0]
+        err = await EXTRAS.set_opts(self.owner_id, feat=None if value == "default" else value)
+        name = {"default": "the card's own", "off": "nothing"}.get(value) or PROFILE_FEATURED[value][0]
+        await self._saved(interaction, err, f"Saved. Big number at the top: **{name}**.")
+
+    async def _picked_seasons(self, interaction: discord.Interaction) -> None:
+        picked = list(self.seasons_select.values)[:PROFILE_MAX_SEASONS]
+        err = await EXTRAS.set_opts(self.owner_id, seasons=picked)
+        await self._saved(interaction, err, f"Saved. Your card shows your finish in {len(picked)} season{'s' if len(picked) != 1 else ''}." if picked
+                          else "Saved. No past seasons on your card.")
+
+    async def _picked_status(self, interaction: discord.Interaction) -> None:
+        value = self.status_select.values[0]
+        err = await EXTRAS.set_opts(self.owner_id, emo=None if value == "none" else value)
+        await self._saved(interaction, err, "Saved. The emoji is in front of your name." if value != "none" else "Saved. No emoji by your name.")
+
+    async def _hex(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(HexColorModal(self.owner_id))
 
     async def _about(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(AboutMeModal(self.owner_id))
@@ -10545,7 +10756,23 @@ class CustomizeView(discord.ui.View):
                                                 ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
-@bot.tree.command(name="customize", description="Customize your /inspect profile (favourite game, colour, parts, avatar, about me).")
+def _customize_text(uid: int, page: str) -> str:
+    cur = _favourite_game(uid)
+    color = PROFILE_COLORS.get(EXTRAS.color.get(uid, "blurple"), PROFILE_COLORS["blurple"])[0]
+    if "hex" in EXTRAS.opts.get(uid, {}):
+        color = f"#{EXTRAS.opts[uid]['hex'].upper()} (hex)"
+    emoji, label, desc = CustomizeView.PAGES[page]
+    notes = {
+        "look": "A hex colour beats the preset colour, and either beats the colour of your Inspect Card. Colour now: " + color,
+        "content": "Untick anything you don't want on your card. Favourite now: " + (cur.replace(chr(10), ' · ') if cur else 'nothing yet'),
+        "seasons": "Pick up to 3 old leaderboard seasons to show your finish (top 10 only) on your card.",
+        "about": "Your name line: emoji + name. The About me line is shown under it.",
+    }
+    return (f"**{emoji} Customize your profile — {label}**\n{notes[page]}\n"
+            "Inspect Cards and Player tags are equipped in `/inventory` (bought in `/shop`). Everything saves the moment you pick it.")
+
+
+@bot.tree.command(name="customize", description="Customize your /inspect profile (colours, parts, past ranks, avatar, about me…).")
 async def customize_slash(interaction: discord.Interaction):
     if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
         await interaction.response.send_message("This bot is not configured for this server.", ephemeral=True)
@@ -10554,16 +10781,7 @@ async def customize_slash(interaction: discord.Interaction):
         await interaction.response.send_message(_POINTS_UNAVAILABLE, ephemeral=True)
         return
     uid = interaction.user.id
-    cur = _favourite_game(uid)
-    color = PROFILE_COLORS.get(EXTRAS.color.get(uid, "blurple"), PROFILE_COLORS["blurple"])[0]
-    text = ("**Customize your profile**\n"
-            "• **Favourite game** — leave it on automatic and Milo shows the game you've played most\n"
-            "• **Colour** — the side bar of your card (it beats the colour of an Inspect Card design)\n"
-            "• **Parts shown** — untick anything you don't want on your card\n"
-            "• **Avatar size** and an **About me** line\n"
-            f"Favourite now: {cur.replace(chr(10), ' · ') if cur else 'nothing yet'} · Colour: {color}\n"
-            "Inspect Cards and Player tags are equipped in `/inventory` (and bought in `/shop`).")
-    await interaction.response.send_message(text, view=CustomizeView(uid), ephemeral=True)
+    await interaction.response.send_message(_customize_text(uid, "look"), view=CustomizeView(uid), ephemeral=True)
 
 
 @bot.tree.command(name="inspect", description="View a player's profile card (yours by default).")
@@ -10599,7 +10817,7 @@ async def redeem_slash(interaction: discord.Interaction, code: app_commands.Rang
     if status == "ok":
         e = discord.Embed(title="Code redeemed", color=discord.Color.green(),
                           description="\n".join(f"• {l}" for l in info["lines"]) or "Done.")
-        e.set_footer(text=f"Code: {info['code']} · equip cosmetics in /shop")
+        e.set_footer(text=f"Code: {info['code']} · equip cosmetics in /inventory")
         await interaction.response.send_message(embed=e, ephemeral=True)
         await log_event(f"🎟️ `/redeem` <@{interaction.user.id}> used `{info['code']}`")
         return
@@ -10638,7 +10856,7 @@ _ONLY_TARGET_RE = re.compile(rf"^\?\w+\s+{_MGR_TARGET}\s*$", re.I)
 _MGR_WORDS = {"?give", "?set", "?undo", "?check", "?balances", "?resetspins", "?snapshot", "?mhelp", "?mmhelp",
               "?resetleaderboard", "?resetleaderbord", "?freeze", "?unfreeze", "?frozen", "?backup",
               "?restore", "?announce", "?resetpreview", "?giveitem", "?takeitem",
-              "?newplayertag", "?getplayertag", "?addredeem", "?removeredeem", "?redeems", "?customid", "?limitedshop"}
+              "?newplayertag", "?getplayertag", "?preview", "?addredeem", "?removeredeem", "?redeems", "?customid", "?limitedshop"}
 # The ONLY text commands a member who has just MILO_ROLE_ID may use (plus "?gamblin schedule list", handled in
 # _handle_gamblin_command). Everything else needs MANAGER_ROLE_ID. This is checked in the handlers, not just hidden in help.
 _LIMITED_WORDS = {"?announce", "?snapshot", "?check", "?balances", "?mmhelp"}
@@ -11287,6 +11505,28 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
         await log_event(f"🛍️ `{word}` by <@{mgr.id}>: <@{member.id}> — {item_label_text} (`{item}`)")
         return
 
+    # ---- ?preview item_id: see any design (even ones not in the shop) on yourself; nothing is bought or changed ----
+    if word == "?preview":
+        parts = text.split()
+        if len(parts) != 2:
+            await reply("Usage: `?preview item_id` — e.g. `?preview slots_newyear`. All IDs: `?customid`", keep=60)
+            return
+        raw = parts[1].lower()
+        classic = {v: k for k, v in _CLASSIC_PREVIEW.items()}
+        item = resolve_item_id(raw) or (raw if raw in classic else None)
+        if item is None:
+            close = difflib.get_close_matches(raw, [*CATALOG, *classic], n=3, cutoff=0.6)
+            await reply(f"❌ I don't know `{parts[1][:40]}`." + (f" Did you mean {', '.join(f'`{c}`' for c in close)}?" if close else "") + " All IDs: `?customid`", keep=60)
+            return
+        label = CATALOG[item]["name"] if item in CATALOG else _CAT_NONE_LABEL[classic[item]]
+        try:
+            embed = _shop_preview(mgr.id, item, mgr)
+            await message.channel.send(f"👀 Preview of **{label}** (`{item}`) on your own data. Nothing was bought or changed.",
+                                       embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            await reply("❌ Discord wouldn't show that preview.")
+        return
+
     # ---- ?newplayertag "text" @user: a custom player tag for one person ----
     if word == "?newplayertag":
         m = re.match(rf'^\?newplayertag\s+["“”](.+?)["“”]\s+{_MGR_TARGET}\s*$', text, re.I | re.S)
@@ -11384,6 +11624,7 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
             "`?removeredeem CODE` — delete a custom code · `?redeems` — list codes and how often each was used\n"
             "Permanent defaults: `MILO_GIFTS` (+50), `MILO_TAG` (Zealous tag)"))
         e.add_field(name="🕰️ Limited shop & IDs", inline=False, value=(
+            "`?preview item_id` — see any design on yourself (even seasonal ones not in the shop), nothing is bought\n"
             "`?customid` — every design / inspect card / tag / 777-style ID, including seasonal and unlisted ones\n"
             "`?limitedshop add <item_id> <price> <start> <end>` — e.g. `add slots_christmas 250 2026-12-01 2026-12-31`\n"
             "`?limitedshop price <item_id> <new_price>` · `?limitedshop time <item_id> <start> <end>` · "

@@ -955,11 +955,19 @@ Start them like any other game: `?gamblin` (pick with buttons), `?gamblin crash`
 ## 31. Inspect Cards, Player tags, /inventory and fixed bets (latest changes)
 
 - **Inspect Cards replace profile titles.** The shop category is now **🪪 Inspect Cards**: each one changes how your `/inspect` profile looks (layout, colours, decoration). The five old titles became cards with the **same names and prices** (Lucky Paw, Night Owl, High Roller, Yarn Tycoon, Jackpot Hunter), and anyone who owned one keeps it (old `title_*` IDs still work as aliases of the new `card_*` IDs). **👀 Preview** shows your own real profile in that design.
-- **/inspect** was realigned (three stats per row: Balance · Rank · Lifetime earned, then Daily streak · Gamblin · Favourite game) and the **777 guarantee counter was removed** from it. It stays in `/points`.
-- **/customize** now has: favourite game, colour, **which parts of the card are shown**, **avatar size** (small / large / hidden) and an **About me** line (100 characters). Saved in `milo:profile:opts` (only people who changed something are stored). A colour you pick beats the colour of an Inspect Card design.
+- **/inspect** was realigned and the **777 guarantee counter was removed** from it (it stays in `/points`). The daily streak is just **🔥 18** (no reward details).
+- **/customize** (four pages): **Look** (preset colour, **hex colour**, divider line, avatar size), **Content** (parts shown, big number at the top, favourite game), **Past ranks** (show your finish in up to 3 old seasons, top 10 only), **About me** (a 100-character line and an emoji in front of your name). Saved in `milo:profile:opts` (only people who changed something are stored). A hex colour beats a preset colour, which beats the colour of an Inspect Card design.
 - **Player tags** are shown after the name on `/inspect` and on **every leaderboard** (this season, past seasons, richest). Three new, very expensive shop tags: **💎 Luxurious** 100,000 · **👑 Majestic** 175,000 · **🌌 Immortal** 250,000. `❤️‍🔥 Zealous` stays redeem-only.
 - **Custom tags** (`?newplayertag`, `?getplayertag`, `?takeitem`) live inside the owner's own shop record, so they are saved and backed up with it. When the last owner loses one, nothing is left in the database.
 - **/inventory** shows everything you own and lets you **equip** any design, inspect card or tag (and preview it) without opening the shop.
 - **Gamblin win cards** (Champion Banner, Fireworks, Hall of Legends) were redesigned: bigger headline, best win ever, games played and a personal-best badge.
 - **Gamblin bet panels** (all seven games) now offer fixed bets **5, 10, 20, 30, 40, 50, 70, 100** instead of percentages. Only the amounts you can afford show; All-in or Max appears when your limit isn't one of them.
 - **`?addredeem`** accepts the expiry exactly as written in `?mhelp`: `[expires:2026-12-31]` (square brackets or round brackets, a time is allowed). Before, the brackets broke the command and nothing was created.
+
+
+## 32. Card redesign, reminders and ?preview
+
+- **Inspect Cards were redesigned.** No card uses a code box any more (bold and the custom points emoji do not render inside one, which broke the old High Roller). Each card has its own header, divider line, bullet, colour and big number: **Lucky Paw** (clover list), **Night Owl** (quote block, streak number), **High Roller** (suit-marked stat fields, balance), **Yarn Tycoon** (gold, large portrait, lifetime earned), **Jackpot Hunter** (777 header, best win). The stat shown as the big number is not repeated in the list below it.
+- **Reminder after `/daily`, `/slots` and `/lottery`:** a small private message lists what is still left today (daily reward, free spins, no lottery ticket) and never lists the thing you just did. Each reminder is sent at most once a day per person and command, and a failure to send it never affects the command.
+- **`/redeem`** now says to equip in `/inventory`.
+- **`?preview item_id`** (full managers): shows any design, including seasonal and unlisted ones, on your own data. Nothing is bought, granted or equipped. A wrong id suggests the closest ones.
