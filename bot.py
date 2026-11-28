@@ -26,6 +26,7 @@ See .env.example for every environment variable this bot uses.
 """
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
@@ -3112,6 +3113,19 @@ class PointsManager:
         if equip:
             st["eq"][CATALOG[item_id]["cat"]] = item_id
 
+    def grant_custom_tag(self, uid: int, label: str) -> str:
+        """Give someone a custom tag (the text must already be cleaned with clean_tag_label). Returns its id.
+        The same text given to another person reuses the same id."""
+        item_id = custom_tag_id(label)
+        _register_custom_tag(item_id, label)
+        st = self._shop_edit(uid)
+        st.setdefault("ct", {})[item_id] = CATALOG[item_id]["name"]
+        self.grant_item(uid, item_id, equip=False)
+        return item_id
+
+    def custom_tag_owners(self, item_id: str) -> list[int]:
+        return [u for u, st in self.shop.items() if item_id in st.get("own", [])]
+
     def revoke_item(self, uid: int, item_id: str) -> bool:
         st = self.shop_state(uid)
         if item_id not in st["own"]:
@@ -3119,6 +3133,12 @@ class PointsManager:
         st = self._shop_edit(uid)
         st["own"] = [i for i in st["own"] if i != item_id]
         st["eq"] = {c: i for c, i in st["eq"].items() if i != item_id}
+        if item_id in st.get("ct", {}):
+            del st["ct"][item_id]
+            if not st["ct"]:
+                del st["ct"]
+            if not self.custom_tag_owners(item_id):            # last owner: the tag stops existing everywhere
+                CATALOG.pop(item_id, None)
         return True
 
     def equip(self, uid: int, cat: str, item_id: str | None) -> bool:
@@ -3196,6 +3216,7 @@ class PointsManager:
         for uid_s, st in data.get("shop", {}).items():
             uid = int(uid_s)
             if self.shop.get(uid) != st:
+                _register_state_tags(st)
                 self.shop[uid] = st
                 self._p_shop.add(uid)
                 counts["shop"] += 1
@@ -3569,6 +3590,7 @@ class PointsManager:
                     except (TypeError, ValueError):
                         cleaned = None
                     if cleaned:
+                        _register_state_tags(cleaned)
                         self.shop[int(uid)] = cleaned
             raw_state = results[11].get("result")
             if self._p_lstate is None and raw_state:
@@ -4110,7 +4132,7 @@ async def leaderboard_slash(interaction: discord.Interaction, season: str | None
             return
         embed = discord.Embed(title=f"🏆 Milo Leaderboard — {old['label']}", color=discord.Color.dark_gold())
         top = old.get("top", [])[:10]
-        embed.description = ("\n".join(f"{medals[i] if i < 3 else f'`#{i + 1}`'} <@{u}> — {pcompact(int(e), True)}" for i, (u, e) in enumerate(top))
+        embed.description = ("\n".join(f"{medals[i] if i < 3 else f'`#{i + 1}`'} {_named(int(u))} — {pcompact(int(e), True)}" for i, (u, e) in enumerate(top))
                              or "Nobody finished on the board that season.")
         embed.set_footer(text=f"Archived season · ended {datetime.fromtimestamp(int(old.get('ended', 0)), _LIMIT_TZ):%d %b %Y} · {old.get('players', len(top))} on the board")
         await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
@@ -4120,7 +4142,7 @@ async def leaderboard_slash(interaction: discord.Interaction, season: str | None
     embed = discord.Embed(title=f"🏆 Milo Leaderboard — {EXTRAS.season_label()}", color=discord.Color.gold())
     if board:
         lines = [
-            f"{medals[i] if i < 3 else f'`#{i + 1}`'} <@{uid}> — {pcompact(earned, True)}"
+            f"{medals[i] if i < 3 else f'`#{i + 1}`'} {_named(uid)} — {pcompact(earned, True)}"
             for i, (uid, earned) in enumerate(board[:10])
         ]
         embed.description = "**📈 Top earners (this season)**\n" + "\n".join(lines)
@@ -4136,7 +4158,7 @@ async def leaderboard_slash(interaction: discord.Interaction, season: str | None
         )
         if near:
             text += "\n\n**Closest so far:**\n" + "\n".join(
-                f"<@{uid}> — {earned:,}/{LEADERBOARD_MIN_POINTS:,}" for uid, earned in near
+                f"{_named(uid)} — {earned:,}/{LEADERBOARD_MIN_POINTS:,}" for uid, earned in near
             )
         embed.description = text
         footer = "Ranked by earnings this season"
@@ -4144,7 +4166,7 @@ async def leaderboard_slash(interaction: discord.Interaction, season: str | None
     rich = POINTS.richest(5)
     if rich:
         rich_lines = [
-            f"{medals[i] if i < 3 else f'`#{i + 1}`'} <@{uid}> — {pcompact(bal, True)}"
+            f"{medals[i] if i < 3 else f'`#{i + 1}`'} {_named(uid)} — {pcompact(bal, True)}"
             for i, (uid, bal) in enumerate(rich)
         ]
         rich_text = "\n".join(rich_lines)
@@ -4643,7 +4665,7 @@ async def help_slash(interaction: discord.Interaction):
             f"{SLOTS_PAID_SPINS} bonus spins ({SLOTS_PACK_SPINS}-spin packs for {pfmt(SLOTS_PACK_COST)}; buying a pack only adds the spins). "
             f"Every {SLOTS_JACKPOT_PITY_AT}th spin without a 777 **is** a 777! Spin one or all at once.\n"
             f"Match all 3 to win: {payout_line}\n"
-            "`/points` — your balance, rank and spins left · `/inspect user:<member>` — a profile card (yours by default) · `/customize` — pick your favourite game and card colour\n"
+            "`/points` — your balance, rank and spins left · `/inspect user:<member>` — a profile card (yours by default) · `/customize` — shape your profile card · `/inventory` — equip your designs, cards and tags\n"
             f"`/daily` — claim free {PTS_NAME} every day; a streak makes it bigger (+{DAILY_WEEK_BONUS} bonus every 7th day!)"
             + (f" Missed a day? Streak insurance can restore it for {STREAK_INSURANCE_PERCENT}% of your balance (you always see the fee first).\n" if STREAK_INSURANCE_PERCENT else "\n")
             + "`/redeem code:<code>` — redeem a code for a reward (once per person)\n"
@@ -4658,7 +4680,7 @@ async def help_slash(interaction: discord.Interaction):
         value=(
             "`/gamblinstats` — your Gamblin record + the hall of fame\n"
             f"`/lottery` — buy tickets for the nightly draw: one winner takes the whole pot ({pamt(LOTTERY_COST)} a ticket)\n"
-            f"`/shop` — buy daily cards, slot machines, 777 announcements, titles & more with {PTS_NAME} (preview first!)\n"
+            f"`/shop` — buy daily cards, slot machines, 777 announcements, inspect cards, player tags & more with {PTS_NAME} (preview first!)\n"
             "Bonus packs: buy them in `/slots`, then spin when you like\n"
             "🎲 Managers sometimes run **Gamblin** nights (slots, blackjack, duck race, roulette, crash, lucky dice & higher or lower) — watch for the @everyone ping!"
         ),
@@ -5287,6 +5309,18 @@ def _g_rows(buttons: list) -> list:
     return [discord.ui.ActionRow(*buttons[i:i + 3]) for i in range(0, len(buttons), 3)]
 
 
+GAMBLIN_BET_STEPS = (5, 10, 20, 30, 40, 50, 70, 100)       # the quick-bet buttons in every Gamblin bet panel
+
+
+def _g_bet_options(avail: int, cap: int) -> list[tuple[str, int, str]]:
+    """(label, amount, colour) of the quick-bet buttons: the fixed steps you can afford (and that fit the
+    min/max bet), then an All-in / Max button when your cap is not already one of the steps."""
+    out = [(str(a), a, "grey") for a in GAMBLIN_BET_STEPS if GAMBLIN_MIN_BET <= a <= cap]
+    if cap >= GAMBLIN_MIN_BET and cap not in GAMBLIN_BET_STEPS:
+        out.append((f"{'All-in' if cap == avail else 'Max bet'} · {cap}", cap, "red"))
+    return out
+
+
 def _g_picker_layout(p: GPlayer, note: str = "") -> discord.ui.LayoutView:
     # Discord allows 40 components per message: this layout uses 39 (kept under on purpose).
     ready = all(d is not None for d in p.draft)
@@ -5323,17 +5357,10 @@ def _g_stake_layout(p: GPlayer, note: str = "") -> discord.ui.LayoutView:
     if cap < GAMBLIN_MIN_BET:
         return _g_layout(_g_text(head + f"\nYou need at least {GAMBLIN_MIN_BET} free {PTS_NAME} to bet."),
                          discord.ui.ActionRow(_gb("← Edit reels", "gmb:edit", "grey")))
-    seen: set[int] = set()
-    buttons = []
-    for pct in (5, 10, 25):
-        amt = min(cap, max(GAMBLIN_MIN_BET, avail * pct // 100))
-        if amt not in seen:
-            seen.add(amt)
-            buttons.append(_gb(f"{pct}% · {amt}", f"gmb:conf:{amt}", "grey"))
-    if cap not in seen:
-        buttons.append(_gb(f"{'All-in' if cap == avail else 'Max bet'} · {cap}", f"gmb:conf:{cap}", "red"))
+    buttons = [_gb(label, f"gmb:conf:{amt}", style) for label, amt, style in _g_bet_options(avail, cap)]
     buttons.append(_gb("✏️ Custom", "gmb:cust", "blue"))
-    return _g_layout(_g_text(head), discord.ui.ActionRow(*buttons), discord.ui.ActionRow(_gb("← Edit reels", "gmb:edit", "grey")))
+    rows = [discord.ui.ActionRow(*buttons[i:i + 5]) for i in range(0, len(buttons), 5)]      # an action row holds at most 5 buttons
+    return _g_layout(_g_text(head), *rows, discord.ui.ActionRow(_gb("← Edit reels", "gmb:edit", "grey")))
 
 
 def _g_confirm_layout(p: GPlayer, amt: int) -> discord.ui.LayoutView:
@@ -5775,16 +5802,7 @@ async def _bj_stake_panel(interaction, p: BJPlayer) -> None:
     if cap < GAMBLIN_MIN_BET:
         await _gpanel(interaction, f"You need at least {GAMBLIN_MIN_BET} free {PTS_NAME} to bet (you have {avail:,}).")
         return
-    seen: set[int] = set()
-    buttons = []
-    for pct in (5, 10, 25):
-        amt = min(cap, max(GAMBLIN_MIN_BET, avail * pct // 100))
-        if amt not in seen:
-            seen.add(amt)
-            buttons.append(_gb(f"{pct}% · {amt}", f"bj:conf:{amt}", "grey"))
-    if cap not in seen:
-        label = "All-in" if cap == avail else "Max bet"
-        buttons.append(_gb(f"{label} · {cap}", f"bj:conf:{cap}", "red"))
+    buttons = [_gb(label, f"bj:conf:{amt}", style) for label, amt, style in _g_bet_options(avail, cap)]
     buttons.append(_gb("✏️ Custom", "bj:cust", "blue"))
     text = (
         f"🃏 **How much do you want to bet this round?**\n"
@@ -6023,22 +6041,13 @@ RL_PREFIX = "rl:"
 
 
 async def _stake_panel(interaction, p: GPlayer, header: str, conf_id, cust_id: str, back_id: str | None = None) -> None:
-    """The shared 'how much?' panel: 5% / 10% / 25% / All-in-or-Max / Custom popup."""
+    """The shared 'how much?' panel: fixed bet steps (5, 10, 20 … 100) / All-in-or-Max / Custom popup."""
     avail = _g_avail(p)
     cap = min(avail, GAMBLIN_MAX_BET)
     if cap < GAMBLIN_MIN_BET:
         await _gpanel(interaction, f"You need at least {GAMBLIN_MIN_BET} free {PTS_NAME} to bet (you have {avail:,}).")
         return
-    seen: set[int] = set()
-    buttons = []
-    for pct in (5, 10, 25):
-        amt = min(cap, max(GAMBLIN_MIN_BET, avail * pct // 100))
-        if amt not in seen:
-            seen.add(amt)
-            buttons.append(_gb(f"{pct}% · {amt}", conf_id(amt), "grey"))
-    if cap not in seen:
-        label = "All-in" if cap == avail else "Max bet"
-        buttons.append(_gb(f"{label} · {cap}", conf_id(cap), "red"))
+    buttons = [_gb(label, conf_id(amt), style) for label, amt, style in _g_bet_options(avail, cap)]
     buttons.append(_gb("✏️ Custom", cust_id, "blue"))
     if back_id:
         buttons.append(_gb("← Back", back_id, "grey"))
@@ -8812,7 +8821,7 @@ async def _lottery_loop() -> None:
 # 🛍️ /shop -- cosmetic DESIGNS for Milo's messages (no Discord roles, so no 250-role limit)
 #
 # Categories (see SHOP_CATEGORIES): slots, spin-all, daily card, Gamblin win card, 777 announcement,
-# profile titles and player tags. Each design has a permanent ID in the CATALOG below.
+# inspect cards and player tags. Each design has a permanent ID in the CATALOG below.
 # Designs are purely cosmetic (never odds or payouts). Everything can be previewed for free first.
 # What you own + what you've equipped is saved to the database (IDs only -- the design itself always
 # comes from the catalog). SHOP_PRICE_PERCENT scales the permanent prices; SHOP_DISCOUNT adds a sale;
@@ -8838,13 +8847,13 @@ SHOP_CATEGORIES = {
     "daily": ("🎁", "/daily", "How your daily reward card looks."),
     "win": ("🏆", "Gamblin win card", "The card Milo posts when you have the biggest win of a Gamblin game."),
     "jackpot": ("💥", "777 announcement", "The message Milo posts when you hit 777 in /slots."),
-    "title": ("🏷️", "Profile titles", "A title shown on your /inspect profile."),
-    "tag": ("🎖️", "Player tags", "A small badge shown next to your name on your profile."),
+    "inspect": ("🪪", "Inspect Cards", "A custom design for your /inspect profile card."),
+    "tag": ("🎖️", "Player tags", "A badge shown after your name on /inspect and the leaderboard."),
 }
 _CAT_NONE_LABEL = {"slots": "Classic", "quick": "Classic", "daily": "Classic", "win": "Classic",
-                   "jackpot": "Default announcement", "title": "No title", "tag": "No tag"}
+                   "jackpot": "Default announcement", "inspect": "Classic card", "tag": "No tag"}
 _CAT_IDS_LABEL = {"daily": "Daily card designs", "slots": "Slot machine designs", "quick": "Spin-all designs",
-                  "win": "Gamblin win cards", "jackpot": "777 announcement styles", "title": "Player titles",
+                  "win": "Gamblin win cards", "jackpot": "777 announcement styles", "inspect": "Inspect cards",
                   "tag": "Player tags"}
 
 CATALOG: dict[str, dict] = {
@@ -8873,17 +8882,24 @@ CATALOG: dict[str, dict] = {
     "jp777_vault": {"cat": "jackpot", "name": "Vault Cracker", "price": 18_000, "listed": True, "blurb": "You cracked the vault. Steel and gold."},
     "jp777_royal": {"cat": "jackpot", "name": "Royal Decree", "price": 25_000, "listed": True, "blurb": "The House issues a formal decree."},
     "jp777_cosmic": {"cat": "jackpot", "name": "Supernova", "price": 40_000, "listed": True, "blurb": "Milo watches a star explode for you."},
-    # --- profile titles ---
-    "title_lucky_paw": {"cat": "title", "name": "Lucky Paw", "price": 2_500, "listed": True, "blurb": "For paws that find the jackpot."},
-    "title_night_owl": {"cat": "title", "name": "Night Owl", "price": 5_000, "listed": True, "blurb": "Up late, still spinning."},
-    "title_high_roller": {"cat": "title", "name": "High Roller", "price": 8_000, "listed": True, "blurb": "Big bets, bigger nerve."},
-    "title_yarn_tycoon": {"cat": "title", "name": "Yarn Tycoon", "price": 15_000, "listed": True, "blurb": "Owns more yarn than the cat can chase."},
-    "title_jackpot_hunter": {"cat": "title", "name": "Jackpot Hunter", "price": 20_000, "listed": True, "blurb": "Always chasing the triple seven."},
-    # --- player tags (redeem-only) ---
+    # --- /inspect cards (these used to be the five profile titles; the old title_* ids are aliases, see _ITEM_ALIASES) ---
+    "card_lucky_paw": {"cat": "inspect", "name": "Lucky Paw", "price": 2_500, "listed": True, "blurb": "Clover green, a lucky-charm header and tidy stat lines."},
+    "card_night_owl": {"cat": "inspect", "name": "Night Owl", "price": 5_000, "listed": True, "blurb": "Midnight indigo with moon and stars."},
+    "card_high_roller": {"cat": "inspect", "name": "High Roller", "price": 8_000, "listed": True, "blurb": "A casino ledger: red felt, monospaced numbers."},
+    "card_yarn_tycoon": {"cat": "inspect", "name": "Yarn Tycoon", "price": 15_000, "listed": True, "blurb": "A gold balance sheet with a big portrait."},
+    "card_jackpot_hunter": {"cat": "inspect", "name": "Jackpot Hunter", "price": 20_000, "listed": True, "blurb": "A neon 777 scoreboard for jackpot chasers."},
+    # --- player tags (redeem-only; ?newplayertag makes one-off custom tags, see custom_tag_id) ---
     "tag_zealous": {"cat": "tag", "name": "Zealous", "price": None, "listed": False, "emoji": "❤️‍🔥", "blurb": "A fiery badge for the truly devoted."},
+    # --- player tags (sold; deliberately very expensive) ---
+    "tag_luxurious": {"cat": "tag", "name": "Luxurious", "price": 100_000, "listed": True, "emoji": "💎", "blurb": "For players who only buy the finest."},
+    "tag_majestic": {"cat": "tag", "name": "Majestic", "price": 175_000, "listed": True, "emoji": "👑", "blurb": "Bow down. The crown is yours."},
+    "tag_immortal": {"cat": "tag", "name": "Immortal", "price": 250_000, "listed": True, "emoji": "🌌", "blurb": "The rarest badge Milo sells."},
 }
 # Alternative spellings that point at the same catalog entry (so nobody has two definitions of one thing).
-_ITEM_ALIASES = {"title_zealous": "tag_zealous"}
+_ITEM_ALIASES = {"title_zealous": "tag_zealous",
+                 # the old profile titles became Inspect Cards (same names and prices, owners keep them)
+                 "title_lucky_paw": "card_lucky_paw", "title_night_owl": "card_night_owl", "title_high_roller": "card_high_roller",
+                 "title_yarn_tycoon": "card_yarn_tycoon", "title_jackpot_hunter": "card_jackpot_hunter"}
 # Retired content. Never defined again; anything pointing at it is quietly dropped on load.
 _RETIRED_ITEM_IDS = {"halloween2026daily", "hallweenspinslot", "daily_halloween", "slots_halloween"}
 
@@ -8986,14 +9002,67 @@ def shop_price(item_id: str) -> int:
     return shop_price_info(item_id)[1]
 
 
+# ---- custom player tags (?newplayertag) -----------------------------------------------------
+# A custom tag is NOT stored in a global list. Its text lives inside the shop record of each player who owns it
+# (st["ct"] = {id: text}), so it is saved and backed up together with them, and when the last owner loses it
+# nothing is left in the database. The id is a hash of the text, so giving the same text to a second person
+# reuses the same id (that is how "only person having this tag" is known). The catalog entry is rebuilt from
+# the owners' records when Milo starts.
+CUSTOM_TAG_MAX = 40
+
+
+def clean_tag_label(text: str) -> str | None:
+    """Tidy a custom tag text: one line, single spaces, 2..CUSTOM_TAG_MAX characters. None if unusable."""
+    t = " ".join((text or "").split())
+    t = discord.utils.escape_mentions(t)
+    return t if 2 <= len(t) <= CUSTOM_TAG_MAX else None
+
+
+def custom_tag_id(label: str) -> str:
+    return "ctag_" + hashlib.sha1(label.casefold().encode("utf-8")).hexdigest()[:10]
+
+
+def _register_custom_tag(item_id: str, label: str) -> None:
+    if item_id not in CATALOG:
+        CATALOG[item_id] = {"cat": "tag", "name": label, "price": None, "listed": False, "custom": True,
+                            "blurb": "A custom tag made just for you."}
+
+
 def _clean_shop_state(raw) -> dict | None:
-    """Keep only things we know about (so an old or odd saved value can't break anything)."""
+    """Keep only things we know about (so an old or odd saved value can't break anything).
+    Also moves the old profile titles over to the Inspect Cards that replaced them."""
     if not isinstance(raw, dict):
         return None
-    own = sorted({i for i in raw.get("own", []) if isinstance(i, str) and i in CATALOG}) if isinstance(raw.get("own"), list) else []
+    ct: dict[str, str] = {}
+    if isinstance(raw.get("ct"), dict):
+        for cid, label in raw["ct"].items():
+            clean = clean_tag_label(label) if isinstance(label, str) else None
+            if isinstance(cid, str) and clean and cid == custom_tag_id(clean):
+                ct[cid] = clean
+    def known(i) -> bool:
+        return isinstance(i, str) and (i in CATALOG or i in ct)
+    own = sorted({_ITEM_ALIASES.get(i, i) for i in raw.get("own", []) if isinstance(i, str)}) if isinstance(raw.get("own"), list) else []
+    own = [i for i in own if known(i)]
     eq_raw = raw.get("eq", {}) if isinstance(raw.get("eq"), dict) else {}
-    eq = {c: i for c, i in eq_raw.items() if i in own and CATALOG[i]["cat"] == c}
-    return {"own": own, "eq": eq} if own else None
+    eq: dict[str, str] = {}
+    for c, i in eq_raw.items():
+        c, i = ("inspect" if c == "title" else c), _ITEM_ALIASES.get(i, i)
+        cat = CATALOG[i]["cat"] if i in CATALOG else ("tag" if i in ct else None)
+        if i in own and cat == c:
+            eq[c] = i
+    if not own:
+        return None
+    out = {"own": own, "eq": eq}
+    ct = {i: t for i, t in ct.items() if i in own}
+    if ct:
+        out["ct"] = ct
+    return out
+
+
+def _register_state_tags(st: dict) -> None:
+    """Make the catalog know the custom tags inside a (cleaned) shop record."""
+    for cid, label in (st.get("ct") or {}).items():
+        _register_custom_tag(cid, label)
 
 
 def style_of(uid: int, cat: str) -> str:
@@ -9017,14 +9086,15 @@ def _milo_emoji_url() -> str | None:
     return f"https://cdn.discordapp.com/emojis/{m.group(2)}.{'gif' if m.group(1) else 'png'}?size=128"
 
 
-def _title_of(uid: int) -> str | None:
-    t = style_of(uid, "title")
-    return CATALOG[t]["name"] if t != "classic" else None
-
-
 def _tag_of(uid: int) -> str | None:
     t = style_of(uid, "tag")
     return f"{CATALOG[t].get('emoji', '')} {CATALOG[t]['name']}".strip() if t != "classic" else None
+
+
+def _named(uid: int) -> str:
+    """The person's mention, followed by their equipped player tag: '@name · 💎 Luxurious'. Used on every leaderboard."""
+    tag = _tag_of(uid)
+    return f"<@{uid}> · {tag}" if tag else f"<@{uid}>"
 
 
 # ---------------------------------------------------------------------------
@@ -9051,6 +9121,7 @@ EXTRA_KEY_SEASON_HIST = "milo:season:history"
 EXTRA_KEY_COLOR = "milo:profile:color"        # HASH user id -> colour key from PROFILE_COLORS; absent = default blurple
 EXTRA_KEY_PACKS = "milo:slots:packs"          # STRING JSON {"day": "YYYY-MM-DD", "bought": {user id: bonus spins bought today}}
 EXTRA_KEY_FAV = "milo:profile:fav"            # HASH user id -> game kind (slots / bj / duck / roulette); absent = auto (most played)
+EXTRA_KEY_OPTS = "milo:profile:opts"          # HASH user id -> JSON {"bio": text, "hide": [section keys], "av": "small|large|none"}; absent = defaults
 
 # Permanent default codes. They live in code (so they can never be lost or expire) and
 # their rewards point at the catalog / a Yarns amount -- no duplicate definitions.
@@ -9118,6 +9189,7 @@ class ExtraData:
         self.history: list[dict] = []
         self.fav: dict[int, str] = {}                    # /customize: favourite game shown on /inspect
         self.color: dict[int, str] = {}                  # /customize: sidebar colour of the /inspect card
+        self.opts: dict[int, dict] = {}                  # /customize: about-me text, hidden sections, avatar size of the /inspect card
         self.packs: dict = {"day": "", "bought": {}}     # bonus spins bought today (see _packs_bought)
         self._dirty: dict[str, str] = {}                 # key -> value that still has to be SET in Upstash
         self._lock = asyncio.Lock()                      # serialises redeems and manager edits
@@ -9167,7 +9239,7 @@ class ExtraData:
         res = await store.pipeline([
             ["HGETALL", EXTRA_KEY_CODES], ["HGETALL", EXTRA_KEY_LIMITED], ["GET", EXTRA_KEY_DAILYG],
             ["GET", EXTRA_KEY_SEASON], ["GET", EXTRA_KEY_SEASON_HIST], ["HGETALL", EXTRA_KEY_FAV],
-            ["HGETALL", EXTRA_KEY_COLOR], ["GET", EXTRA_KEY_PACKS],
+            ["HGETALL", EXTRA_KEY_COLOR], ["GET", EXTRA_KEY_PACKS], ["HGETALL", EXTRA_KEY_OPTS],
         ])
         for item in res:
             if not isinstance(item, dict) or "error" in item:
@@ -9214,6 +9286,11 @@ class ExtraData:
                 logger.warning("Ignoring an unreadable season history in the database")
         self.fav = {int(u): k for u, k in _flat_pairs(res[5].get("result")) if str(u).isdigit() and k in GAMBLIN_GAMES}
         self.color = {int(u): k for u, k in _flat_pairs(res[6].get("result")) if str(u).isdigit() and k in PROFILE_COLORS}
+        self.opts = {}
+        for u, raw in _flat_pairs(res[8].get("result")):
+            clean = _clean_profile_opts(raw) if str(u).isdigit() else None
+            if clean:
+                self.opts[int(u)] = clean
         if EXTRA_KEY_PACKS not in self._dirty and res[7].get("result"):
             try:
                 parsed = json.loads(res[7]["result"])
@@ -9335,6 +9412,31 @@ class ExtraData:
                 self.color.pop(uid, None)
             else:
                 self.color[uid] = key
+        return None
+
+    async def set_opts(self, uid: int, **changes) -> str | None:
+        """Change /customize options (bio / hide / av). A value of None (or empty) puts that option back to its default.
+        Saved at once. Returns an error text or None."""
+        async with self._lock:
+            new = dict(self.opts.get(uid, {}))
+            for key, value in changes.items():
+                if value in (None, "", []):
+                    new.pop(key, None)
+                else:
+                    new[key] = value
+            new = _clean_profile_opts(new) or {}
+            if self.store is not None:
+                try:
+                    if new:
+                        await self.store._cmd("HSET", EXTRA_KEY_OPTS, str(uid), json.dumps(new, separators=(",", ":")))
+                    else:
+                        await self.store._cmd("HDEL", EXTRA_KEY_OPTS, str(uid))
+                except StoreError as exc:
+                    return f"I couldn't save that right now ({exc}). Nothing changed."
+            if new:
+                self.opts[uid] = new
+            else:
+                self.opts.pop(uid, None)
         return None
 
     def set_bought(self, uid: int, day: str, total: int) -> None:
@@ -9683,18 +9785,35 @@ def _render_daily(style: str, mention: str, reward: int, streak: int, lost: bool
 
 # ---- Gamblin win card ------------------------------------------------------------------------
 def _render_win_card(style: str, uid: int, game: str, net: int, best_win: int, record: bool, games: int) -> discord.Embed:
+    """The card Milo posts for the biggest win of a Gamblin game. The three bought designs show the win big,
+    plus the winner's best win ever, games played and a personal-best flag; the default is a one-liner."""
     who = f"<@{uid}>"
-    if style == "win_champion":
-        e = discord.Embed(title="━━━  C H A M P I O N  ━━━", description=f"{who}\n**{game}**\n\n## +{pfmt(net)}", color=_rgb(255, 200, 0))
-    elif style == "win_fireworks":
-        e = discord.Embed(title="THE TABLE IS ON FIRE",
-                          description=f"`✦ ✧ ✦ ✧ ✦ ✧ ✦`\n{who} lit up **{game}**\n## +{pfmt(net)}\n`✧ ✦ ✧ ✦ ✧ ✦ ✧`", color=_rgb(255, 90, 60))
-    elif style == "win_legend":
-        e = discord.Embed(title="LEGENDARY WIN", description=f"{who} conquered **{game}**\n## +{pfmt(net)}", color=_rgb(212, 175, 55))
-        e.add_field(name="Best single win", value=f"+{best_win:,}")
-        e.add_field(name="Games played", value=f"{games:,}")
+
+    def stats(e: discord.Embed, best_label: str = "Best win ever", games_label: str = "Games played") -> discord.Embed:
+        e.add_field(name=best_label, value=f"**+{best_win:,}**")
+        e.add_field(name=games_label, value=f"**{games:,}**")
         if record:
-            e.add_field(name="Record", value="New personal best")
+            e.add_field(name="Record", value="**New personal best!**")
+        return e
+
+    if style == "win_champion":
+        e = discord.Embed(title="👑  C H A M P I O N  👑", color=_rgb(255, 200, 0),
+                          description=f"`━━━━━━━━━  🏆  ━━━━━━━━━`\n{who} takes the crown in **{game}**\n\n## +{pfmt(net)}\n`━━━━━━━━━━━━━━━━━━━━━━━`")
+        stats(e)
+        e.set_footer(text="Milo salutes you 🐾")
+    elif style == "win_fireworks":
+        e = discord.Embed(title="🎆  THE TABLE IS ON FIRE  🎆", color=_rgb(255, 90, 60),
+                          description=f"`✦ ✧ ✦ ✧ ✦ ✧ ✦ ✧ ✦ ✧ ✦`\n🔥 {who} set **{game}** ablaze\n\n## +{pfmt(net)}\n`✧ ✦ ✧ ✦ ✧ ✦ ✧ ✦ ✧ ✦ ✧`")
+        stats(e)
+        e.set_footer(text="Somebody call the fire brigade 🧯")
+    elif style == "win_legend":
+        e = discord.Embed(title="✨  LEGENDARY WIN  ✨", color=_rgb(212, 175, 55),
+                          description=f"```\n   ♛   L E G E N D   ♛\n```\n> {who} conquered **{game}**\n> \n> ## +{pfmt(net)}")
+        stats(e)
+        pic = _milo_emoji_url()
+        if pic:
+            e.set_thumbnail(url=pic)
+        e.set_footer(text="Told in the tales of the table")
     else:
         e = discord.Embed(title=f"🏆 {game} — biggest win", description=f"{who} won the most this game: **+{pfmt(net)}**", color=discord.Color.gold())
     return e
@@ -9729,18 +9848,19 @@ def _render_jackpot(style: str, uid: int, payout: int, pity: str) -> tuple[str |
 
 # ---- previews (free, sample data) -------------------------------------------------------------
 def _profile_style_preview(uid: int, item_id: str) -> discord.Embed:
-    it = CATALOG[item_id]
-    if it["cat"] == "tag":
-        line = f"@you  ·  {it.get('emoji', '')} {it['name']}".replace("  ", " ")
-        e = discord.Embed(title="Your name", description=f"{line}", color=discord.Color.blurple())
+    """Sample for a Player tag (or an Inspect Card when there is no member to show)."""
+    if item_id in CATALOG and CATALOG[item_id]["cat"] == "tag":
+        tag = f"{CATALOG[item_id].get('emoji', '')} {CATALOG[item_id]['name']}".strip()
+        e = discord.Embed(title="Your name", description=f"@you  ·  {tag}", color=discord.Color.blurple())
+        e.add_field(name="Leaderboard", value=f"`#1` @you  ·  {tag}", inline=False)
     else:
-        e = discord.Embed(title="Your name", description=f"@you\n**{it['name']}**", color=discord.Color.blurple())
+        e = discord.Embed(title="Your name", description="@you\nSample card", color=discord.Color.blurple())
     e.set_footer(text="This is how it appears on your /inspect profile")
     return e
 
 
-def _shop_preview(uid: int, style: str) -> discord.Embed:
-    """What this design looks like, using sample data. Nothing is spent or changed."""
+def _shop_preview(uid: int, style: str, target: discord.Member | discord.User | None = None) -> discord.Embed:
+    """What this design looks like, using sample data (an Inspect Card shows your own profile). Nothing is spent or changed."""
     cat = CATALOG[style]["cat"] if style in CATALOG else None
     note = "👀 Demo — sample data, nothing was spent"
     if cat == "slots" or style == "classic_slots":
@@ -9757,13 +9877,17 @@ def _shop_preview(uid: int, style: str) -> discord.Embed:
     if cat == "jackpot" or style == "classic_jackpot":
         text, e = _render_jackpot(style, uid, 100, "")
         return e or discord.Embed(description=text, color=discord.Color.gold())
-    if cat in ("title", "tag"):
+    if cat == "inspect" or style == "classic_inspect":
+        if target is not None:                                          # your own real card in that design
+            return _profile_embed(target, "classic" if style == "classic_inspect" else style)
+        return _profile_style_preview(uid, style)
+    if cat == "tag" or style == "classic_tag":
         return _profile_style_preview(uid, style)
     return _render_win_card(style, uid, "Roulette", 2400, 1800, True, 12)
 
 
 _CLASSIC_PREVIEW = {"slots": "classic_slots", "quick": "classic_quick", "daily": "classic_daily", "win": "classic_win",
-                    "jackpot": "classic_jackpot", "title": "classic_title", "tag": "classic_tag"}
+                    "jackpot": "classic_jackpot", "inspect": "classic_inspect", "tag": "classic_tag"}
 
 
 def _price_plain(item_id: str) -> str:
@@ -9809,7 +9933,7 @@ def _shop_cat_embed(uid: int, cat: str, sel: str | None) -> discord.Embed:
     eq = style_of(uid, cat)
     for i in ["classic"] + _cat_items(uid, cat):
         if i == "classic":
-            name, desc = _CAT_NONE_LABEL[cat], "The normal Milo look." if cat not in ("title", "tag") else "Show nothing."
+            name, desc = _CAT_NONE_LABEL[cat], "The normal Milo look." if cat != "tag" else "Show nothing."
             if cat == "jackpot":
                 desc = "Milo's standard 777 message."
         else:
@@ -9931,7 +10055,7 @@ class ShopCategoryView(discord.ui.View):
         style = _CLASSIC_PREVIEW[self.cat] if self.sel == "classic" else self.sel
         label = _CAT_NONE_LABEL[self.cat] if self.sel == "classic" else CATALOG[self.sel]["name"]
         await interaction.response.send_message(f"👀 **{label}** — this is how it looks:",
-                                                embed=_shop_preview(self.owner_id, style), ephemeral=True)
+                                                embed=_shop_preview(self.owner_id, style, interaction.user), ephemeral=True)
 
     async def _action(self, interaction: discord.Interaction) -> None:
         uid = self.owner_id
@@ -10004,7 +10128,7 @@ class ShopConfirmView(discord.ui.View):
         await interaction.response.edit_message(content="Cancelled — nothing bought. 🐾", embed=_shop_cat_embed(self.owner_id, self.cat, self.item_id), view=back)
 
 
-@bot.tree.command(name="shop", description=f"Buy designs, titles and 777 styles for Milo's messages with your {PTS_NAME} (preview first!).")
+@bot.tree.command(name="shop", description=f"Buy designs, inspect cards, player tags and 777 styles with your {PTS_NAME} (preview first!).")
 async def shop_slash(interaction: discord.Interaction):
     if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
         await interaction.response.send_message("This bot is not configured for this server.", ephemeral=True)
@@ -10013,6 +10137,116 @@ async def shop_slash(interaction: discord.Interaction):
         await interaction.response.send_message(_POINTS_UNAVAILABLE, ephemeral=True)
         return
     await interaction.response.send_message(embed=_shop_home_embed(interaction.user.id), view=ShopHomeView(interaction.user.id), ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# 🎒 /inventory: everything you own, and equip it without going through the shop
+# ---------------------------------------------------------------------------
+def _owned_in(uid: int, cat: str) -> list[str]:
+    own = set(POINTS.shop_state(uid)["own"])
+    return [i for i, v in CATALOG.items() if v["cat"] == cat and i in own]          # catalog order
+
+
+def _inventory_embed(uid: int, cat: str | None = None) -> discord.Embed:
+    e = discord.Embed(title="🎒 Your inventory", color=discord.Color.teal(),
+                      description="Everything you own. Pick a category, choose an item and press **Equip** — no shop needed.\n"
+                                  "Want more? `/shop` · Parts of your profile: `/customize`")
+    for c, (emoji, label, _) in SHOP_CATEGORIES.items():
+        eq = style_of(uid, c)
+        owned = _owned_in(uid, c)
+        names = ", ".join(item_name(i) for i in owned) or "nothing yet"
+        text = f"Equipped: **{_CAT_NONE_LABEL[c] if eq == 'classic' else item_name(eq)}**\nOwned ({len(owned)}): {names}"
+        e.add_field(name=f"{'▶ ' if c == cat else ''}{emoji} {label}", value=text[:1020], inline=False)
+    return e
+
+
+class InventoryView(discord.ui.View):
+    def __init__(self, owner_id: int, cat: str | None = None, sel: str | None = None) -> None:
+        super().__init__(timeout=300)
+        self.owner_id, self.cat, self.sel = owner_id, cat, sel
+        self._build()
+
+    def _build(self) -> None:
+        self.clear_items()
+        uid = self.owner_id
+        cat_opts = []
+        for c, (emoji, label, _) in SHOP_CATEGORIES.items():
+            eq = style_of(uid, c)
+            cat_opts.append(discord.SelectOption(label=label, value=c, emoji=emoji, default=c == self.cat,
+                                                 description=f"Equipped: {_CAT_NONE_LABEL[c] if eq == 'classic' else item_name(eq)} · own {len(_owned_in(uid, c))}"[:100]))
+        self.cat_select = discord.ui.Select(placeholder="Pick a category…", options=cat_opts, row=0)
+        self.cat_select.callback = self._cat_picked
+        self.add_item(self.cat_select)
+        if self.cat is None:
+            return
+        eq = style_of(uid, self.cat)
+        if self.sel is None:
+            self.sel = eq
+        opts = [discord.SelectOption(label=_CAT_NONE_LABEL[self.cat], value="classic", description="The default", default=self.sel == "classic")]
+        for i in _owned_in(uid, self.cat)[:24]:
+            opts.append(discord.SelectOption(label=item_name(i)[:100], value=i, default=self.sel == i,
+                                             description=("✅ equipped" if i == eq else "owned")))
+        self.item_select = discord.ui.Select(placeholder="Pick an item…", options=opts, row=1)
+        self.item_select.callback = self._item_picked
+        self.add_item(self.item_select)
+        already = self.sel == eq
+        self.equip_btn = discord.ui.Button(
+            label="Equipped ✓" if already else ("Use default" if self.sel == "classic" else "Equip"),
+            style=discord.ButtonStyle.secondary if already else discord.ButtonStyle.success, disabled=already, row=2)
+        self.equip_btn.callback = self._equip
+        self.add_item(self.equip_btn)
+        self.preview_btn = discord.ui.Button(label="Preview", emoji="👀", style=discord.ButtonStyle.secondary, row=2)
+        self.preview_btn.callback = self._preview
+        self.add_item(self.preview_btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Open your own with `/inventory` 🐾", ephemeral=True)
+            return False
+        return True
+
+    async def _show(self, interaction: discord.Interaction, content: str | None = None) -> None:
+        self._build()
+        await interaction.response.edit_message(content=content, embed=_inventory_embed(self.owner_id, self.cat), view=self)
+
+    async def _cat_picked(self, interaction: discord.Interaction) -> None:
+        self.cat, self.sel = self.cat_select.values[0], None
+        await self._show(interaction)
+
+    async def _item_picked(self, interaction: discord.Interaction) -> None:
+        self.sel = self.item_select.values[0]
+        await self._show(interaction)
+
+    async def _equip(self, interaction: discord.Interaction) -> None:
+        if self.cat is None or self.sel is None:
+            return
+        if not POINTS.equip(self.owner_id, self.cat, None if self.sel == "classic" else self.sel):
+            await interaction.response.send_message("You don't own that (anymore).", ephemeral=True)
+            self.sel = None
+            return
+        name = _CAT_NONE_LABEL[self.cat] if self.sel == "classic" else item_name(self.sel)
+        await self._show(interaction, f"✅ Equipped: **{name}**.")
+
+    async def _preview(self, interaction: discord.Interaction) -> None:
+        if self.cat is None or self.sel is None:
+            await interaction.response.send_message("Pick an item first.", ephemeral=True)
+            return
+        style = _CLASSIC_PREVIEW[self.cat] if self.sel == "classic" else self.sel
+        name = _CAT_NONE_LABEL[self.cat] if self.sel == "classic" else item_name(self.sel)
+        await interaction.response.send_message(f"👀 **{name}** — this is how it looks:",
+                                                embed=_shop_preview(self.owner_id, style, interaction.user), ephemeral=True)
+
+
+@bot.tree.command(name="inventory", description="See everything you own and equip your player tags, inspect cards and other designs.")
+async def inventory_slash(interaction: discord.Interaction):
+    if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
+        await interaction.response.send_message("This bot is not configured for this server.", ephemeral=True)
+        return
+    if not POINTS.ready:
+        await interaction.response.send_message(_POINTS_UNAVAILABLE, ephemeral=True)
+        return
+    uid = interaction.user.id
+    await interaction.response.send_message(embed=_inventory_embed(uid), view=InventoryView(uid), ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -10059,13 +10293,165 @@ PROFILE_COLORS: dict[str, tuple[str, str, tuple[int, int, int]]] = {
 }
 
 
-def _profile_color(uid: int) -> discord.Color:
+# What /customize can show or hide on the card: key -> (label, emoji)
+PROFILE_SECTIONS: dict[str, tuple[str, str]] = {
+    "balance": ("Balance", "💰"), "rank": ("Rank", "🏆"), "earned": ("Lifetime earned", "📈"), "streak": ("Daily streak", "🔥"),
+    "gamblin": ("Gamblin", "🎲"), "fav": ("Favourite game", "⭐"), "equipped": ("Equipped designs", "🎨"),
+}
+PROFILE_AVATARS = {"small": "Small (top right)", "large": "Large (bottom)", "none": "Hidden"}
+PROFILE_BIO_MAX = 100
+
+
+def _clean_profile_opts(raw) -> dict | None:
+    """Keep only known, valid /customize options (so an odd saved value can't break /inspect)."""
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    out: dict = {}
+    bio = " ".join(str(data.get("bio") or "").split())[:PROFILE_BIO_MAX]
+    if bio:
+        out["bio"] = discord.utils.escape_mentions(bio)
+    hide = [k for k in PROFILE_SECTIONS if isinstance(data.get("hide"), list) and k in data["hide"]]
+    if hide:
+        out["hide"] = hide
+    if data.get("av") in PROFILE_AVATARS and data.get("av") != "small":
+        out["av"] = data["av"]
+    return out or None
+
+
+# How each Inspect Card looks. layout: grid (fields, like Classic) / lines (one line per stat) / ledger (monospaced table).
+# mark = bullet, banner = a line of art under the name, color = side bar (a colour picked in /customize wins), av = default avatar size.
+INSPECT_DESIGNS: dict[str, dict] = {
+    "classic": {"layout": "grid"},
+    "card_lucky_paw": {"layout": "lines", "color": (67, 181, 129), "mark": "🍀", "name": "🍀  {name}  🍀",
+                       "banner": "`🍀 · · · · · · · · · · 🍀`"},
+    "card_night_owl": {"layout": "lines", "color": (88, 80, 190), "mark": "✦", "name": "🌙  {name}",
+                       "banner": "`· ˚ ✦ · ⋆ · ˚ ✦ · ⋆ · ˚`"},
+    "card_high_roller": {"layout": "ledger", "color": (200, 30, 60), "name": "♠ ♥  {name}  ♦ ♣", "banner": "HIGH ROLLER"},
+    "card_yarn_tycoon": {"layout": "grid", "color": (255, 196, 0), "name": "🧶  {name}", "banner": "━━━━━━  YARN TYCOON  ━━━━━━", "av": "large"},
+    "card_jackpot_hunter": {"layout": "lines", "color": (150, 80, 255), "mark": "🎰", "name": "{name}",
+                            "banner": "```\n┃ 7️⃣ ┃ 7️⃣ ┃ 7️⃣ ┃\n```"},
+}
+
+
+def _inspect_sections(uid: int) -> dict[str, tuple[str, list[str]]]:
+    """key -> (label, value lines) for every part of the card, before /customize hides any."""
+    day, _ = _day_info()
+    last, streak = POINTS.daily_state(uid)
+    alive = bool(last) and last >= _day_before(day)                  # streak still running (claimed today or yesterday)
+    st = POINTS.stats.get(uid)
+    rank = POINTS.rank_of(uid)
+    out: dict[str, tuple[str, list[str]]] = {
+        "balance": ("Balance", [pcompact(POINTS.points(uid), True)]),
+        "rank": (f"Rank · {EXTRAS.season_label()}", [f"#{rank}" if rank else f"{EXTRAS.season_earned(uid):,}/{LEADERBOARD_MIN_POINTS:,} to join"]),
+        "earned": ("Lifetime earned", [f"{POINTS.total_earned(uid):,}"]),
+    }
+    if alive:
+        bonus_day = streak + 7 - (streak % 7)                         # the next 7th-day bonus (a full week ahead if today was one)
+        out["streak"] = ("Daily streak", [f"**{streak}** day{'s' if streak != 1 else ''}" + (" · claimed today" if last == day else " · ready to claim"),
+                                          f"Next reward: **+{pamt(_daily_reward(streak + 1))}**",
+                                          f"Bonus: +{DAILY_WEEK_BONUS} on day {bonus_day}"])
+    else:
+        out["streak"] = ("Daily streak", ["**0** days" + (f" (was {streak})" if streak else ""),
+                                          f"Next reward: **+{pamt(_daily_reward(1))}**"])
+    if st and st.get("s"):
+        out["gamblin"] = ("Gamblin", [f"{st['s']:,} games", f"{st['net']:+,} profit", f"Best win **+{st['bw']:,}**"])
+    else:
+        out["gamblin"] = ("Gamblin", ["No games yet"])
+    fav = _favourite_game(uid)
+    if fav:
+        out["fav"] = ("Favourite game", fav.split("\n"))
+    eq = []
+    for cat in ("daily", "slots", "quick", "win", "jackpot"):
+        item = style_of(uid, cat)
+        if item != "classic":
+            eq.append(f"{SHOP_CATEGORIES[cat][1]}: **{CATALOG[item]['name']}**")
+    out["equipped"] = ("Equipped designs", eq or ["Classic everything"])
+    return out
+
+
+def _profile_color(uid: int, design: dict | None = None) -> discord.Color:
     key = EXTRAS.color.get(uid)
-    return discord.Color.from_rgb(*PROFILE_COLORS[key][2]) if key in PROFILE_COLORS else discord.Color.blurple()
+    if key in PROFILE_COLORS:
+        return discord.Color.from_rgb(*PROFILE_COLORS[key][2])
+    if design and design.get("color"):
+        return discord.Color.from_rgb(*design["color"])
+    return discord.Color.blurple()
+
+
+def _profile_embed(target: discord.Member | discord.User, design_id: str | None = None) -> discord.Embed:
+    uid = target.id
+    if design_id is None:
+        design_id = style_of(uid, "inspect")
+    design = INSPECT_DESIGNS.get(design_id, INSPECT_DESIGNS["classic"])
+    opts = EXTRAS.opts.get(uid, {})
+    hidden = set(opts.get("hide", ()))
+    tag = _tag_of(uid)
+
+    head = f"@{target.name}" + (f"  ·  {tag}" if tag else "")
+    if opts.get("bio"):
+        head += f"\n*{opts['bio']}*"
+    parts = {k: v for k, v in _inspect_sections(uid).items() if k not in hidden}
+    layout = design["layout"]
+    title = design.get("name", "{name}").format(name=target.display_name)[:256]
+    e = discord.Embed(title=title, color=_profile_color(uid, design))
+
+    if layout == "grid":
+        e.description = (design["banner"] + "\n" if design.get("banner") else "") + head
+        for key, (label, lines) in parts.items():
+            e.add_field(name=label, value="\n".join(lines), inline=key != "equipped")
+    elif layout == "lines":
+        rows = [f"{design['mark']} **{label}:** " + " · ".join(lines) for _, (label, lines) in parts.items()]
+        e.description = "\n".join([head, design["banner"], *rows])
+    else:                                                              # ledger: a monospaced table
+        table = []
+        for _, (label, lines) in parts.items():
+            lines = [l.replace("**", "") for l in lines]
+            label = label.split(" · ")[0].upper()
+            if len(lines[0]) <= 14:                                   # short value: same row as the label, the rest indented below
+                table.append(f"{label[:17]:<17}{lines[0]:>14}")
+                lines = lines[1:]
+            else:                                                     # long text: the label gets its own row
+                table.append(label)
+            table += [f"   {l[:44]}" for l in lines]
+        e.description = f"**{design['banner']}**\n{head}\n```\n" + "\n".join(table) + "\n```"
+    e.description = (e.description or "")[:4000]
+
+    av = opts.get("av") or design.get("av", "small")
+    if av == "large":
+        e.set_image(url=target.display_avatar.url)
+    elif av == "small":
+        e.set_thumbnail(url=target.display_avatar.url)                # avatar: small, top-right
+    if uid in POINTS.frozen:
+        e.set_footer(text="Frozen by a manager")
+    elif isinstance(target, discord.Member) and target.joined_at:
+        e.set_footer(text=f"In the server since {target.joined_at:%d %b %Y}")
+    return e
+
+
+class AboutMeModal(discord.ui.Modal, title="About me"):
+    def __init__(self, owner_id: int) -> None:
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.bio = discord.ui.TextInput(label="Shown on your /inspect card", required=False, max_length=PROFILE_BIO_MAX,
+                                        default=EXTRAS.opts.get(owner_id, {}).get("bio", ""), placeholder="Leave empty to remove it")
+        self.add_item(self.bio)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        text = " ".join(str(self.bio.value or "").split())
+        err = await EXTRAS.set_opts(self.owner_id, bio=text or None)
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        await interaction.response.send_message("Saved. Your about-me line is on your `/inspect` card." if text else "Removed your about-me line.", ephemeral=True)
 
 
 class CustomizeView(discord.ui.View):
-    """/customize: favourite game + sidebar colour for your /inspect card. Each choice saves the moment it's picked."""
+    """/customize: favourite game, colour, which parts show, avatar size and an about-me line for your /inspect card.
+    Each choice saves the moment it's picked."""
 
     def __init__(self, owner_id: int) -> None:
         super().__init__(timeout=180)
@@ -10084,6 +10470,24 @@ class CustomizeView(discord.ui.View):
             options=[discord.SelectOption(label=label, value=key, emoji=swatch, default=key == cc) for key, (label, swatch, _) in PROFILE_COLORS.items()])
         self.color_select.callback = self._picked_color
         self.add_item(self.color_select)
+        hidden = set(EXTRAS.opts.get(owner_id, {}).get("hide", ()))
+        self.sections_select = discord.ui.Select(
+            placeholder="Parts shown on your card…", row=2, min_values=0, max_values=len(PROFILE_SECTIONS),
+            options=[discord.SelectOption(label=label, value=key, emoji=emoji, default=key not in hidden) for key, (label, emoji) in PROFILE_SECTIONS.items()])
+        self.sections_select.callback = self._picked_sections
+        self.add_item(self.sections_select)
+        av = EXTRAS.opts.get(owner_id, {}).get("av", "small")
+        self.avatar_select = discord.ui.Select(
+            placeholder="Avatar size…", row=3,
+            options=[discord.SelectOption(label=label, value=key, emoji="🖼️", default=key == av) for key, label in PROFILE_AVATARS.items()])
+        self.avatar_select.callback = self._picked_avatar
+        self.add_item(self.avatar_select)
+        self.about_btn = discord.ui.Button(label="About me", emoji="✏️", style=discord.ButtonStyle.primary, row=4)
+        self.about_btn.callback = self._about
+        self.add_item(self.about_btn)
+        self.preview_btn = discord.ui.Button(label="Preview my card", emoji="👀", style=discord.ButtonStyle.secondary, row=4)
+        self.preview_btn.callback = self._preview
+        self.add_item(self.preview_btn)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
@@ -10113,8 +10517,35 @@ class CustomizeView(discord.ui.View):
             o.default = o.value == value
         await interaction.response.edit_message(content=f"Saved. Your `/inspect` card colour is now **{PROFILE_COLORS[value][0]}**.", view=self)
 
+    async def _picked_sections(self, interaction: discord.Interaction) -> None:
+        shown = set(self.sections_select.values)
+        err = await EXTRAS.set_opts(self.owner_id, hide=[k for k in PROFILE_SECTIONS if k not in shown])
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        for o in self.sections_select.options:
+            o.default = o.value in shown
+        await interaction.response.edit_message(content=f"Saved. Your card shows {len(shown)} of {len(PROFILE_SECTIONS)} parts.", view=self)
 
-@bot.tree.command(name="customize", description="Customize your /inspect profile (favourite game and colour).")
+    async def _picked_avatar(self, interaction: discord.Interaction) -> None:
+        value = self.avatar_select.values[0]
+        err = await EXTRAS.set_opts(self.owner_id, av=None if value == "small" else value)
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        for o in self.avatar_select.options:
+            o.default = o.value == value
+        await interaction.response.edit_message(content=f"Saved. Avatar on your card: **{PROFILE_AVATARS[value]}**.", view=self)
+
+    async def _about(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(AboutMeModal(self.owner_id))
+
+    async def _preview(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message("👀 This is your card right now:", embed=_profile_embed(interaction.user),
+                                                ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.tree.command(name="customize", description="Customize your /inspect profile (favourite game, colour, parts, avatar, about me).")
 async def customize_slash(interaction: discord.Interaction):
     if interaction.guild is not None and not is_allowed_guild(interaction.guild.id):
         await interaction.response.send_message("This bot is not configured for this server.", ephemeral=True)
@@ -10126,60 +10557,13 @@ async def customize_slash(interaction: discord.Interaction):
     cur = _favourite_game(uid)
     color = PROFILE_COLORS.get(EXTRAS.color.get(uid, "blurple"), PROFILE_COLORS["blurple"])[0]
     text = ("**Customize your profile**\n"
-            "Pick the game shown as your favourite on `/inspect` (leave it on automatic and Milo shows the game you've played most), "
-            "and the colour of the card's side bar.\n"
+            "• **Favourite game** — leave it on automatic and Milo shows the game you've played most\n"
+            "• **Colour** — the side bar of your card (it beats the colour of an Inspect Card design)\n"
+            "• **Parts shown** — untick anything you don't want on your card\n"
+            "• **Avatar size** and an **About me** line\n"
             f"Favourite now: {cur.replace(chr(10), ' · ') if cur else 'nothing yet'} · Colour: {color}\n"
-            "Titles, tags and other looks are equipped in `/shop`.")
+            "Inspect Cards and Player tags are equipped in `/inventory` (and bought in `/shop`).")
     await interaction.response.send_message(text, view=CustomizeView(uid), ephemeral=True)
-
-
-def _profile_embed(target: discord.Member | discord.User) -> discord.Embed:
-    uid = target.id
-    tag, title = _tag_of(uid), _title_of(uid)
-    day, _ = _day_info()
-    last, streak = POINTS.daily_state(uid)
-    alive = bool(last) and last >= _day_before(day)                  # streak still running (claimed today or yesterday)
-    st = POINTS.stats.get(uid)
-    rank = POINTS.rank_of(uid)
-
-    line = f"@{target.name}" + (f"  ·  {tag}" if tag else "")
-    if title:
-        line += f"\n**{title}**"
-    e = discord.Embed(title=target.display_name, description=line, color=_profile_color(uid))
-    e.set_thumbnail(url=target.display_avatar.url)                   # avatar: small, top-right
-    e.add_field(name="Balance", value=pcompact(POINTS.points(uid), True))
-    e.add_field(name=f"Rank · {EXTRAS.season_label()}", value=f"#{rank}" if rank else f"{EXTRAS.season_earned(uid):,}/{LEADERBOARD_MIN_POINTS:,} to join")
-    e.add_field(name="Lifetime earned", value=f"{POINTS.total_earned(uid):,}")
-
-    if alive:
-        bonus_day = streak + 7 - (streak % 7)                         # the next 7th-day bonus (a full week ahead if today was one)
-        streak_text = f"**{streak}** day{'s' if streak != 1 else ''}" + (" · claimed today" if last == day else " · ready to claim")
-        e.add_field(name="Daily streak", value=(f"{streak_text}\nNext reward: **+{pamt(_daily_reward(streak + 1))}**\n"
-                                                f"Bonus: +{DAILY_WEEK_BONUS} on day {bonus_day}"))
-    else:
-        e.add_field(name="Daily streak", value="**0** days" + (f" (was {streak})" if streak else "") + f"\nNext reward: **+{pamt(_daily_reward(1))}**")
-
-    if st and st.get("s"):
-        e.add_field(name="Biggest Gamblin win", value=f"**+{st['bw']:,}**")
-        e.add_field(name="Gamblin", value=f"{st['s']:,} games\n{st['net']:+,} profit")
-    else:
-        e.add_field(name="Biggest Gamblin win", value="No games yet")
-    fav = _favourite_game(uid)
-    if fav:
-        e.add_field(name="Favourite game", value=fav)
-    e.add_field(name="777 guarantee", value=f"{POINTS.jp_count(uid)}/{SLOTS_JACKPOT_PITY_AT} spins")
-
-    eq = []
-    for cat in ("daily", "slots", "quick", "win", "jackpot"):
-        item = style_of(uid, cat)
-        if item != "classic":
-            eq.append(f"{SHOP_CATEGORIES[cat][1]}: **{CATALOG[item]['name']}**")
-    e.add_field(name="Equipped", value="\n".join(eq) if eq else "Classic everything", inline=False)
-    if uid in POINTS.frozen:
-        e.set_footer(text="Frozen by a manager")
-    elif isinstance(target, discord.Member) and target.joined_at:
-        e.set_footer(text=f"In the server since {target.joined_at:%d %b %Y}")
-    return e
 
 
 @bot.tree.command(name="inspect", description="View a player's profile card (yours by default).")
@@ -10254,7 +10638,7 @@ _ONLY_TARGET_RE = re.compile(rf"^\?\w+\s+{_MGR_TARGET}\s*$", re.I)
 _MGR_WORDS = {"?give", "?set", "?undo", "?check", "?balances", "?resetspins", "?snapshot", "?mhelp", "?mmhelp",
               "?resetleaderboard", "?resetleaderbord", "?freeze", "?unfreeze", "?frozen", "?backup",
               "?restore", "?announce", "?resetpreview", "?giveitem", "?takeitem",
-              "?addredeem", "?removeredeem", "?redeems", "?customid", "?limitedshop"}
+              "?newplayertag", "?getplayertag", "?addredeem", "?removeredeem", "?redeems", "?customid", "?limitedshop"}
 # The ONLY text commands a member who has just MILO_ROLE_ID may use (plus "?gamblin schedule list", handled in
 # _handle_gamblin_command). Everything else needs MANAGER_ROLE_ID. This is checked in the handlers, not just hidden in help.
 _LIMITED_WORDS = {"?announce", "?snapshot", "?check", "?balances", "?mmhelp"}
@@ -10439,9 +10823,9 @@ def _customid_embeds() -> list[discord.Embed]:
     for cat in ("daily", "slots", "quick", "win"):
         ids = [i for i, v in CATALOG.items() if v["cat"] == cat and not v.get("season")]
         e1.add_field(name=_CAT_IDS_LABEL[cat], value=lines(ids), inline=False)
-    e2 = discord.Embed(title="🆔 Customization IDs (2/3) — announcements, titles, tags", color=discord.Color.dark_teal())
-    for cat in ("jackpot", "title", "tag"):
-        ids = [i for i, v in CATALOG.items() if v["cat"] == cat]
+    e2 = discord.Embed(title="🆔 Customization IDs (2/3) — announcements, inspect cards, tags", color=discord.Color.dark_teal())
+    for cat in ("jackpot", "inspect", "tag"):
+        ids = [i for i, v in CATALOG.items() if v["cat"] == cat and not v.get("custom")]      # custom ?newplayertag tags are one-offs, not listed
         e2.add_field(name=_CAT_IDS_LABEL[cat], value=lines(ids), inline=False)
     e3 = discord.Embed(title="🆔 Customization IDs (3/3) — seasonal & rewards", color=discord.Color.dark_teal())
     seasonal = [i for i, v in CATALOG.items() if v.get("season")]
@@ -10451,7 +10835,7 @@ def _customid_embeds() -> list[discord.Embed]:
         "Any ID above works as a reward, and so does a Yarns amount like `+50`.\n"
         "Example: `?addredeem NEWYEAR2027 +100,slots_newyear`\n"
         "Default permanent codes: " + ", ".join(f"`{c}` ({', '.join(reward_text(r) for r in rw)})" for c, rw in DEFAULT_REDEEM_CODES.items())))
-    e3.add_field(name="Alias", value="`title_zealous` is accepted as another name for `tag_zealous`.", inline=False)
+    e3.add_field(name="Alias", value="`title_zealous` is accepted as another name for `tag_zealous`; the old `title_*` profile titles are now the `card_*` Inspect Cards.", inline=False)
     return [e1, e2, e3]
 
 
@@ -10691,7 +11075,7 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
             await reply("❌ A code is 3–32 characters: letters, numbers, `_` or `-`.")
             return
         expires = 0
-        em = re.search(r"\bexpires?:\s*(" + _DATE_ARG + ")", rest, re.I)
+        em = re.search(r"[\[(]?\s*\bexpires?\s*[:=]\s*(" + _DATE_ARG + r")\s*[\])]?", rest, re.I)      # also accepts [expires:2026-12-31]
         if em:
             expires = _parse_local_dt(em.group(1), end_of_day=True) or -1
             rest = rest[:em.start()] + " " + rest[em.end():]
@@ -10889,15 +11273,71 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
         if member is None:
             return
         item = resolve_item_id(m.group(3))
+        item_label_text, was_custom = CATALOG[item]["name"], bool(CATALOG[item].get("custom"))      # read before a take can delete it
         if word == "?giveitem":
             POINTS.grant_item(member.id, item, equip=False)
-            await reply(f"🎁 Gave **{CATALOG[item]['name']}** to {member.display_name}.")
+            await reply(f"🎁 Gave **{item_label_text}** to {member.display_name}.")
         elif POINTS.revoke_item(member.id, item):
-            await reply(f"↩️ Took **{CATALOG[item]['name']}** from {member.display_name}.")
+            gone = was_custom and item not in CATALOG
+            await reply(f"↩️ Took **{item_label_text}** from {member.display_name}."
+                        + (" Nobody else had that tag, so it was deleted from the database." if gone else ""))
         else:
             await reply(f"ℹ️ {member.display_name} doesn't own that design.")
             return
-        await log_event(f"🛍️ `{word}` by <@{mgr.id}>: <@{member.id}> — {CATALOG[item]['name']} (`{item}`)")
+        await log_event(f"🛍️ `{word}` by <@{mgr.id}>: <@{member.id}> — {item_label_text} (`{item}`)")
+        return
+
+    # ---- ?newplayertag "text" @user: a custom player tag for one person ----
+    if word == "?newplayertag":
+        m = re.match(rf'^\?newplayertag\s+["“”](.+?)["“”]\s+{_MGR_TARGET}\s*$', text, re.I | re.S)
+        label = clean_tag_label(m.group(1)) if m else None
+        if not m or label is None:
+            await reply(f'Usage: `?newplayertag "🥇 S00 Rank 1" @user` — the tag is 2–{CUSTOM_TAG_MAX} characters, one line, emoji welcome.', keep=60)
+            return
+        if not POINTS.ready:
+            await reply("❌ Points haven't loaded from the database yet — try again in a minute.")
+            return
+        member = await find_member(m.group(2) or m.group(3))
+        if member is None:
+            return
+        item = custom_tag_id(label)
+        if item in CATALOG and not CATALOG[item].get("custom"):
+            await reply("❌ That text is already a shop tag — use `?giveitem` for it.")
+            return
+        if POINTS.owns(member.id, item):
+            await reply(f"ℹ️ {member.display_name} already has the tag **{CATALOG[item]['name']}**.")
+            return
+        item = POINTS.grant_custom_tag(member.id, label)
+        auto = style_of(member.id, "tag") == "classic"
+        if auto:
+            POINTS.equip(member.id, "tag", item)
+        await reply(f"🎖️ Gave **{CATALOG[item]['name']}** to {member.display_name}" + (" and equipped it." if auto else " — they can equip it in `/inventory`.")
+                    + f"\nRemove it with `?takeitem {member.mention} {item}`")
+        await log_event(f"🎖️ `?newplayertag` by <@{mgr.id}>: <@{member.id}> — {CATALOG[item]['name']} (`{item}`)")
+        return
+
+    # ---- ?getplayertag @user: every player tag they own ----
+    if word == "?getplayertag":
+        m = _ONLY_TARGET_RE.match(text)
+        if not m:
+            await reply("Usage: `?getplayertag @user`", keep=60)
+            return
+        if not POINTS.ready:
+            await reply("❌ Points haven't loaded from the database yet — try again in a minute.")
+            return
+        member = await find_member(m.group(1) or m.group(2))
+        if member is None:
+            return
+        tags = _owned_in(member.id, "tag")
+        worn = style_of(member.id, "tag")
+        if not tags:
+            await reply(f"ℹ️ {member.display_name} has no player tags.")
+            return
+        kind = lambda i: "custom" if CATALOG[i].get("custom") else ("shop" if CATALOG[i].get("price") else "reward")
+        lines = [f"{'✅' if i == worn else '▫️'} {item_name(i)} · `{i}` · {kind(i)}" for i in tags]
+        e = discord.Embed(title=f"🎖️ Player tags of {member.display_name}", description="\n".join(lines)[:4000], color=discord.Color.teal())
+        e.set_footer(text="✅ = equipped · Remove one with ?takeitem @user item_id (a custom tag nobody else has is deleted completely)")
+        await message.channel.send(embed=e, allowed_mentions=discord.AllowedMentions.none())
         return
 
     # ---- ?resetpreview: see the midnight message without pinging anyone ----
@@ -10937,13 +11377,14 @@ async def _handle_manager_command(message: discord.Message, word: str) -> bool:
             f"`?give @user +300` / `-40` — add or remove {PTS_NAME} (optional note) · `?set @user 500` — exact balance · `?undo` — reverse the last ?give / ?set\n"
             f"`?check @user` · `?balances` · `?resetspins @user` — restore today's spins\n"
             "`?freeze @user [reason]` / `?unfreeze @user` / `?frozen` — stop (or allow) earning, gambling and trading\n"
-            "`?giveitem @user item_id` / `?takeitem @user item_id` — give or remove any design, title or tag"))
+            "`?giveitem @user item_id` / `?takeitem @user item_id` — give or remove any design, inspect card or tag\n"
+            '`?newplayertag "🥇 S00 Rank 1" @user` — make a custom player tag for that person · `?getplayertag @user` — list their tags and IDs (remove one with `?takeitem`)'))
         e.add_field(name="🎟️ Redeem codes", inline=False, value=(
             "`?addredeem CODE +50,daily_christmas,slots_christmas [expires:2026-12-31]` — rewards are Yarns amounts and/or IDs; all are checked first\n"
             "`?removeredeem CODE` — delete a custom code · `?redeems` — list codes and how often each was used\n"
             "Permanent defaults: `MILO_GIFTS` (+50), `MILO_TAG` (Zealous tag)"))
         e.add_field(name="🕰️ Limited shop & IDs", inline=False, value=(
-            "`?customid` — every design / title / tag / 777-style ID, including seasonal and unlisted ones\n"
+            "`?customid` — every design / inspect card / tag / 777-style ID, including seasonal and unlisted ones\n"
             "`?limitedshop add <item_id> <price> <start> <end>` — e.g. `add slots_christmas 250 2026-12-01 2026-12-31`\n"
             "`?limitedshop price <item_id> <new_price>` · `?limitedshop time <item_id> <start> <end>` · "
             "`?limitedshop remove <item_id>` · `?limitedshop list`\n"

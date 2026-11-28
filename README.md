@@ -224,7 +224,7 @@ If neither role is configured, `?send` is completely disabled; if `MANAGER_ROLE_
 | `/slots` | Spin a 3-reel slot machine for points. **25 free spins a day**, then up to **20 bonus spins** in packs: **5 points buys a pack of 10 spins**. **Buying a pack only adds the spins** — nothing spins until you press *Spin once* or *Spin all*, and if another pack is left today a *Buy another pack* button appears. Match all three of any symbol to win; every 200th spin without a 777 is a 777. |
 | `/daily` | Claim free points once a day. Day 1 gives 15 and each consecutive day adds 5 (up to day 7), and **every 7th day in a row adds a +50 bonus**. Miss a day and the streak restarts. Works out to roughly 37 points a day for a perfect streak. |
 | `/pay @user amount` | Send some of your points to another member. You confirm first. A **5% fee is burned** on every payment (rounded up, at least 1), so you pay the amount plus the fee and they get the full amount. There's also a **daily limit of 200 points sent** per person (`PAY_DAILY_CAP`, the fee doesn't count towards it). Not allowed to yourself, to bots, to or from frozen people, or while a Gamblin game runs. |
-| `/shop` | **Buy designs for Milo's messages** with your points: designs, 777 announcement styles and profile titles in 7 independent categories, from 2,500 points. Seasonal items appear only during a limited-time listing. **Preview any of them for free before buying.** Cosmetic only. Section 28. |
+| `/shop` | **Buy designs for Milo's messages** with your points: designs, 777 announcement styles, **Inspect Cards** and **Player tags** in 7 independent categories, from 2,500 points. `/inventory` equips what you own. Seasonal items appear only during a limited-time listing. **Preview any of them for free before buying.** Cosmetic only. Section 28. |
 | `/lottery` | **Daily lottery (raffle).** Buy tickets (10 points each, up to 5 a night). At midnight **one ticket is drawn and its owner wins the whole pot** — every ticket sold, plus any rollover. More tickets = better odds. 2–3 empty tickets are mixed in, so rarely nobody wins and the pot rolls over. |
 | `/gamblinstats [user]` | Your Gamblin record (games, total profit, biggest win, best game, favourite) plus the **hall of fame**: biggest single win, best single game, most games, highest total profit. |
 | `/points user:<member>` | Your balance, total points earned, leaderboard rank (or progress toward it), and spins left today. Private to you. Add a member to peek at theirs (spins hidden). |
@@ -622,7 +622,7 @@ In the Gamblin channel: deny **Send Messages** (and Create Threads) for `@everyo
 2. **Rounds** (`GAMBLIN_ROUNDS`, default 3). Each round has one betting window (`GAMBLIN_BET_SECONDS`, default 45). Tap **🎰 Pick your reels** and a private panel opens (it looks like this, with headings between rows of buttons):
    - **REEL 1 / REEL 2 / REEL 3** — one row of symbol buttons each (🍒 🍋 🍉 🍇 ⭐ 7️⃣, two rows of three). Press one symbol per reel; it turns green. Press it again to un-pick, or press another to switch.
    - **QUICK SELECT** — 🍒🍒🍒, 🍋🍋🍋, 🍉🍉🍉, 🍇🍇🍇, ⭐⭐⭐, 7️⃣7️⃣7️⃣ picks all three reels at once. While one is on, the reel buttons and the other quick buttons are locked; press the green one again (or **Clear**) to undo.
-   - **Proceed to bet** — enabled once every reel has a pick. Then choose the amount (5% / 10% / 25% / All-in-or-Max / ✏️ Custom popup) → see your exact payouts → 🔒 Lock. A bet can't be changed once locked.
+   - **Proceed to bet** — enabled once every reel has a pick. Then choose the amount (fixed bets 5 / 10 / 20 / 30 / 40 / 50 / 70 / 100, then All-in-or-Max if it isn't one of them, and ✏️ Custom popup) → see your exact payouts → 🔒 Lock. A bet can't be changed once locked.
    - **The spin:** when betting closes, Milo spins reel 1, reel 2 and reel 3 one at a time. You win if **any** of your picks match their reel: **1 match** pays at least x1.2, **2 matches** pay more, and **all 3** pay a big bonus. The exact multipliers are shown for your picks before you lock in.
 3. **Betting is private** (panels only you can see). Bets are `GAMBLIN_MIN_BET`–`GAMBLIN_MAX_BET`; one bet per round.
 4. **Results** are posted after the spin, then standings at the end.
@@ -661,7 +661,9 @@ All of these are **hidden** `?` commands: Manager role only, silent to everyone 
 | `?announce Title \| message` | Posts a tidy embed as Milo. Add `--ping` to ping @everyone and/or a `#channel` to post elsewhere: `?announce --ping #general Movie night \| 8pm in voice!`. Without a `\|` the whole text is the message. Your command is deleted. (`?send` is still there for plain Milo messages.) |
 | `?backup` | Posts a backup file (balances, earned, 777 counters, streaks, Gamblin stats, frozen list, shop designs) to the **log channel**. Milo also posts one **every night** next to the points snapshot. Needs `LOG_CHANNEL_ID`. |
 | `?restore` | Attach a backup file to your `?restore` message. Milo checks the file, shows what's in it and asks you to confirm. It then sets those numbers, saves immediately and logs it. Only people *in the file* are changed; the frozen list is set to match the file. Blocked while a Gamblin game runs. Run `?backup` first if you're unsure. |
-| `?giveitem @user item_id` / `?takeitem @user item_id` | Gives or removes a `/shop` design (for support, refunds or prizes). Type either with no item to see all the item ids. A given design isn't equipped automatically. |
+| `?giveitem @user item_id` / `?takeitem @user item_id` | Gives or removes a `/shop` design, inspect card or tag (for support, refunds or prizes). IDs: `?customid`. A given design isn't equipped automatically. Taking a custom tag from its last owner deletes it from the database. |
+| `?newplayertag "🥇 S00 Rank 1" @user` | Makes a **custom player tag** for that person (2–40 characters, emoji welcome) and equips it if they wear no tag yet. Giving the same text to someone else reuses the same tag. |
+| `?getplayertag @user` | Lists every player tag they own (shop, reward and custom) with its ID and which one is equipped. Remove one with `?takeitem @user item_id`. |
 | `?resetspins @user` | Gives someone today's free + bonus spins back (and clears their cooldown/pity). For when something glitched. |
 | `?snapshot` | Posts everyone's points to the log channel right now. |
 | `?updateDB` · `?gamblin` · `?rolemenu` · `?send` | Existing commands, unchanged. |
@@ -703,7 +705,7 @@ Start it with **`?gamblin`** and pick **🃏 Blackjack** (or type `?gamblin bj`)
 ### How a game runs
 1. **Lobby:** `@everyone` ping, Join button, countdown (same as Gamblin).
 2. **Rounds** (`GAMBLIN_BJ_ROUNDS`, default 5), each against the dealer:
-   - **Betting window** (30s): press **💰 Place bet**, pick a stake privately (5% / 10% / 25% / All-in or Max / ✏️ Custom popup), confirm, 🔒 lock. Late joiners can sit down any round.
+   - **Betting window** (30s): press **💰 Place bet**, pick a stake privately (fixed bets 5 / 10 / 20 / 30 / 40 / 50 / 70 / 100, All-in or Max, ✏️ Custom popup), confirm, 🔒 lock. Late joiners can sit down any round.
    - **Deal:** everyone's cards are public on the table message; the dealer shows one card.
    - **Your move** (40s): press **🃏 My hand** for a private panel with **Hit**, **Stand** and **Double** (first two cards only). Idle players auto-stand. The round moves on as soon as everyone has finished.
    - **Dealer** reveals and draws to 17, then every bet is settled and shown on the table.
@@ -727,7 +729,7 @@ Sessions live in memory (a restart ends it). Points are virtual only.
 Pick **🦆 Duck Race** in `?gamblin`. **3 races** by default (`GAMBLIN_DUCK_ROUNDS`).
 
 **Each race:**
-1. **Betting (30s):** Milo posts the line-up of six ducks 🟥 Quackers · 🟦 Sir Waddles · 🟩 Puddles · 🟨 Drake · 🟪 Beaky · 🟧 Feathers with each one's payout and win chance. The odds are **shuffled between ducks every race**, so yesterday's favourite isn't always today's. Press **💰 Place bet**, pick a duck, pick a stake (5% / 10% / 25% / All-in or Max / ✏️ Custom popup), confirm, 🔒 lock. **One bet per race.** Newcomers can join any race.
+1. **Betting (30s):** Milo posts the line-up of six ducks 🟥 Quackers · 🟦 Sir Waddles · 🟩 Puddles · 🟨 Drake · 🟪 Beaky · 🟧 Feathers with each one's payout and win chance. The odds are **shuffled between ducks every race**, so yesterday's favourite isn't always today's. Press **💰 Place bet**, pick a duck, pick a stake (fixed bets 5 / 10 / 20 / 30 / 40 / 50 / 70 / 100, All-in or Max, ✏️ Custom popup), confirm, 🔒 lock. **One bet per race.** Newcomers can join any race.
 2. **The race:** the message animates with ducks waddling across the track to the 🏁 (about 15 seconds).
 3. **Results:** podium, then every bet with its win or loss.
 
@@ -912,7 +914,7 @@ Instead of roles (Discord caps a server at 250), the shop sells **designs for Mi
 
 All of it is loaded into memory at startup; manager changes write to Upstash first and then re-read it, so the cache always matches the database. Designs themselves (the catalog) live in `bot.py` under `CATALOG`; players only own **IDs**, so editing a design updates it for every owner.
 
-**Player commands:** `/redeem code:<code>` (default codes: `MILO_GIFTS` = +50, `MILO_TAG` = the ❤️‍🔥 Zealous tag) · `/inspect [user]` (profile card) · `/customize` (pick the favourite game shown on it; automatic = most played) · `/leaderboard [season]` · `/daily` (streak insurance) · `/shop` (now also 777 announcements, titles, tags).
+**Player commands:** `/redeem code:<code>` (default codes: `MILO_GIFTS` = +50, `MILO_TAG` = the ❤️‍🔥 Zealous tag) · `/inspect [user]` (profile card) · `/customize` (pick the favourite game shown on it; automatic = most played) · `/leaderboard [season]` · `/daily` (streak insurance) · `/shop` (now also 777 announcements, inspect cards, tags).
 
 **Manager commands** (`?mhelp`): `?addredeem CODE +50,daily_christmas [expires:2026-12-31]` · `?removeredeem CODE` · `?redeems` · `?customid` · `?limitedshop add|price|time|remove|list` · `?resetleaderboard sname:Christmas snum:Season 01`. **Milo role** (`?mmhelp`): `?send`, `?announce`, `?snapshot`, `?check`, `?balances`, `?gamblin schedule list`.
 
@@ -948,3 +950,16 @@ Start them like any other game: `?gamblin` (pick with buttons), `?gamblin crash`
 - **🎲 Lucky Dice** (`GAMBLIN_DICE_ROUNDS`=4, `GAMBLIN_DICE_BET_SECONDS`=30). Two dice, one bet per round: **Under 7** (x2.2), **Lucky 7** (x5.5), **Over 7** (x2.2), **Doubles** (x5.5), **Snake eyes** 1+1 (x33.1) or **Boxcars** 6+6 (x33.1).
 - **🎴 Higher or Lower** (`GAMBLIN_HILO_ROUNDS`=5, `GAMBLIN_HILO_BET_SECONDS`=30). A card is shown; bet that the next one (from the rest of the deck, Ace high) is **Higher**, **Lower** or the **Same** rank. The odds depend on the card shown and are displayed on the buttons; ties lose for Higher and Lower, and only Same wins them. The card shown is always **5 to Jack**, so both sides pay a real profit: any bet that would pay less than x1.2 is never offered (an Ace-high card used to make "Lower" pay x0.9, a win that lost money).
 - **Favourite game:** all three appear in `/customize`. Stats are recorded under "Crash", "Lucky Dice" and "Higher or Lower".
+
+
+## 31. Inspect Cards, Player tags, /inventory and fixed bets (latest changes)
+
+- **Inspect Cards replace profile titles.** The shop category is now **🪪 Inspect Cards**: each one changes how your `/inspect` profile looks (layout, colours, decoration). The five old titles became cards with the **same names and prices** (Lucky Paw, Night Owl, High Roller, Yarn Tycoon, Jackpot Hunter), and anyone who owned one keeps it (old `title_*` IDs still work as aliases of the new `card_*` IDs). **👀 Preview** shows your own real profile in that design.
+- **/inspect** was realigned (three stats per row: Balance · Rank · Lifetime earned, then Daily streak · Gamblin · Favourite game) and the **777 guarantee counter was removed** from it. It stays in `/points`.
+- **/customize** now has: favourite game, colour, **which parts of the card are shown**, **avatar size** (small / large / hidden) and an **About me** line (100 characters). Saved in `milo:profile:opts` (only people who changed something are stored). A colour you pick beats the colour of an Inspect Card design.
+- **Player tags** are shown after the name on `/inspect` and on **every leaderboard** (this season, past seasons, richest). Three new, very expensive shop tags: **💎 Luxurious** 100,000 · **👑 Majestic** 175,000 · **🌌 Immortal** 250,000. `❤️‍🔥 Zealous` stays redeem-only.
+- **Custom tags** (`?newplayertag`, `?getplayertag`, `?takeitem`) live inside the owner's own shop record, so they are saved and backed up with it. When the last owner loses one, nothing is left in the database.
+- **/inventory** shows everything you own and lets you **equip** any design, inspect card or tag (and preview it) without opening the shop.
+- **Gamblin win cards** (Champion Banner, Fireworks, Hall of Legends) were redesigned: bigger headline, best win ever, games played and a personal-best badge.
+- **Gamblin bet panels** (all seven games) now offer fixed bets **5, 10, 20, 30, 40, 50, 70, 100** instead of percentages. Only the amounts you can afford show; All-in or Max appears when your limit isn't one of them.
+- **`?addredeem`** accepts the expiry exactly as written in `?mhelp`: `[expires:2026-12-31]` (square brackets or round brackets, a time is allowed). Before, the brackets broke the command and nothing was created.
